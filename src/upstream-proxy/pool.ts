@@ -6,7 +6,10 @@
 //
 // Loopback targets (localhost/127.0.0.1/::1) always bypass the proxy so the
 // default managed backend (`http://127.0.0.1:10001`) is never proxied.
-import { ProxyAgent, Socks5ProxyAgent, fetch as undiciFetch } from 'undici';
+//
+// undici is loaded lazily (dynamic import) so hosts on older Node keep
+// running direct-only: only actual proxy engagement needs it, and a load
+// failure fails open to direct with a warning.
 import type { Dispatcher } from 'undici';
 
 export type ProxyStrategy = 'failover-rr' | 'round-robin' | 'random';
@@ -152,14 +155,39 @@ export function createProxyPool(options: ProxyPoolOptions = {}): UpstreamProxyPo
   let engagedUntil = 0;
   let current: string | null = null;
 
-  const getDispatcher = (proxyUrl: string): Dispatcher => {
+  // Cached dynamic import: resolved at most once; a rejection (e.g. Node too
+  // old for undici) is memorized so every proxied call fails open to direct.
+  let undiciModule: {
+    ProxyAgent: new (url: string) => Dispatcher;
+    Socks5ProxyAgent: new (url: string) => Dispatcher;
+    fetch: (input: unknown, init?: unknown) => Promise<unknown>;
+  } | null = null;
+  let undiciFailed = false;
+  const loadUndici = async (): Promise<typeof undiciModule> => {
+    if (undiciModule || undiciFailed) return undiciModule;
+    try {
+      const mod = (await import('undici')) as unknown as NonNullable<typeof undiciModule>;
+      undiciModule = mod;
+      return mod;
+    } catch (err) {
+      undiciFailed = true;
+      logDebug('Upstream proxy runtime unavailable, staying direct', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  };
+
+  const getDispatcher = async (proxyUrl: string): Promise<Dispatcher | null> => {
     const hit = dispatchers.get(proxyUrl);
     if (hit) return hit;
+    const mod = await loadUndici();
+    if (!mod) return null;
     const protocol = new URL(proxyUrl).protocol;
     const agent: Dispatcher =
       protocol === 'socks:' || protocol === 'socks5:' || protocol === 'socks5h:'
-        ? ((new Socks5ProxyAgent(proxyUrl) as unknown) as Dispatcher)
-        : ((new ProxyAgent(proxyUrl) as unknown) as Dispatcher);
+        ? new mod.Socks5ProxyAgent(proxyUrl)
+        : new mod.ProxyAgent(proxyUrl);
     dispatchers.set(proxyUrl, agent);
     return agent;
   };
@@ -224,10 +252,13 @@ export function createProxyPool(options: ProxyPoolOptions = {}): UpstreamProxyPo
       if (!proxyUrl) return direct();
       current = proxyUrl;
       try {
-        return await (undiciFetch as (i: unknown, o?: unknown) => Promise<unknown>)(input as never, {
+        const mod = await loadUndici();
+        const dispatcher = proxyUrl ? await getDispatcher(proxyUrl) : null;
+        if (!mod || !dispatcher) return direct();
+        return await mod.fetch(input as never, {
           ...((init as Record<string, unknown>) ?? {}),
-          dispatcher: getDispatcher(proxyUrl),
-        });
+          dispatcher,
+        } as never);
       } catch (err) {
         // Transport failure through this proxy: cool it, fail open to direct
         // for this call (quota errors are handled by callers, not here).
