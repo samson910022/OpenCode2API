@@ -1,6 +1,8 @@
 // P4 TS: root entrypoint (ported from index.js, behavior identical).
 import { startProxy, normalizeBool, resolveDisableTools } from './src/proxy.js';
 import { resolveMaxRetries } from './src/retry/policy.js';
+import { mergeApiKeySources } from './src/auth/keys.js';
+import { DEFAULT_PROXY_COOLDOWN_MS, parseProxyList, parseProxyNoProxyList } from './src/upstream-proxy/pool.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -40,10 +42,16 @@ function parsePort(value: unknown, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+/** Resolve the multi-key list for one layer: canonical list + legacy aliases merge (empty never blocks). */
+function parseApiKeys(...sources: unknown[]): string[] {
+  return mergeApiKeySources(...sources);
+}
+
 // Default configuration
 const defaultConfig = {
   PORT: parsePort(process.env['OPENCODE_PROXY_PORT'], 10000),
   API_KEY: '',
+  API_KEYS: [] as string[],
   OPENCODE_SERVER_URL: `http://127.0.0.1:${process.env['OPENCODE_SERVER_PORT'] || 10001}`,
   OPENCODE_SERVER_PASSWORD: process.env['OPENCODE_SERVER_PASSWORD'] || '',
   MANAGE_BACKEND: parseBool(process.env['OPENCODE_PROXY_MANAGE_BACKEND'], false),
@@ -65,6 +73,13 @@ const defaultConfig = {
   AUTO_CLEANUP_CONVERSATIONS: parseBool(process.env['OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS'], false),
   CLEANUP_INTERVAL_MS: parsePort(process.env['OPENCODE_PROXY_CLEANUP_INTERVAL_MS'], 43200000),
   CLEANUP_MAX_AGE_MS: parsePort(process.env['OPENCODE_PROXY_CLEANUP_MAX_AGE_MS'], 86400000),
+  UPSTREAM_PROXIES: parseProxyList([process.env['OPENCODE_UPSTREAM_PROXIES'], process.env['UPSTREAM_PROXIES']]),
+  UPSTREAM_PROXY_STRATEGY: 'failover-rr',
+  UPSTREAM_PROXY_COOLDOWN_MS: DEFAULT_PROXY_COOLDOWN_MS,
+  UPSTREAM_PROXY_NO_PROXY: parseProxyNoProxyList(
+    process.env['OPENCODE_UPSTREAM_PROXY_NO_PROXY'] ?? process.env['UPSTREAM_PROXY_NO_PROXY'],
+    ['localhost', '127.0.0.1', '::1'],
+  ),
 };
 
 // Load config from file.
@@ -110,12 +125,18 @@ function readFileNumber(key: string, fallback: number): number {
 }
 
 // Merge configs: env > file > default
-const finalConfig: ProxyConfig = {
-  PORT:
+// Auth layers resolve independently; the env layer wins as a whole so a stale
+// file single-key can never pollute (or resurrect after rotation of) an
+// explicitly configured env list. Empty strings never block lower sources.
+const envApiKeys = parseApiKeys(process.env['OPENCODE_API_KEYS'], process.env['API_KEYS'], process.env['API_KEY']);
+const fileApiKeys = parseApiKeys(fileConfig['API_KEYS'], fileConfig['API_KEY']);
+const resolvedApiKeys = envApiKeys.length > 0 ? envApiKeys : fileApiKeys;
+const finalConfig: ProxyConfig = {  PORT:
     parsePort(process.env['OPENCODE_PROXY_PORT'], NaN) ||
     parsePort(process.env['PORT'], NaN) ||
     readFileNumber('PORT', defaultConfig.PORT),
-  API_KEY: process.env['API_KEY'] || readFileString('API_KEY', defaultConfig.API_KEY),
+  API_KEY: resolvedApiKeys[0] ?? '',
+  API_KEYS: resolvedApiKeys,
   OPENCODE_SERVER_URL: process.env['OPENCODE_SERVER_URL'] || readFileString('OPENCODE_SERVER_URL', defaultConfig.OPENCODE_SERVER_URL),
   OPENCODE_SERVER_PASSWORD:
     process.env['OPENCODE_SERVER_PASSWORD'] || readFileString('OPENCODE_SERVER_PASSWORD', defaultConfig.OPENCODE_SERVER_PASSWORD),
@@ -196,6 +217,24 @@ const finalConfig: ProxyConfig = {
     parsePort(process.env['OPENCODE_PROXY_CLEANUP_MAX_AGE_MS'], 0) ||
     readFileNumber('CLEANUP_MAX_AGE_MS', defaultConfig.CLEANUP_MAX_AGE_MS),
   OPENCODE_HOME_BASE: null,
+  // Fallback proxy pool (P3): env layer wins as a whole, then file, then default.
+  // Empty = direct-only (default, zero overhead; engagable only on free-limit).
+  UPSTREAM_PROXIES: (() => {
+    const env = parseProxyList([process.env['OPENCODE_UPSTREAM_PROXIES'], process.env['UPSTREAM_PROXIES']]);
+    if (env.length > 0) return env;
+    const file = parseProxyList(fileConfig['UPSTREAM_PROXIES']);
+    return file.length > 0 ? file : [...defaultConfig.UPSTREAM_PROXIES];
+  })(),
+  UPSTREAM_PROXY_STRATEGY:
+    process.env['OPENCODE_UPSTREAM_PROXY_STRATEGY'] ||
+    readFileString('UPSTREAM_PROXY_STRATEGY', defaultConfig.UPSTREAM_PROXY_STRATEGY),
+  UPSTREAM_PROXY_COOLDOWN_MS:
+    parsePort(process.env['OPENCODE_UPSTREAM_PROXY_COOLDOWN_MS'], 0) ||
+    readFileNumber('UPSTREAM_PROXY_COOLDOWN_MS', defaultConfig.UPSTREAM_PROXY_COOLDOWN_MS),
+  UPSTREAM_PROXY_NO_PROXY: parseProxyNoProxyList(
+    process.env['OPENCODE_UPSTREAM_PROXY_NO_PROXY'] ?? process.env['UPSTREAM_PROXY_NO_PROXY'] ?? fileConfig['UPSTREAM_PROXY_NO_PROXY'],
+    defaultConfig.UPSTREAM_PROXY_NO_PROXY,
+  ),
 };
 
 // Validate required configuration
@@ -223,6 +262,12 @@ console.log(`  - Backend: ${finalConfig.OPENCODE_SERVER_URL}`);
 console.log(`  - Backend Password: ${finalConfig.OPENCODE_SERVER_PASSWORD ? 'Configured' : 'Not configured'}`);
 console.log(`  - OpenCode Path: ${finalConfig.OPENCODE_PATH}`);
 console.log(`  - API Key: ${finalConfig.API_KEY ? 'Configured' : 'Not configured (no auth)'}`);
+console.log(
+  `  - API Keys: ${finalConfig.API_KEYS.length > 0 ? `Configured (n=${finalConfig.API_KEYS.length})` : 'Not configured'}`,
+);
+console.log(
+  `  - Fallback Proxies: ${finalConfig.UPSTREAM_PROXIES.length > 0 ? `Configured (n=${finalConfig.UPSTREAM_PROXIES.length}, ${finalConfig.UPSTREAM_PROXY_STRATEGY})` : 'Direct-only'}`,
+);
 console.log(`  - Zen API Key: ${finalConfig.ZEN_API_KEY ? 'Configured' : 'Not configured'}`);
 console.log(`  - Disable Tools: ${finalConfig.DISABLE_TOOLS ? 'Yes' : 'No'}`);
 console.log(`  - External Tools Mode: ${finalConfig.EXTERNAL_TOOLS_MODE}`);

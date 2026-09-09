@@ -7,7 +7,7 @@ import path from 'path';
 import { createOpencodeClient } from '@opencode-ai/sdk';
 import type { OpencodeClient } from '@opencode-ai/sdk';
 import type { Application, Request, Response, NextFunction } from 'express';
-import { buildExternalToolRegistry } from './tool-runtime/registry.js';
+import { buildExternalToolRegistry, normalizeToolNameForMatch } from './tool-runtime/registry.js';
 import { resolveMaxRetries } from './retry/policy.js';
 import { buildToolExposure } from './tool-runtime/router.js';
 import { evaluateToolPolicy } from './tool-runtime/policy.js';
@@ -26,9 +26,11 @@ import {
 } from './config/proxy-config.js';
 import { buildBackendAuthHeaders, ensureBackend, backendState } from './backend/manager.js';
 import { createCollector } from './stream/collector.js';
+import { createProxyPool } from './upstream-proxy/pool.js';
 import { registerChatRoutes } from './routes/chat.js';
 import { registerResponsesRoutes } from './routes/responses.js';
 import { registerMessagesRoutes } from './routes/messages.js';
+import { registerInteractionsRoutes } from './routes/interactions.js';
 import { registerSystemRoutes, registerNotFoundRoute } from './routes/system.js';
 import type { ProxyConfig } from './types/config.js';
 import type {
@@ -41,6 +43,7 @@ import type {
 import type { ProxyClient, ProviderInfo, ModelInfo, ResolvedModel } from './types/client.js';
 import type { ResponseStateEntry } from './types/backend.js';
 import { asRecord, toErrorMessage } from './utils/guards.js';
+import { buildEffectiveApiKeys, createApiKeyVerifier } from './auth/keys.js';
 
 // P4: thin re-exports to preserve original import paths
 // (tests/env-alias.test.js, stream-hardening.test.js import these from '../src/proxy.js').
@@ -49,6 +52,7 @@ export { normalizeBool, resolveDisableTools, withTimeout };
 export function createApp(config: ProxyConfig): CreateAppResult {
   const {
     API_KEY,
+    API_KEYS = [],
     OPENCODE_SERVER_URL,
     OPENCODE_SERVER_PASSWORD,
     REQUEST_TIMEOUT_MS = DEFAULT_REQUEST_TIMEOUT_MS,
@@ -68,6 +72,10 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     CLEANUP_INTERVAL_MS,
     CLEANUP_MAX_AGE_MS,
     OPENCODE_HOME_BASE,
+    UPSTREAM_PROXIES = [],
+    UPSTREAM_PROXY_STRATEGY = 'failover-rr',
+    UPSTREAM_PROXY_COOLDOWN_MS = 300000,
+    UPSTREAM_PROXY_NO_PROXY = [],
   } = config;
 
   // Effective retry budget: total attempts = 1 + maxRetries.
@@ -89,14 +97,20 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   const rawClient: OpencodeClient = createOpencodeClient({ baseUrl: OPENCODE_SERVER_URL, headers: clientHeaders });
   const client = rawClient as unknown as ProxyClient;
 
+  // Multi-key auth (A): legacy single + list merge; empty = no auth (unchanged).
+  // Single shared verifier instance (also exposed via ctx for system routes).
+  const effectiveApiKeys: string[] = buildEffectiveApiKeys(API_KEY, API_KEYS);
+  const apiKeyVerifier = createApiKeyVerifier(effectiveApiKeys);
+
   // Auth middleware (accepts Authorization: Bearer and x-api-key for Anthropic SDK compat)
   app.use((req: Request, res: Response, next: NextFunction): void => {
     if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/health/details' || req.path === '/metrics')
       return next();
-    if (API_KEY && (API_KEY as string).trim() !== '') {
-      const authHeader: unknown = req.headers.authorization;
-      const apiKeyHeader: unknown = req.headers['x-api-key'];
-      if (!((authHeader && authHeader === `Bearer ${API_KEY}`) || (apiKeyHeader && apiKeyHeader === API_KEY))) {
+    if (apiKeyVerifier.keys.length > 0) {
+      const matchedIndex = apiKeyVerifier.matchedIndex(
+        req as unknown as { headers: { authorization?: unknown; 'x-api-key'?: unknown } },
+      );
+      if (matchedIndex < 0) {
         if (req.path === '/v1/messages') {
           res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: 'Unauthorized' } });
           return;
@@ -104,6 +118,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
         res.status(401).json({ error: { message: 'Unauthorized' } });
         return;
       }
+      (req as unknown as Record<string, unknown>)['apiKeyId'] = `key-${matchedIndex + 1}`;
     }
     next();
   });
@@ -573,7 +588,13 @@ export function createApp(config: ProxyConfig): CreateAppResult {
 
   const matchesAllowedToolName = (toolId: unknown, allowedToolName: unknown): boolean => {
     if (!toolId || !allowedToolName || typeof toolId !== 'string' || typeof allowedToolName !== 'string') return false;
-    return toolId === allowedToolName || toolId.endsWith(`.${allowedToolName}`) || toolId.endsWith(`/${allowedToolName}`);
+    if (toolId === allowedToolName || toolId.endsWith(`.${allowedToolName}`) || toolId.endsWith(`/${allowedToolName}`))
+      return true;
+    // Separator/case-insensitive fallback so legacy `web_fetch` matches the
+    // real backend id `webfetch` (and `web_search` matches `websearch`).
+    const a = normalizeToolNameForMatch(toolId);
+    const b = normalizeToolNameForMatch(allowedToolName);
+    return a !== '' && a === b;
   };
 
   const resolveInternalAllowedToolIds = (
@@ -767,10 +788,41 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   const collector = createCollector({ client, logDebug });
   const { promptWithTimeout, pollForAssistantResponse, collectFromEvents, extractFromParts } = collector;
 
+  // P3: fallback proxy pool — direct-only until a free-limit error engages it.
+  // proxiedFetch auto-falls-back to direct while disengaged, so the proxy
+  // client behaves identically to the direct one until engagement. Loopback
+  // targets always bypass (see pool.ts), keeping the default managed backend
+  // direct. SSE subscribe ignores custom fetch (SDK gap): fallback attempts
+  // use poll, never collectFromEvents (see routes).
+  const proxyPool = createProxyPool({
+    proxies: UPSTREAM_PROXIES,
+    strategy: UPSTREAM_PROXY_STRATEGY,
+    cooldownMs: UPSTREAM_PROXY_COOLDOWN_MS,
+    noProxy: UPSTREAM_PROXY_NO_PROXY,
+    logDebug,
+  });
+  let proxyClient: ProxyClient | null = null;
+  let proxyPromptWithTimeout = promptWithTimeout;
+  let proxyPollForAssistantResponse = pollForAssistantResponse;
+  if (proxyPool.hasProxies()) {
+    const proxiedFetch = (input: unknown, init?: unknown): Promise<unknown> =>
+      proxyPool.proxiedFetch(input, init) as Promise<unknown>;
+    const rawProxyClient: OpencodeClient = createOpencodeClient({
+      baseUrl: OPENCODE_SERVER_URL,
+      headers: clientHeaders,
+      fetch: proxiedFetch as unknown as (req: globalThis.Request) => Promise<globalThis.Response>,
+    });
+    proxyClient = rawProxyClient as unknown as ProxyClient;
+    const proxyCollector = createCollector({ client: proxyClient, logDebug });
+    proxyPromptWithTimeout = proxyCollector.promptWithTimeout;
+    proxyPollForAssistantResponse = proxyCollector.pollForAssistantResponse;
+  }
+
   const ctx: AppContext = {
     client,
     config,
     API_KEY: String(API_KEY ?? ''),
+    API_KEYS: effectiveApiKeys,
     OPENCODE_SERVER_URL: String(OPENCODE_SERVER_URL ?? ''),
     OPENCODE_SERVER_PASSWORD: String(OPENCODE_SERVER_PASSWORD ?? ''),
     REQUEST_TIMEOUT_MS: Number(REQUEST_TIMEOUT_MS),
@@ -839,6 +891,10 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     collectFromEvents,
     pollForAssistantResponse,
     extractFromParts,
+    proxyPool,
+    proxyClient,
+    proxyPromptWithTimeout,
+    proxyPollForAssistantResponse,
     getCachedToolIds: () => cachedToolIds,
     getCachedToolIdsAt: () => cachedToolIdsAt,
   };
@@ -848,6 +904,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   registerChatRoutes(app, ctx);
   registerResponsesRoutes(app, ctx);
   registerMessagesRoutes(app, ctx);
+  registerInteractionsRoutes(app, ctx);
   registerNotFoundRoute(app);
 
   return { app, client };

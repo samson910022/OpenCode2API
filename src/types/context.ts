@@ -1,6 +1,7 @@
 import type { ProxyConfig } from './config.js';
 import type { ProxyClient, ResolvedModel, ModelInfo, ProviderInfo } from './client.js';
 import type { ResponseStateEntry } from './backend.js';
+import type { UpstreamProxyPool } from '../upstream-proxy/pool.js';
 import type { ExternalToolEntry } from '../tool-runtime/registry.js';
 import type { ValidatedToolCall } from '../tool-runtime/validator.js';
 import type { FinalToolCall } from '../tool-runtime/parser.js';
@@ -55,7 +56,7 @@ export interface CollectorHandle {
     sessionId: string,
     timeoutMs: number,
     intervalMs?: number
-  ) => Promise<{ content: string; reasoning: string; error: unknown }>;
+  ) => Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[] }>;
   collectFromEvents: (
     sessionId: string,
     timeoutMs: number,
@@ -78,6 +79,7 @@ export interface AppContext {
   client: ProxyClient;
   config: ProxyConfig;
   API_KEY: string;
+  API_KEYS: string[];
   OPENCODE_SERVER_URL: string;
   OPENCODE_SERVER_PASSWORD: string;
   REQUEST_TIMEOUT_MS: number;
@@ -150,6 +152,11 @@ export interface AppContext {
   collectFromEvents: CollectorHandle['collectFromEvents'];
   pollForAssistantResponse: CollectorHandle['pollForAssistantResponse'];
   extractFromParts: CollectorHandle['extractFromParts'];
+  /** Fallback proxy pool (P3): direct-only when unconfigured. */
+  proxyPool: UpstreamProxyPool;
+  proxyClient: ProxyClient | null;
+  proxyPromptWithTimeout: CollectorHandle['promptWithTimeout'];
+  proxyPollForAssistantResponse: CollectorHandle['pollForAssistantResponse'];
   getCachedToolIds: () => string[] | null;
   getCachedToolIdsAt: () => number;
 }

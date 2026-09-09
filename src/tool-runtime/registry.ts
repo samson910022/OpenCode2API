@@ -240,7 +240,10 @@ export function findExternalToolByName(registry: unknown, name: unknown): Extern
   return matches.length === 1 && matches[0] ? matches[0] : null;
 }
 
-function normalizeToolNameForMatch(name: unknown): string {
+// Shared with the internal-allowlist matcher (proxy.ts) so `web_fetch` and
+// `webfetch` (likewise `web_search`/`websearch`) resolve identically on both
+// the external-bridge and internal-allowlist paths.
+export function normalizeToolNameForMatch(name: unknown): string {
   return String(name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 

@@ -115,7 +115,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     sessionId: string,
     timeoutMs: number,
     intervalMs: number = DEFAULT_POLL_INTERVAL_MS,
-  ): Promise<{ content: string; reasoning: string; error: unknown }> {
+  ): Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[] }> {
     const pollStart = Date.now();
     const startedAt = Date.now();
     // Best-effort snapshot of the most recent in-flight assistant message. Polling
@@ -123,7 +123,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     // the text part only afterwards, so returning on the first non-empty snapshot
     // truncates the answer to the reasoning alone. Keep the partial around purely as
     // a timeout fallback and otherwise wait for the message to actually finish.
-    let lastPartial: { content: string; reasoning: string; error: null } | null = null;
+    let lastPartial: { content: string; reasoning: string; error: null; toolParts: unknown[] } | null = null;
     while (Date.now() - startedAt < timeoutMs) {
       const messagesRes: unknown = await client.session.messages({ path: { id: sessionId } });
       const messages = extractMessagesList(messagesRes);
@@ -170,10 +170,10 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
               reasoningLen: reasoning.length,
               error: error ? (asRecord(error)['name'] as unknown) : null,
             });
-            return { content, reasoning, error };
+            return { content, reasoning, error, toolParts };
           }
           if (content || reasoning) {
-            lastPartial = { content, reasoning, error: null };
+            lastPartial = { content, reasoning, error: null, toolParts };
           }
           break;
         }

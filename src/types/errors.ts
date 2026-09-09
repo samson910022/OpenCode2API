@@ -7,6 +7,7 @@ export interface NormalizedUpstreamError extends Error {
   data?: unknown;
   availableModels?: unknown;
   responseHeaders?: Record<string, string | number | undefined> | null;
+  responseBody?: string | null;
   isRetryable?: boolean;
   cause?: unknown;
 }
@@ -20,6 +21,7 @@ export interface RawBackendErrorLike {
   statusCode?: unknown;
   isRetryable?: unknown;
   responseHeaders?: unknown;
+  responseBody?: unknown;
   data?: unknown;
   [key: string]: unknown;
 }

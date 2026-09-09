@@ -1,6 +1,7 @@
 {
     "PORT": 10000,
     "API_KEY": "your-secret-api-key",
+    "API_KEYS": [],
     "BIND_HOST": "0.0.0.0",
     "DISABLE_TOOLS": true,
     "EXTERNAL_TOOLS_MODE": "proxy-bridge",
@@ -26,5 +27,9 @@
     "ZEN_API_KEY": "",
     "MANAGE_BACKEND": false,
     "REQUEST_TIMEOUT_MS": 180000,
-    "RETRY_MAX_RETRIES": 3
+    "RETRY_MAX_RETRIES": 3,
+    "UPSTREAM_PROXIES": [],
+    "UPSTREAM_PROXY_STRATEGY": "failover-rr",
+    "UPSTREAM_PROXY_COOLDOWN_MS": 300000,
+    "UPSTREAM_PROXY_NO_PROXY": ["localhost", "127.0.0.1", "::1"]
 }

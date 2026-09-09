@@ -1,5 +1,7 @@
 // P4 TS: proxy config defaults + pure bool/config builders (ported from P3 .js, behavior identical).
 import type { DisableToolsOptions, ProxyConfig, ProxyConfigOptions } from '../types/config.js';
+import { mergeApiKeySources } from '../auth/keys.js';
+import { DEFAULT_PROXY_COOLDOWN_MS, DEFAULT_PROXY_NO_PROXY, parseProxyList, parseProxyNoProxyList } from '../upstream-proxy/pool.js';
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
 export const DEFAULT_POLL_INTERVAL_MS = 500;
@@ -132,9 +134,21 @@ export function buildProxyConfig(options: unknown = {}): ProxyConfig {
     );
   }
   const useIsolatedRaw: unknown = opts['USE_ISOLATED_HOME'];
+  // Multi-key auth (A): caller options win as a whole layer; otherwise env.
+  // Both the list (API_KEYS/OPENCODE_API_KEYS, comma-separated) and the legacy
+  // single (API_KEY) merge with empty values ignored (never blocking).
+  // NOTE: `!== undefined` is intentional — an explicitly passed empty value
+  // isolates tests/Docker defaults from ambient env leakage.
+  const optsProvidedKeys = opts['API_KEYS'] !== undefined || opts['API_KEY'] !== undefined;
+  const resolvedApiKeys: string[] = optsProvidedKeys
+    ? mergeApiKeySources(opts['API_KEYS'], opts['API_KEY'])
+    : mergeApiKeySources(process.env['OPENCODE_API_KEYS'], process.env['API_KEYS'], process.env['API_KEY']);
+  // Display single = first effective key (same rule as index.ts prod path).
+  const resolvedApiKey: string = resolvedApiKeys[0] ?? '';
   const config: ProxyConfig = {
     PORT: (opts['PORT'] as number) || 10000,
-    API_KEY: (opts['API_KEY'] as string) || '',
+    API_KEY: resolvedApiKey,
+    API_KEYS: resolvedApiKeys,
     OPENCODE_SERVER_URL: (opts['OPENCODE_SERVER_URL'] as string) || 'http://127.0.0.1:10001',
     OPENCODE_SERVER_PASSWORD:
       (opts['OPENCODE_SERVER_PASSWORD'] as string) || process.env['OPENCODE_SERVER_PASSWORD'] || '',
@@ -218,6 +232,26 @@ export function buildProxyConfig(options: unknown = {}): ProxyConfig {
     CLEANUP_MAX_AGE_MS:
       Number.isFinite(cleanupMaxAgeMs) && cleanupMaxAgeMs > 0 ? cleanupMaxAgeMs : 24 * 60 * 60 * 1000,
     OPENCODE_HOME_BASE: (opts['OPENCODE_HOME_BASE'] as string | null) || null,
+    // Fallback proxy pool (P3): empty = direct-only (default, zero overhead).
+    // Library path mirrors index.ts: explicit opts layer wins as a whole,
+    // otherwise env (canonical OPENCODE_ name first, then legacy alias).
+    UPSTREAM_PROXIES:
+      opts['UPSTREAM_PROXIES'] !== undefined || opts['UPSTREAM_PROXY_URLS'] !== undefined
+        ? parseProxyList([opts['UPSTREAM_PROXIES'], opts['UPSTREAM_PROXY_URLS']].flatMap((v) => (Array.isArray(v) ? v : [v])))
+        : parseProxyList([process.env['OPENCODE_UPSTREAM_PROXIES'], process.env['UPSTREAM_PROXIES']]),
+    UPSTREAM_PROXY_STRATEGY:
+      (typeof opts['UPSTREAM_PROXY_STRATEGY'] === 'string' && (opts['UPSTREAM_PROXY_STRATEGY'] as string)) ||
+      process.env['OPENCODE_UPSTREAM_PROXY_STRATEGY'] ||
+      'failover-rr',
+    UPSTREAM_PROXY_COOLDOWN_MS: Number(
+      opts['UPSTREAM_PROXY_COOLDOWN_MS'] || process.env['OPENCODE_UPSTREAM_PROXY_COOLDOWN_MS'] || DEFAULT_PROXY_COOLDOWN_MS,
+    ),
+    UPSTREAM_PROXY_NO_PROXY: parseProxyNoProxyList(
+      opts['UPSTREAM_PROXY_NO_PROXY'] !== undefined
+        ? opts['UPSTREAM_PROXY_NO_PROXY']
+        : (process.env['OPENCODE_UPSTREAM_PROXY_NO_PROXY'] ?? process.env['UPSTREAM_PROXY_NO_PROXY']),
+      DEFAULT_PROXY_NO_PROXY,
+    ),
   };
   return config;
 }

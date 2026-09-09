@@ -1,6 +1,7 @@
 // P4 TS: system routes (models/health/details/metrics/404) (ported from P3 .js, behavior identical).
 import type { Application, Request, Response } from 'express';
 import type { AppContext } from '../types/context.js';
+import { buildEffectiveApiKeys, createApiKeyVerifier } from '../auth/keys.js';
 
 function toErrorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String((e as Record<string, unknown>)?.['message'] ?? e);
@@ -9,6 +10,7 @@ function toErrorMessage(e: unknown): string {
 export function registerSystemRoutes(app: Application, ctx: AppContext): void {
   const {
     API_KEY,
+    API_KEYS = [],
     INTERNAL_TOOL_METRICS_ENABLED,
     INTERNAL_TOOL_DISCOVERY_FIXTURE,
     HEALTH_DETAILS_ENABLED,
@@ -22,13 +24,17 @@ export function registerSystemRoutes(app: Application, ctx: AppContext): void {
     internalToolMetrics,
     getCachedToolIds,
     getCachedToolIdsAt,
+    proxyPool,
   } = ctx;
+  // ctx.API_KEYS is already the effective list built by createApp; the merge
+  // below is idempotent and only covers hand-built contexts in tests.
+  const effectiveApiKeys: string[] =
+    Array.isArray(API_KEYS) && API_KEYS.length > 0 ? [...API_KEYS] : buildEffectiveApiKeys(API_KEY, []);
+  const apiKeyVerifier = createApiKeyVerifier(effectiveApiKeys);
   const hasValidBearerAuth = (req: Request): boolean => {
-    if (!API_KEY || API_KEY.trim() === '') return true;
-    const authHeader: unknown = req.headers.authorization;
-    const apiKeyHeader: unknown = req.headers['x-api-key'];
-    return Boolean(
-      (authHeader && authHeader === `Bearer ${API_KEY}`) || (apiKeyHeader && apiKeyHeader === API_KEY),
+    if (apiKeyVerifier.keys.length === 0) return true;
+    return apiKeyVerifier.isAuthorized(
+      req as unknown as { headers: { authorization?: unknown; 'x-api-key'?: unknown } },
     );
   };
 
@@ -101,6 +107,7 @@ export function registerSystemRoutes(app: Application, ctx: AppContext): void {
             'resultingMode',
           ],
         },
+        fallback_proxies: proxyPool ? proxyPool.getStatus() : null,
       },
     });
   });
@@ -117,6 +124,7 @@ export function registerSystemRoutes(app: Application, ctx: AppContext): void {
     }
 
     const cached = getCachedToolIds();
+    const proxyStatus = proxyPool ? proxyPool.getStatus() : null;
     const metricsLines = [
       '# HELP opencode_internal_tool_mode_requests_total Count of internal tool mode selections by mode.',
       '# TYPE opencode_internal_tool_mode_requests_total counter',
@@ -132,6 +140,12 @@ export function registerSystemRoutes(app: Application, ctx: AppContext): void {
       '# HELP opencode_internal_tool_cache_ids Number of cached backend tool IDs.',
       '# TYPE opencode_internal_tool_cache_ids gauge',
       `opencode_internal_tool_cache_ids ${cached ? cached.length : 0}`,
+      '# HELP opencode_fallback_proxy_configured Number of configured fallback proxies.',
+      '# TYPE opencode_fallback_proxy_configured gauge',
+      `opencode_fallback_proxy_configured ${proxyStatus ? proxyStatus.configured : 0}`,
+      '# HELP opencode_fallback_proxy_engaged Whether the fallback proxy pool is engaged (1) or direct (0).',
+      '# TYPE opencode_fallback_proxy_engaged gauge',
+      `opencode_fallback_proxy_engaged ${proxyStatus && proxyStatus.engaged ? 1 : 0}`,
     ];
 
     res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');

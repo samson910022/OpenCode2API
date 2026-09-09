@@ -18,6 +18,67 @@ function collectMessageParts(error: unknown): string {
   return parts.join(' ');
 }
 
+function readStatusCode(error: unknown): number | null {
+  const record = asRecord(error);
+  const data = asRecord(record['data']);
+  const direct: unknown = record['statusCode'] ?? data['statusCode'] ?? data['status'];
+  if (typeof direct === 'number' && Number.isFinite(direct)) return direct;
+  if (typeof direct === 'string') {
+    const n = Number(direct.trim());
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  const candidates: unknown[] = [record['message'], data['message']];
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const m = candidate.match(/^\s*(\d{3})\s*:/);
+    if (m?.[1]) return Number(m[1]);
+  }
+  return null;
+}
+
+function readResponseBodyText(error: unknown): string {
+  const record = asRecord(error);
+  const data = asRecord(record['data']);
+  const raw: unknown = record['responseBody'] ?? data['responseBody'] ?? null;
+  if (typeof raw === 'string') return raw.slice(0, 4096);
+  if (raw && typeof raw === 'object') {
+    try {
+      return JSON.stringify(raw).slice(0, 4096);
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
+/**
+ * Classify free-tier/Go quota exhaustion that should trigger proxy fallback.
+ *
+ * Fingerprint (mirrors upstream `session/retry.ts` + Zen `zen/util/handler.ts`):
+ * status 429 AND body/type carrying `FreeUsageLimitError` (anonymous/IP daily
+ * quota) or `GoUsageLimitError` (Go subscription 5h/weekly/monthly quota).
+ * Plain 5xx / CreditsError-401 / generic 429s without the class marker do NOT
+ * match — those keep the existing direct-retry path and never engage proxies.
+ */
+export function parseFreeLimitKind(error: unknown): 'free' | 'go' | null {
+  if (!error) return null;
+  if (readStatusCode(error) !== 429) return null;
+  const record = asRecord(error);
+  const data = asRecord(record['data']);
+  const pickStr = (v: unknown): string => (typeof v === 'string' ? v : '');
+  const haystack = `${collectMessageParts(error)} ${readResponseBodyText(error)} ${pickStr(data['limitName'])} ${pickStr(record['reason'])} ${pickStr(data['type'])} ${pickStr(data['code'])} ${pickStr(data['name'])}`;
+  if (/CreditsError|insufficient balance/i.test(haystack)) return null;
+  if (/GoUsageLimitError|account_rate_limit/i.test(haystack)) return 'go';
+  if (/FreeUsageLimitError|free_tier_limit/i.test(haystack)) return 'free';
+  if (/free usage (exceeded|limit)|usage limit reached|(5-hour|weekly|monthly) usage limit/i.test(haystack)) return 'free';
+  return null;
+}
+
+/** True when the error is free/Go quota exhaustion eligible for proxy fallback. */
+export function isFreeUsageLimitError(error: unknown): boolean {
+  return parseFreeLimitKind(error) !== null;
+}
+
 /**
  * Detect transient upstream provider failures that succeed on retry.
  *
@@ -161,6 +222,10 @@ export function normalizeBackendError(raw: unknown): NormalizedUpstreamError {
   if (responseHeaders && typeof responseHeaders === 'object') {
     err.responseHeaders = responseHeaders as Record<string, string | number | undefined>;
   }
+  // Preserve the raw body text so isFreeUsageLimitError can match the Zen
+  // error class (FreeUsageLimitError/GoUsageLimitError) after normalization.
+  const bodyText = readResponseBodyText(raw);
+  if (bodyText) err.responseBody = bodyText;
   if (typeof record['isRetryable'] === 'boolean') err.isRetryable = record['isRetryable'] as boolean;
   else if (typeof data['isRetryable'] === 'boolean') err.isRetryable = data['isRetryable'] as boolean;
   err.cause = raw;
