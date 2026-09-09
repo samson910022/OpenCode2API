@@ -2,7 +2,7 @@
 import { startProxy, normalizeBool, resolveDisableTools } from './src/proxy.js';
 import { resolveMaxRetries } from './src/retry/policy.js';
 import { mergeApiKeySources } from './src/auth/keys.js';
-import { DEFAULT_PROXY_COOLDOWN_MS, parseProxyList, parseProxyNoProxyList } from './src/upstream-proxy/pool.js';
+import { DEFAULT_PROXY_COOLDOWN_MS, normalizeProxyCooldownMs, normalizeProxyStrategy, parseProxyList, parseProxyNoProxyList } from './src/upstream-proxy/pool.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -225,12 +225,14 @@ const finalConfig: ProxyConfig = {  PORT:
     const file = parseProxyList(fileConfig['UPSTREAM_PROXIES']);
     return file.length > 0 ? file : [...defaultConfig.UPSTREAM_PROXIES];
   })(),
-  UPSTREAM_PROXY_STRATEGY:
+  UPSTREAM_PROXY_STRATEGY: normalizeProxyStrategy(
     process.env['OPENCODE_UPSTREAM_PROXY_STRATEGY'] ||
-    readFileString('UPSTREAM_PROXY_STRATEGY', defaultConfig.UPSTREAM_PROXY_STRATEGY),
-  UPSTREAM_PROXY_COOLDOWN_MS:
+      readFileString('UPSTREAM_PROXY_STRATEGY', defaultConfig.UPSTREAM_PROXY_STRATEGY),
+  ),
+  UPSTREAM_PROXY_COOLDOWN_MS: normalizeProxyCooldownMs(
     parsePort(process.env['OPENCODE_UPSTREAM_PROXY_COOLDOWN_MS'], 0) ||
-    readFileNumber('UPSTREAM_PROXY_COOLDOWN_MS', defaultConfig.UPSTREAM_PROXY_COOLDOWN_MS),
+      readFileNumber('UPSTREAM_PROXY_COOLDOWN_MS', defaultConfig.UPSTREAM_PROXY_COOLDOWN_MS),
+  ),
   UPSTREAM_PROXY_NO_PROXY: parseProxyNoProxyList(
     process.env['OPENCODE_UPSTREAM_PROXY_NO_PROXY'] ?? process.env['UPSTREAM_PROXY_NO_PROXY'] ?? fileConfig['UPSTREAM_PROXY_NO_PROXY'],
     defaultConfig.UPSTREAM_PROXY_NO_PROXY,

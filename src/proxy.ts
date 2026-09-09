@@ -107,10 +107,10 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/health/details' || req.path === '/metrics')
       return next();
     if (apiKeyVerifier.keys.length > 0) {
-      const matchedIndex = apiKeyVerifier.matchedIndex(
+      const authorized = apiKeyVerifier.isAuthorized(
         req as unknown as { headers: { authorization?: unknown; 'x-api-key'?: unknown } },
       );
-      if (matchedIndex < 0) {
+      if (!authorized) {
         if (req.path === '/v1/messages') {
           res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: 'Unauthorized' } });
           return;
@@ -118,7 +118,6 @@ export function createApp(config: ProxyConfig): CreateAppResult {
         res.status(401).json({ error: { message: 'Unauthorized' } });
         return;
       }
-      (req as unknown as Record<string, unknown>)['apiKeyId'] = `key-${matchedIndex + 1}`;
     }
     next();
   });

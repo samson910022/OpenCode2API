@@ -97,6 +97,7 @@ describe('grounding pure helpers', () => {
     test('detect/strip hosted search tools', () => {
         expect(detectHostedSearchTools([{ type: 'web_search' }]).requested).toBe(true);
         expect(detectHostedSearchTools([{ type: 'Google_Search' }]).requested).toBe(true);
+        expect(detectHostedSearchTools([{ type: 'web_search_20260222' }]).requested).toBe(true);
         expect(detectHostedSearchTools([{ type: 'function', function: { name: 'x' } }]).requested).toBe(false);
         expect(detectHostedSearchTools('nope').requested).toBe(false);
         const mixed = [{ type: 'web_search' }, { type: 'function', function: { name: 'f' } }];

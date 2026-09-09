@@ -10,6 +10,9 @@ import { ProxyAgent, Socks5ProxyAgent, fetch as undiciFetch } from 'undici';
 import type { Dispatcher } from 'undici';
 
 export type ProxyStrategy = 'failover-rr' | 'round-robin' | 'random';
+// NOTE: `failover-rr` and `round-robin` are aliases (both advance round-robin
+// across engagements; transport failures always fail over to the next healthy
+// proxy). Kept as separate names for forward compatibility.
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 
@@ -77,6 +80,19 @@ export function parseProxyNoProxyList(value: unknown, fallback: string[]): strin
 
 export const DEFAULT_PROXY_NO_PROXY = ['localhost', '127.0.0.1', '::1'];
 export const DEFAULT_PROXY_COOLDOWN_MS = 300000;
+export const DEFAULT_PROXY_STRATEGY: ProxyStrategy = 'failover-rr';
+
+/** Allow-list the strategy at the config layer so the stored value is always real. */
+export function normalizeProxyStrategy(value: unknown): ProxyStrategy {
+  const v = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return v === 'round-robin' || v === 'random' || v === 'failover-rr' ? (v as ProxyStrategy) : DEFAULT_PROXY_STRATEGY;
+}
+
+/** Clamp the cooldown at the config layer (positive finite, else default). */
+export function normalizeProxyCooldownMs(value: unknown): number {
+  const n = typeof value === 'number' ? value : parseInt(String(value ?? ''), 10);
+  return Number.isFinite(n) && (n as number) > 0 ? Math.floor(n as number) : DEFAULT_PROXY_COOLDOWN_MS;
+}
 
 export interface ProxyPoolOptions {
   proxies?: unknown;
@@ -123,15 +139,8 @@ function targetHost(input: unknown): string {
 
 export function createProxyPool(options: ProxyPoolOptions = {}): UpstreamProxyPool {
   const proxies = parseProxyList(options.proxies);
-  const rawStrategy = typeof options.strategy === 'string' ? options.strategy.trim().toLowerCase() : '';
-  const strategy: ProxyStrategy =
-    rawStrategy === 'round-robin' || rawStrategy === 'random' || rawStrategy === 'failover-rr'
-      ? (rawStrategy as ProxyStrategy)
-      : 'failover-rr';
-  const cooldownMs =
-    typeof options.cooldownMs === 'number' && Number.isFinite(options.cooldownMs) && options.cooldownMs > 0
-      ? Math.floor(options.cooldownMs)
-      : DEFAULT_PROXY_COOLDOWN_MS;
+  const strategy = normalizeProxyStrategy(options.strategy);
+  const cooldownMs = normalizeProxyCooldownMs(options.cooldownMs);
   const noProxy = new Set(parseProxyNoProxyList(options.noProxy, DEFAULT_PROXY_NO_PROXY));
   const logDebug = typeof options.logDebug === 'function' ? options.logDebug : (): void => {};
   // NOTE: undici logs an ExperimentalWarning for SOCKS5 support on first use;

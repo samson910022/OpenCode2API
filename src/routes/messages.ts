@@ -23,6 +23,7 @@ import {
 } from '../tool-runtime/parser.js';
 import { isTransientUpstreamError, normalizeBackendError, transformUpstreamError } from '../errors/upstream.js';
 import { engageFallbackForFreeLimit } from '../upstream-proxy/fallback.js';
+import { detectHostedSearchTools } from '../search/grounding.js';
 import {
   withTimeout,
   DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
@@ -102,13 +103,15 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           const toolsRaw: unknown = body['tools'];
           const tools: unknown[] = Array.isArray(toolsRaw) ? (toolsRaw as unknown[]) : [];
           // Anthropic server-side web_search would be silently dropped by the
-          // function-tool bridge; fail loudly with a pointer instead.
-          const hasHostedSearch = tools.some((def: unknown) => {
-            const r = asRecord(def);
-            const type = typeof r['type'] === 'string' ? String(r['type']) : '';
-            const name = typeof r['name'] === 'string' ? String(r['name']) : '';
-            return type.startsWith('web_search') || name === 'web_search';
-          });
+          // function-tool bridge; fail loudly with a pointer instead. Uses the
+          // shared helper (covers versioned types like web_search_20260222)
+          // plus the bare `web_search` name for name-only defs.
+          const hasHostedSearch =
+            detectHostedSearchTools(tools).requested ||
+            tools.some((def: unknown) => {
+              const r = asRecord(def);
+              return typeof r['name'] === 'string' && String(r['name']) === 'web_search';
+            });
           if (hasHostedSearch) {
             res.status(400).json({
               type: 'error',

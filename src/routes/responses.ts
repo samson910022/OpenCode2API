@@ -168,6 +168,15 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             resultingMode: toolMode,
           };
         }
+      } else if (hostedSearch.requested && toolMode === TOOL_MODE.EXTERNAL_BRIDGE) {
+        // Metadata only: the overrides union below already grants websearch,
+        // but without this trackToolMode/health would under-report it.
+        if (!internalToolContext.allowedToolNames.includes('websearch')) {
+          internalToolContext = {
+            ...internalToolContext,
+            allowedToolNames: [...internalToolContext.allowedToolNames, 'websearch'],
+          };
+        }
       }
       trackToolMode(toolMode, {
         configuredAllowlist: internalToolContext.allowedToolNames,

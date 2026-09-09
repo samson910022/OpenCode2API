@@ -91,6 +91,13 @@ describe('hosted-search routing guards', () => {
         expect(res.statusCode).toBe(400);
         expect(res.body.type).toBe('error');
         expect(res.body.error.type).toBe('invalid_request_error');
+        const google = await request(app).post('/v1/messages').send({
+            model: 'opencode/kimi-k2.5',
+            max_tokens: 100,
+            messages: [{ role: 'user', content: 'hi' }],
+            tools: [{ type: 'google_search' }],
+        });
+        expect(google.statusCode).toBe(400);
     });
 
     test('plain function tools still bridge on chat/messages', async () => {

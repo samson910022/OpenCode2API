@@ -572,7 +572,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   }
                 } catch (e: unknown) {
                   logDebug('Stream error:', toErrorMessage(e));
-                  if (fallbackToProxy) collected = { __error: e };
+                  collected = { __error: e };
                 }
 
                 const collectedRecord = asRecord(collected);

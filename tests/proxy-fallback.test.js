@@ -103,6 +103,19 @@ describe('proxy list parsing', () => {
         expect(parseProxyNoProxyList('', ['localhost'])).toEqual(['localhost']);
         expect(parseProxyNoProxyList('Example.COM, a', [])).toEqual(['example.com', 'a']);
     });
+
+    test('strategy/cooldown normalize to truthful values', async () => {
+        const pool = await import('../src/upstream-proxy/pool.js');
+        expect(pool.normalizeProxyStrategy('random')).toBe('random');
+        expect(pool.normalizeProxyStrategy(' ROUND-ROBIN ')).toBe('round-robin');
+        expect(pool.normalizeProxyStrategy('turbo')).toBe('failover-rr');
+        expect(pool.normalizeProxyStrategy('')).toBe('failover-rr');
+        expect(pool.normalizeProxyCooldownMs(60000)).toBe(60000);
+        expect(pool.normalizeProxyCooldownMs('15000')).toBe(15000);
+        expect(pool.normalizeProxyCooldownMs('garbage')).toBe(300000);
+        expect(pool.normalizeProxyCooldownMs(0)).toBe(300000);
+        expect(pool.normalizeProxyCooldownMs(-5)).toBe(300000);
+    });
 });
 
 describe('proxy pool (network-free)', () => {

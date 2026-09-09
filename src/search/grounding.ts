@@ -5,6 +5,12 @@
 // items + `url_citation` annotations from the backend tool parts.
 
 export const HOSTED_SEARCH_TOOL_TYPES = ['web_search', 'web_search_preview', 'google_search'];
+/** True for hosted search tool types, incl. versioned variants (e.g. Anthropic `web_search_20260222`). */
+export function isHostedSearchType(type: unknown): boolean {
+  if (typeof type !== 'string') return false;
+  const v = type.toLowerCase();
+  return HOSTED_SEARCH_TOOL_TYPES.includes(v) || v.startsWith('web_search_') || v.startsWith('web_search-');
+}
 
 export const SEARCH_GROUNDING_INSTRUCTION =
   'A built-in web search tool (websearch) is enabled for this turn. ' +
@@ -26,13 +32,13 @@ export interface HostedSearchRequest {
   kinds: string[];
 }
 
-/** Detect OpenAI/Gemini hosted search tools in a Responses `tools` array. */
+/** Detect OpenAI/Gemini/Anthropic hosted search tools in a `tools` array. */
 export function detectHostedSearchTools(tools: unknown): HostedSearchRequest {
   if (!Array.isArray(tools)) return { requested: false, kinds: [] };
   const kinds: string[] = [];
   for (const def of tools as unknown[]) {
     const t = toolTypeOf(def).toLowerCase();
-    if (HOSTED_SEARCH_TOOL_TYPES.includes(t) && !kinds.includes(t)) kinds.push(t);
+    if (isHostedSearchType(t) && !kinds.includes(t)) kinds.push(t);
   }
   return { requested: kinds.length > 0, kinds };
 }
@@ -40,7 +46,7 @@ export function detectHostedSearchTools(tools: unknown): HostedSearchRequest {
 /** Remove hosted search defs so the external-tool registry stays function-only. */
 export function stripHostedSearchTools(tools: unknown): unknown[] {
   if (!Array.isArray(tools)) return [];
-  return (tools as unknown[]).filter((def) => !HOSTED_SEARCH_TOOL_TYPES.includes(toolTypeOf(def).toLowerCase()));
+  return (tools as unknown[]).filter((def) => !isHostedSearchType(toolTypeOf(def).toLowerCase()));
 }
 
 export interface SearchSource {

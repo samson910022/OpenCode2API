@@ -1,7 +1,7 @@
 // P4 TS: proxy config defaults + pure bool/config builders (ported from P3 .js, behavior identical).
 import type { DisableToolsOptions, ProxyConfig, ProxyConfigOptions } from '../types/config.js';
 import { mergeApiKeySources } from '../auth/keys.js';
-import { DEFAULT_PROXY_COOLDOWN_MS, DEFAULT_PROXY_NO_PROXY, parseProxyList, parseProxyNoProxyList } from '../upstream-proxy/pool.js';
+import { DEFAULT_PROXY_COOLDOWN_MS, DEFAULT_PROXY_NO_PROXY, normalizeProxyCooldownMs, normalizeProxyStrategy, parseProxyList, parseProxyNoProxyList } from '../upstream-proxy/pool.js';
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
 export const DEFAULT_POLL_INTERVAL_MS = 500;
@@ -239,12 +239,13 @@ export function buildProxyConfig(options: unknown = {}): ProxyConfig {
       opts['UPSTREAM_PROXIES'] !== undefined || opts['UPSTREAM_PROXY_URLS'] !== undefined
         ? parseProxyList([opts['UPSTREAM_PROXIES'], opts['UPSTREAM_PROXY_URLS']].flatMap((v) => (Array.isArray(v) ? v : [v])))
         : parseProxyList([process.env['OPENCODE_UPSTREAM_PROXIES'], process.env['UPSTREAM_PROXIES']]),
-    UPSTREAM_PROXY_STRATEGY:
+    UPSTREAM_PROXY_STRATEGY: normalizeProxyStrategy(
       (typeof opts['UPSTREAM_PROXY_STRATEGY'] === 'string' && (opts['UPSTREAM_PROXY_STRATEGY'] as string)) ||
-      process.env['OPENCODE_UPSTREAM_PROXY_STRATEGY'] ||
-      'failover-rr',
-    UPSTREAM_PROXY_COOLDOWN_MS: Number(
-      opts['UPSTREAM_PROXY_COOLDOWN_MS'] || process.env['OPENCODE_UPSTREAM_PROXY_COOLDOWN_MS'] || DEFAULT_PROXY_COOLDOWN_MS,
+        process.env['OPENCODE_UPSTREAM_PROXY_STRATEGY'] ||
+        'failover-rr',
+    ),
+    UPSTREAM_PROXY_COOLDOWN_MS: normalizeProxyCooldownMs(
+      opts['UPSTREAM_PROXY_COOLDOWN_MS'] ?? process.env['OPENCODE_UPSTREAM_PROXY_COOLDOWN_MS'] ?? DEFAULT_PROXY_COOLDOWN_MS,
     ),
     UPSTREAM_PROXY_NO_PROXY: parseProxyNoProxyList(
       opts['UPSTREAM_PROXY_NO_PROXY'] !== undefined

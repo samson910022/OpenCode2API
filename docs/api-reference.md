@@ -233,7 +233,7 @@ POST /v1/interactions
 | `tools` | array | - | 仅支持 `{type: "google_search"}`（等价 `web_search`），其余 function 工具返回 400 |
 | `previous_interaction_id` | string | - | 续写上轮会话（等价 responses 的 `previous_response_id`） |
 | `stream` | boolean | - | SSE：`interaction.created` / `step.delta` / `interaction.completed`（无 `[DONE]`，错误为 `{type:'error'}` 事件；15s heartbeat） |
-| `store` | boolean | - | `false` 则不持久化；仅删除本请求新建的会话，复用的父会话保留 |
+| `store` | boolean | - | `false` 则不持久化；仅删除本请求新建的会话，复用的父会话保留（注意：带 `previous_interaction_id` 的 `store:false` 轮次仍会追加到父会话历史，并非完全无痕） |
 
 响应为 `Interaction` 资源：`{id, status, model, output_text, steps[], usage: {grounding_tool_count}}`，其中 `steps` 含 `google_search_call{queries}`、`google_search_result{sources}`（标注为 opencode websearch 代理结果，非 Google 原生）、`model_output{text, annotations}`。文本往返与 `web_search` 接地逻辑复用 Responses 管线；限流错误的重试与代理 fallback 和其余路由一致（engage + 换 session，最多 `maxAttempts` 次），普通错误直接返回。
 
