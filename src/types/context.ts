@@ -160,7 +160,7 @@ export interface AppContext {
   proxyPollForAssistantResponse: CollectorHandle['pollForAssistantResponse'];
   getCachedToolIds: () => string[] | null;
   getCachedToolIdsAt: () => number;
-  /** Wired N×N translator registry (Phase 1接線; optional so manual test ctx still compiles). */
+  /** Wired N×N translator registry (Phase 1 wiring; optional so manual test ctx still compiles). */
   translators?: TranslatorRegistry;
 }
 

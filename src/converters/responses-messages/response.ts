@@ -8,17 +8,10 @@
  */
 
 import { asRecord } from '../../utils/guards.js';
-import { num, str, targetId } from '../json.js';
+import { makeId, num, str, targetId } from '../json.js';
 
 function newId(prefix: string): string {
-    try {
-        if (typeof globalThis.crypto?.randomUUID === 'function') {
-            return `${prefix}${globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
-        }
-    } catch {
-        // fall through
-    }
-    return `${prefix}${Date.now().toString(36)}${Math.floor(Math.random() * 1e9).toString(36)}`;
+    return makeId(prefix);
 }
 
 /** responses.response -> messages.message. */

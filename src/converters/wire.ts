@@ -1,5 +1,5 @@
 /**
- * Route wiring helpers for the N×N translator registry (Phase 1接線基礎).
+ * Route wiring helpers for the N×N translator registry (Phase 1 wiring base).
  *
  * Rules (AGENTS.md §5/§9 — routes own the wire):
  * - Error envelopes MUST bypass translators (converters assume valid

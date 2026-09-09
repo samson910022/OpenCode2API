@@ -16,6 +16,12 @@
  * CLIProxyAPI where TokenCount serves billing/limits
  * (cf. openai/claude/init.go ClaudeTokenCount). Registry tokenCount calls
  * therefore use the documented fallback.
+ *
+ * Interactions note: the local interactions route only emits
+ * status 'completed' (routes/interactions.ts:376,408 — no incomplete
+ * concept), so all ->interactions translators intentionally map to
+ * completed with zero-filled grounding counts. Length/content_filter
+ * truncation signals are not representable on that wire by design.
  */
 
 import type { Format } from './formats.js';
@@ -42,12 +48,9 @@ export function streamFidelityOf(from: Format, to: Format): StreamFidelity | und
     return STREAM_FIDELITY[`${from}->${to}`];
 }
 
-export const TOKEN_COUNT_REGISTERED = false;
-
 /**
  * Registry-derived source of truth for the TokenCount ledger claim.
- * @deprecated TOKEN_COUNT_REGISTERED is a static snapshot pinned by legacy
- * tests; new code MUST use isTokenCountRegistered(registry) instead.
+ * New code MUST use isTokenCountRegistered(registry) instead of a static flag.
  */
 export function isTokenCountRegistered(registry: import('./registry.js').TranslatorRegistry): boolean {
     return registry.hasAnyTokenCount();

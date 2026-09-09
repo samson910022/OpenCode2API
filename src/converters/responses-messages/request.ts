@@ -13,6 +13,8 @@ import { asRecord } from '../../utils/guards.js';
 import { asArray, str } from '../json.js';
 
 function parseJsonObject(text: string): unknown {
+    // Distinct from normalizeArgs (which returns a JSON string): this returns
+    // a parsed object for tool_use input, {} on any failure.
     try {
         const v = JSON.parse(text || '{}') as unknown;
         return v && typeof v === 'object' ? v : {};
@@ -61,7 +63,15 @@ export function convertResponsesRequestToMessages(model: string, body: unknown, 
                     content: [{ type: 'tool_use', id: str(it['call_id']), name: str(it['name']), input: t === 'function_call' ? parseJsonObject(str(it['arguments'])) : { input: str(it['input']) } }],
                 });
             } else if (t === 'function_call_output' || t === 'custom_tool_call_output') {
-                pushUser([{ type: 'tool_result', tool_use_id: str(it['call_id']), content: toolOutputToMessagesContent(it['output']) }]);
+                const content = toolOutputToMessagesContent(it['output']);
+                // Preserve ERROR: prefix as is_error (mirrors chat-messages).
+                let isError = false;
+                let normalized = content;
+                if (typeof normalized === 'string' && normalized.startsWith('ERROR: ')) {
+                    isError = true;
+                    normalized = normalized.slice('ERROR: '.length);
+                }
+                pushUser([{ type: 'tool_result', tool_use_id: str(it['call_id']), content: normalized, ...(isError ? { is_error: true } : {}) }]);
             }
         }
     }
@@ -71,7 +81,19 @@ export function convertResponsesRequestToMessages(model: string, body: unknown, 
         out['tools'] = tools
             .map((tool) => {
                 const t = asRecord(tool);
-                if (str(t['type']) !== 'function' || !str(t['name'])) return null;
+                const type = str(t['type']);
+                // Keep custom declarations so custom_tool_call invocations above
+                // always have a matching declaration (mirrors chat-responses
+                // custom->function wrapping, adapted to messages shape).
+                if (type === 'custom') {
+                    // Unnamed custom declarations are dropped (validators reject
+                    // empty names); named ones are kept so custom_tool_call
+                    // invocations always have a matching declaration.
+                    if (!str(t['name'])) return null;
+                    const name = str(t['name']);
+                    return { name, description: str(t['description'] ?? ''), input_schema: { type: 'object', properties: { input: { type: 'string' } } } };
+                }
+                if (type !== 'function' || !str(t['name'])) return null;
                 return { name: str(t['name']), description: str(t['description'] ?? ''), input_schema: (t['parameters'] ?? { type: 'object' }) as unknown };
             })
             .filter(Boolean);
@@ -187,7 +209,17 @@ export function convertMessagesRequestToResponses(model: string, body: unknown, 
                     : Array.isArray(raw)
                         ? raw.map((p) => str(asRecord(p)['text'])).filter(Boolean).join('\n') || JSON.stringify(raw)
                         : JSON.stringify(raw ?? '');
-                input.push({ type: 'function_call_output', call_id: str(block['tool_use_id']), output });
+                // Forward of the ERROR: prefix convention (mirrors anthropic.ts
+                // and chat-messages/request.ts): is_error rides as text prefix
+                // because function_call_output has no error bit.
+                // NOTE: 'ERROR: ' is a reserved prefix on this edge — a success
+                // output literally starting with it will round-trip as is_error.
+                const isError = ((): boolean => {
+                    const v = block['is_error'];
+                    return v === true || str(v).toLowerCase() === 'true';
+                })();
+                const normalized = isError && typeof output === 'string' && !output.startsWith('ERROR: ') ? `ERROR: ${output}` : output;
+                input.push({ type: 'function_call_output', call_id: str(block['tool_use_id']), output: normalized });
             }
         }
     }

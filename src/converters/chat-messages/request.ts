@@ -44,7 +44,7 @@ export function convertMessagesRequestToChat(model: string, body: unknown, strea
 }
 
 /**
- * Route-level reasoning gate for strict legacy parity (Phase 2接線).
+ * Route-level reasoning gate for strict legacy parity (Phase 2 wiring).
  *
  * The translator above is Go-faithful (adaptive/auto + effort passthrough),
  * but legacy routes treated adaptive as unknown (null → no prompt line).
@@ -161,9 +161,18 @@ export function convertChatRequestToMessages(model: string, body: unknown, strea
                     .filter(Boolean)
                     .join('\n');
             } else text = JSON.stringify(raw ?? '');
+            // Reverse of anthropicMessagesToChatMessages ERROR: prefix: chat
+            // tool content starting with 'ERROR: ' maps back to is_error.
+            // NOTE: 'ERROR: ' is a reserved prefix on this edge — a success
+            // output literally starting with it will round-trip as is_error.
+            let isError = false;
+            if (text.startsWith('ERROR: ')) {
+                isError = true;
+                text = text.slice('ERROR: '.length);
+            }
             messages.push({
                 role: 'user',
-                content: [{ type: 'tool_result', tool_use_id: str(msg['tool_call_id']), content: text }],
+                content: [{ type: 'tool_result', tool_use_id: str(msg['tool_call_id']), content: text, ...(isError ? { is_error: true } : {}) }],
             });
             continue;
         }

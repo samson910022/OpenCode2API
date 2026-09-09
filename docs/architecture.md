@@ -124,6 +124,13 @@ Rules that keep the port safe:
   intentionally unregistered — counting stays in the collector.
 - `usage.ts` maps usage legs with zero-filled unknowns; interactions
   responses never carry tokens (`grounding_tool_count` only).
+- `is_error` rides the `ERROR: ` text prefix on tool legs (chat `tool`
+  content, responses `function_call_output`, messages `tool_result`):
+  only `true`/`"true"` encode, and success text literally starting with
+  the prefix round-trips as `is_error` by design.
+- `incomplete` with `content_filter` reason is preserved across
+  chat<->responses (non-stream + stream terminal); `*->messages` edges
+  map truncation to `end_turn` (Anthropic has no `content_filter` value).
 
 Wiring status (live, not tests-only):
 
@@ -139,13 +146,17 @@ Wiring status (live, not tests-only):
   routes keep native response rendering. Error envelopes always bypass.
 - Stream state rides one holder per stream (`src/converters/holder.ts`
   single source, shared by all four pair `init.ts` files).
+- `TranslatorPipeline` (`pipeline.ts`) is test-only for now (exercised by
+  `tests/translator-registry.test.js`); production routes call the registry
+  via `wire.ts` Safe wrappers. Future pipeline wiring needs a dedicated
+  review and must keep middleware away from tools/system.
 - `POST /v1/messages` inbound (`claude.request → chat.request`) goes
   through the registry; adaptive/auto thinking collapses to the legacy
   fallback (`resolveMessagesReasoningLevel`) so no new prompt line leaks.
   All other routes keep native handling; cross-protocol translation of
   their outputs is covered by `tests/translator-integration.test.js`.
 - TokenCount stays unregistered — use `isTokenCountRegistered(registry)`
-  (live) instead of the deprecated `TOKEN_COUNT_REGISTERED` snapshot.
+  (live registry query).
 
 ## 6. Roadmap (accepted, not yet implemented)
 

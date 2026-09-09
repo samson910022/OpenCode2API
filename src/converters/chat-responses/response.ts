@@ -11,18 +11,11 @@
  */
 
 import { asRecord } from '../../utils/guards.js';
-import { num, str, targetId } from '../json.js';
+import { makeId, num, str, targetId } from '../json.js';
 import { usageToChat } from '../usage.js';
 
 function newResponseId(): string {
-    try {
-        if (typeof globalThis.crypto?.randomUUID === 'function') {
-            return `resp_${globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
-        }
-    } catch {
-        // fall through
-    }
-    return `resp_${Date.now().toString(36)}${Math.floor(Math.random() * 1e9).toString(36)}`;
+    return makeId('resp_');
 }
 
 interface ChatToolCallLike {
@@ -43,7 +36,14 @@ export function convertChatResponseToResponsesNonStream(
     const first = asRecord(choices[0]);
     const message = asRecord(first['message']);
     const finish = str(first['finish_reason']);
-    const text = str(message['content']);
+    // message.content may be string or parts array; extract text (mirrors
+    // chat-messages/response.ts so array content is not silently dropped).
+    const rawContent = message['content'];
+    const text = typeof rawContent === 'string'
+        ? rawContent
+        : Array.isArray(rawContent)
+            ? rawContent.map((p) => { const part = asRecord(p); return str(part['text'] ?? part['content']); }).filter(Boolean).join('')
+            : '';
     const rawCalls = Array.isArray(message['tool_calls']) ? (message['tool_calls'] as unknown[]) : [];
     const calls: ChatToolCallLike[] = rawCalls.map((tc) => {
         const t = asRecord(tc);
@@ -116,9 +116,15 @@ export function convertResponsesResponseToChatNonStream(
         }
     }
     const usage = asRecord(root['usage']);
-    const finish = toolCalls.length ? 'tool_calls' : 'stop';
+    const status = str(root['status']);
+    // Preserve incomplete signal (length/content_filter already handled for
+    // chat->responses above); tool_calls take precedence when present.
+    // Restore content_filter when incomplete_details.reason says so so the
+    // signal round-trips instead of collapsing to length.
+    const incompleteReason = str(asRecord(root['incomplete_details'])['reason']);
+    const finish = toolCalls.length ? 'tool_calls' : status === 'incomplete' ? (incompleteReason === 'content_filter' ? 'content_filter' : 'length') : 'stop';
     return {
-        id: targetId(root['id'], 'chatcmpl-', () => `chatcmpl-${Date.now().toString(36)}`),
+        id: targetId(root['id'], 'chatcmpl-', () => makeId('chatcmpl-')),
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model,
@@ -297,7 +303,7 @@ export function createChatToResponsesStreamTranslator(model: string, responseId?
  * TODO(P4+): custom_tool_call branches.
  */
 export function createResponsesToChatStreamTranslator(model: string, completionId?: string) {
-    const id = completionId || `chatcmpl-${Date.now().toString(36)}`;
+    const id = completionId || makeId('chatcmpl-');
     let done = false;
     let sawTools = false;
     const nameOf = new Map<string, string>();
@@ -343,9 +349,11 @@ export function createResponsesToChatStreamTranslator(model: string, completionI
             done = true;
             const resp = asRecord(ev['response']);
             const usage = usageToChat(resp['usage']);
+            const incompleteReason = str(asRecord(resp['incomplete_details'])['reason']);
+            const finish = sawTools ? 'tool_calls' : str(resp['status']) === 'incomplete' ? (incompleteReason === 'content_filter' ? 'content_filter' : 'length') : 'stop';
             return [{
                 id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model,
-                choices: [{ index: 0, delta: {}, finish_reason: sawTools ? 'tool_calls' : str(resp['status']) === 'incomplete' ? 'length' : 'stop' }],
+                choices: [{ index: 0, delta: {}, finish_reason: finish }],
                 usage: { prompt_tokens: usage.prompt_tokens, completion_tokens: usage.completion_tokens, total_tokens: usage.total_tokens },
             }];
         }

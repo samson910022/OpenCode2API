@@ -13,17 +13,10 @@
 
 import { buildAnthropicMessage, mapFinishToStopReason, sanitizeClaudeToolId } from '../anthropic.js';
 import { asRecord } from '../../utils/guards.js';
-import { num, str, targetId } from '../json.js';
+import { makeId, num, str, targetId } from '../json.js';
 
 function newMessageId(): string {
-    try {
-        if (typeof globalThis.crypto?.randomUUID === 'function') {
-            return `msg_${globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
-        }
-    } catch {
-        // fall through
-    }
-    return `msg_${Date.now().toString(36)}${Math.floor(Math.random() * 1e9).toString(36)}`;
+    return makeId('msg_');
 }
 
 export interface AnthropicStreamEvent {
@@ -96,7 +89,7 @@ export function convertMessagesResponseToChatNonStream(
     const stop = str(root['stop_reason']);
     const finish = stop === 'tool_use' ? 'tool_calls' : stop === 'max_tokens' ? 'length' : 'stop';
     return {
-        id: targetId(root['id'], 'chatcmpl-', () => `chatcmpl-${Date.now().toString(36)}`),
+        id: targetId(root['id'], 'chatcmpl-', () => makeId('chatcmpl-')),
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model,
@@ -278,7 +271,7 @@ export function createChatToMessagesStreamTranslator(model: string, messageId?: 
  * TODO(P4+): thinking_delta/signature + cache usage legs.
  */
 export function createMessagesToChatStreamTranslator(model: string, completionId?: string) {
-    const id = completionId || `chatcmpl-${Date.now().toString(36)}`;
+    const id = completionId || makeId('chatcmpl-');
     let done = false;
     const blockOrder = new Map<number, number>();
     let nextToolIndex = 0;

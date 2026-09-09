@@ -27,6 +27,21 @@ export function normalizeArgs(args: unknown): string {
 }
 
 /**
+ * Generate a prefixed random id (single source for resp_/msg_/intr_/
+ * chatcmpl-/toolu_ ids; do not duplicate per file).
+ */
+export function makeId(prefix: string): string {
+    try {
+        if (typeof globalThis.crypto?.randomUUID === 'function') {
+            return `${prefix}${globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
+        }
+    } catch {
+        // fall through
+    }
+    return `${prefix}${Date.now().toString(36)}${Math.floor(Math.random() * 1e9).toString(36)}`;
+}
+
+/**
  * Keep a response id only when it already carries the target protocol prefix
  * (clients branch on resp_/chatcmpl-/msg_/intr_); otherwise generate a fresh
  * one so translated bodies never leak a foreign prefix downstream.

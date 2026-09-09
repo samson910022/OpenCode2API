@@ -24,17 +24,10 @@
  */
 
 import { asRecord } from '../../utils/guards.js';
-import { str, targetId } from '../json.js';
+import { makeId, str, targetId } from '../json.js';
 
 function newInteractionId(): string {
-    try {
-        if (typeof globalThis.crypto?.randomUUID === 'function') {
-            return `intr_${globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
-        }
-    } catch {
-        // fall through
-    }
-    return `intr_${Date.now().toString(36)}${Math.floor(Math.random() * 1e9).toString(36)}`;
+    return makeId('intr_');
 }
 
 function chatTextOf(body: unknown): string {
@@ -75,7 +68,7 @@ export function convertInteractionsResponseToChatNonStream(
 ): unknown {
     const root = asRecord(body);
     return {
-        id: targetId(root['id'], 'chatcmpl-', () => `chatcmpl-${Date.now().toString(36)}`),
+        id: targetId(root['id'], 'chatcmpl-', () => makeId('chatcmpl-')),
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model,
@@ -125,7 +118,7 @@ export function convertInteractionsResponseToResponsesNonStream(
     const root = asRecord(body);
     const text = str(root['output_text']);
     return {
-        id: targetId(root['id'], 'resp_', () => `resp_${Date.now().toString(36)}`),
+        id: targetId(root['id'], 'resp_', () => makeId('resp_')),
         object: 'response',
         created_at: Math.floor(Date.now() / 1000),
         model,
@@ -177,7 +170,7 @@ export function convertInteractionsResponseToMessagesNonStream(
     const root = asRecord(body);
     const text = str(root['output_text']);
     return {
-        id: targetId(root['id'], 'msg_', () => `msg_${Date.now().toString(36)}`),
+        id: targetId(root['id'], 'msg_', () => makeId('msg_')),
         type: 'message',
         role: 'assistant',
         model,
@@ -255,7 +248,7 @@ export function createChatToInteractionsStreamTranslator(model: string, interact
  * TODO(P4+): google_search_call searching/completed step events, per-step indices.
  */
 export function createInteractionsToChatStreamTranslator(model: string, completionId?: string) {
-    const id = completionId || `chatcmpl-${Date.now().toString(36)}`;
+    const id = completionId || makeId('chatcmpl-');
     let done = false;
     return (event: unknown): Record<string, unknown>[] => {
         if (done) return [];
@@ -276,7 +269,7 @@ export function createInteractionsToChatStreamTranslator(model: string, completi
 
 /** interaction events -> responses events (text-core). */
 export function createInteractionsToResponsesStreamTranslator(model: string, responseId?: string) {
-    const id = responseId || `resp_${Date.now().toString(36)}`;
+    const id = responseId || makeId('resp_');
     let created = false;
     let seq = 0;
     let completed = false;
@@ -301,7 +294,7 @@ export function createInteractionsToResponsesStreamTranslator(model: string, res
 
 /** interaction events -> Anthropic SSE (text-core). */
 export function createInteractionsToMessagesStreamTranslator(model: string, messageId?: string) {
-    const id = messageId || `msg_${Date.now().toString(36)}`;
+    const id = messageId || makeId('msg_');
     let started = false;
     let textIx = -1;
     let stopped = false;

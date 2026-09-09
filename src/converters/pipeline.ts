@@ -7,6 +7,15 @@
  * Stream terminal mirrors Go (`pipeline.go:88`): single `translateStream`
  * call over `body`, result stored as `chunks`.
  *
+ * NOTE (wiring status): production routes do NOT use this pipeline yet —
+ * they call the registry directly via `wire.ts` Safe wrappers
+ * (error-bypass + per-stream holders). This class is exercised by
+ * `tests/translator-registry.test.js` and reserved for future P1+ wiring.
+ * Do not wire it into routes without a dedicated review: middleware can
+ * rewrite `tools`/`system`/`model`, so any future use MUST document that
+ * middleware never touches tools/system and MUST propagate errors
+ * (see TODO below).
+ *
  * TODO(P1): error-propagating middleware (`ResponseHandler` returning
  * `Result`/`throw`) to match Go `pipeline.go:23,26` ctx/error signatures.
  *

@@ -1,6 +1,6 @@
 import { TranslatorRegistry } from '../src/converters/registry.js';
 import { registerAllTranslatorPairs } from '../src/converters/init.js';
-import { STREAM_FIDELITY, TOKEN_COUNT_REGISTERED, streamFidelityOf } from '../src/converters/fidelity.js';
+import { STREAM_FIDELITY, streamFidelityOf, isTokenCountRegistered } from '../src/converters/fidelity.js';
 import { targetId } from '../src/converters/json.js';
 import {
     usageToChat,
@@ -60,7 +60,7 @@ describe('P4 stream matrix has no missing directed edge', () => {
         expect(streamFidelityOf('openai', 'interactions')).toBe('full');
         expect(streamFidelityOf('claude', 'openai')).toBe('text-core');
         // TokenCount intentionally unregistered on all edges (collector counts).
-        expect(TOKEN_COUNT_REGISTERED).toBe(false);
+        expect(isTokenCountRegistered(r)).toBe(false);
         expect(r.translateTokenCount('openai', 'claude', 7, { n: 7 })).toEqual({ n: 7 });
     });
 

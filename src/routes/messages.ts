@@ -133,7 +133,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           const thinking: unknown = body['thinking'];
           const stream = Boolean(requestStream);
           const requestOpencodeConfig: unknown = body['opencode'];
-          // Phase 2接線: inbound claude.request -> chat.request via the wired
+          // Phase 2 wiring: inbound claude.request -> chat.request via the wired
           // N×N registry (thin wrapper over the same anthropic.ts pure layer,
           // so shapes match). Direct registry call (not the Safe wrapper):
           // requests are validated above and never error envelopes; an extra
