@@ -102,15 +102,30 @@ jobs:
             echo "head_sha=${head_sha}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Detect gateway source
+        id: gw
+        shell: bash
+        env:
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+        run: |
+          set -euo pipefail
+          # secrets context is not allowed in step `if:`; expose via outputs.
+          # Always runs (trivial check) so downstream never reads an absent output.
+          if [[ -n "${GATEWAY_BASE_URL}" ]]; then
+            echo "external=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "external=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Node
-        if: steps.gate.outputs.skip != 'true' && secrets.GATEWAY_BASE_URL == ''
+        if: steps.gate.outputs.skip != 'true' && steps.gw.outputs.external != 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: npm
 
       - name: Start in-job gateway (free models, no login needed)
-        if: steps.gate.outputs.skip != 'true' && secrets.GATEWAY_BASE_URL == ''
+        if: steps.gate.outputs.skip != 'true' && steps.gw.outputs.external != 'true'
         shell: bash
         run: |
           set -euo pipefail
