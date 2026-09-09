@@ -34,6 +34,11 @@ SEVERITY_RANK = {"blocking": 0, "should-fix": 1, "nit": 2}
 LOW_RISK_DIRS = ("tests/", "docs/")
 LOW_RISK_SUFFIXES = (".yml", ".yaml", ".md")
 
+# Test fixtures are dummy keys by design; pattern-scanning them only produces
+# noise. Skipped for secret patterns (forbidden-file names are still checked
+# above for every path, so a committed tests/.env still fires as blocking).
+PATTERN_SKIP_DIRS = ("tests/",)
+
 
 def is_low_risk_path(rel: str) -> bool:
     """True for fixture/doc/config paths where quoted hits are usually noise."""
@@ -45,10 +50,15 @@ FORBIDDEN_TRACKED = (".env", "config.json", "opencode.json")
 
 
 def is_forbidden_tracked(rel: str) -> bool:
-    """True only for real secret files; never for `*.example` templates."""
-    if rel in FORBIDDEN_TRACKED:
+    """True only for real secret files; never for `*.example` templates.
+
+    Matched by basename so a committed secret trips in any directory
+    (including PATTERN_SKIP_DIRS like `tests/`).
+    """
+    base = rel.rsplit("/", 1)[-1]
+    if base in FORBIDDEN_TRACKED:
         return True
-    if rel == ".env" or (rel.startswith(".env.") and not rel.endswith(".example")):
+    if base == ".env" or (base.startswith(".env.") and not base.endswith(".example")):
         return True
     return False
 MATRIX_FILES = [
@@ -102,6 +112,11 @@ def scan_worktree(max_files: int = 400) -> list[dict[str, str]]:
         if rel.endswith(".example"):
             # Tracked templates (`.env.example`, `config.json.example`) carry
             # placeholder values by design; secret-pattern hits there are noise.
+            continue
+        if rel.startswith(PATTERN_SKIP_DIRS):
+            # Fixture keys under tests/ are dummy by design; skip before any
+            # I/O so they cost no file budget. Forbidden names already
+            # checked above, so a committed tests/.env still fires.
             continue
         path = REPO_ROOT / rel
         if not path.is_file() or path.stat().st_size > 300_000:

@@ -106,6 +106,8 @@ class TestBotConfig(unittest.TestCase):
         self.assertTrue(is_forbidden_tracked(".env"))
         self.assertTrue(is_forbidden_tracked(".env.local"))
         self.assertTrue(is_forbidden_tracked("config.json"))
+        # Backstop holds inside skipped dirs: a committed tests/.env still fires.
+        self.assertTrue(is_forbidden_tracked("tests/.env"))
 
     def test_scrub_covers_full_catalog(self):
         from llm_client import INTERNAL_MODEL_NAMES
@@ -354,7 +356,8 @@ class TestScanAndRunner(unittest.TestCase):
 
     def test_prior_dry_run_fps_resolved(self):
         # The three dry-run false positives from the first live scan:
-        # bare-code hit, unquoted yml env hit gone; quoted fixture hit is nit.
+        # bare-code hit and unquoted yml env hit are gone; tests/ fixtures
+        # are skipped for patterns (see test_tests_dir_skipped_for_patterns).
         from repo_scan import collect_findings, is_low_risk_path
         by_loc = {}
         for item in collect_findings():
@@ -370,6 +373,18 @@ class TestScanAndRunner(unittest.TestCase):
                 slug = item["fingerprint"].split(":")[1]
                 if slug in ("possible-api-key", "possible-password") and is_low_risk_path(path):
                     self.assertEqual(item["severity"], "nit", item["location"])
+
+    def test_tests_dir_skipped_for_patterns(self):
+        # Fixture keys under tests/ are dummy by design: no secret-pattern
+        # findings there (forbidden-file names are still checked).
+        from repo_scan import PATTERN_SKIP_DIRS, collect_findings
+        self.assertIn("tests/", PATTERN_SKIP_DIRS)
+        for item in collect_findings():
+            path = item["location"].split(":")[0]
+            slug = item["fingerprint"].split(":")[1]
+            if slug in ("possible-api-key", "possible-password",
+                        "private-key-material"):
+                self.assertFalse(path.startswith("tests/"), item["location"])
 
     def test_comment_modes(self):
         self.assertEqual(github_runner._resolve_comment_mode("/review please"), "review")
