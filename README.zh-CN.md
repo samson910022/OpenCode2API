@@ -10,7 +10,7 @@
 >
 > 📖 [文档](./docs/README.zh-CN.md)（[English index](./docs/README.md)） | 🚀 [快速开始](#-快速开始) | 🐛 [Issues](https://github.com/samson910022/OpenCode2API/issues)
 
-将本地 [OpenCode](https://opencode.ai) 运行时转换为 OpenAI 与 Anthropic 兼容 API 网关。在任何 OpenAI 或 Anthropic 客户端中使用免费模型（Big Pickle、Ling、MiMo、Muse Spark、Nemotron）——免费阵容会轮换，以 `/v1/models` 实时列表为准。
+将本地 [OpenCode](https://opencode.ai) 运行时转换为 OpenAI、Anthropic 与 Gemini 兼容 API 网关。在任何 OpenAI、Anthropic 或 Gemini 客户端中使用免费模型（Big Pickle、Ling、MiMo、Muse Spark、Nemotron）——免费阵容会轮换，以 `/v1/models` 实时列表为准。
 
 ---
 
@@ -20,6 +20,10 @@
 |:-----|:-----|
 | 🟢 **OpenAI 兼容** | `/v1/models`, `/v1/chat/completions`, `/v1/responses` |
 | 🟣 **Anthropic 兼容** | `/v1/messages`（含 `tool_use` / `thinking` / SSE 流式） |
+| 🔁 **Gemini 兼容（薄层）** | `POST /v1beta/interactions`（别名 `POST /v1/interactions`，文本 + `google_search` 联网） |
+| 🌐 **服务端联网搜索** | `/v1/responses` 的 `tools: [{type: "web_search"}]` 驱动 opencode websearch，返回 `web_search_call` + 诚实 `url_citation` |
+| 🔑 **多 Key 认证** | `API_KEY` 与 `OPENCODE_API_KEYS` / `API_KEYS` 合并；`Bearer` 或 `x-api-key` 任一通过；为空回退免认证 |
+| 🔀 **免费限流 fallback 代理** | 默认直连，仅 429 免费限流错误时启用 `OPENCODE_UPSTREAM_PROXIES`（`failover-rr`、cooldown、回环 bypass） |
 | 📡 **流式输出** | Chat Completions、Responses 与 Messages API 的完整 SSE 流式支持 |
 | 🧠 **推理控制** | 支持 `reasoning_effort` 和 `reasoning: { "effort": "high" }` |
 | 🐳 **Docker 部署** | 一键部署，自动启动 OpenCode 后端 |
@@ -173,6 +177,36 @@ curl -X POST http://127.0.0.1:10000/v1/messages \
 
 > 也可用 `x-api-key: YOUR_API_KEY` 代替 `Authorization: Bearer`；`max_tokens` 必填；流式时返回 `message_start/content_block_start/content_block_delta/content_block_stop/message_delta/message_stop`（无 `[DONE]`）。
 
+### Responses API + 联网搜索
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1/responses \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/muse-spark-1.3-contributor-free",
+    "input": "PostgreSQL 最新版本是多少？",
+    "tools": [{"type": "web_search"}]
+  }'
+```
+
+> `web_search`（亦接受 `web_search_preview` / `web_search_*` / `google_search`）是显式授权：代理驱动 opencode 内置 `websearch`，返回 `web_search_call` + 仅标注实际引用来源的 `url_citation`（无编造）。chat/messages 传入 `web_search` 会 400 并指引到此端点。
+
+### Interactions API（Gemini 兼容薄层）
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1beta/interactions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/muse-spark-1.3-contributor-free",
+    "input": "PostgreSQL 最新版本是多少？",
+    "tools": [{"type": "google_search"}]
+  }'
+```
+
+> 别名 `POST /v1/interactions`；支持 `system_instruction`、`previous_interaction_id`、`store: false`（不持久化）与 SSE（`interaction.created` / `step.delta` / `interaction.completed`，无 `[DONE]`）。客户端执行的 function 工具会被 400 拒绝——请改用 `/v1/responses`。
+
 ---
 
 ## 📦 部署方式
@@ -193,6 +227,7 @@ curl -X POST http://127.0.0.1:10000/v1/messages \
 | `PORT` / `OPENCODE_PROXY_PORT` | `10000` | 代理服务端口 |
 | `OPENCODE_SERVER_PORT` | `10001` | OpenCode 后端服务端口 |
 | `API_KEY` | - | Bearer Token 认证密钥 |
+| `API_KEYS` / `OPENCODE_API_KEYS` | `(none)` | 额外客户端 keys，逗号分隔；与 `API_KEY` 合并，任一通过；为空回退免认证 |
 | `BIND_HOST` | `0.0.0.0` | 绑定地址 |
 | `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用 |
 | `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式；当前仅支持 `proxy-bridge` |
@@ -213,6 +248,10 @@ curl -X POST http://127.0.0.1:10000/v1/messages \
 | `OPENCODE_PROXY_CLEANUP_MAX_AGE_MS` | `86400000` | 最大存储时间 (毫秒) |
 | `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `180000` | 请求超时时间 (毫秒) |
 | `OPENCODE_PROXY_RETRY_MAX_RETRIES` | `3` | 首次失败后重试次数 (0-5，总尝试 1+n；退避指数+jitter 并优先 `retry-after`) |
+| `OPENCODE_UPSTREAM_PROXIES` | `(none)` | Fallback 代理 URL，逗号分隔（`socks5://` 优先，`http(s)://` 可用；`config.json` 用短键 `UPSTREAM_PROXIES`） |
+| `OPENCODE_UPSTREAM_PROXY_STRATEGY` | `failover-rr` | `failover-rr` / `round-robin`（别名）/ `random`；连续免费限流即轮换下一个 |
+| `OPENCODE_UPSTREAM_PROXY_COOLDOWN_MS` | `300000` | 代理粘滞时长（毫秒），到期回直连 |
+| `OPENCODE_UPSTREAM_PROXY_NO_PROXY` | `localhost,127.0.0.1,::1` | 永不走代理的目标 host（后端 `127.0.0.1` 恒直连） |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode 后端地址 |
 | `OPENCODE_SERVER_PASSWORD` | - | OpenCode 后端密码 |
 | `OPENCODE_PATH` | `opencode` | OpenCode 可执行文件路径 |
@@ -281,6 +320,8 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 | `POST` | `/v1/chat/completions` | Chat Completions API |
 | `POST` | `/v1/responses` | Responses API |
 | `POST` | `/v1/messages` | Anthropic Messages API（`max_tokens` 必填，支持 `x-api-key`） |
+| `POST` | `/v1beta/interactions` | Gemini 兼容薄层（文本 + `google_search` 联网、`previous_interaction_id`、`store`、SSE 无 `[DONE]`） |
+| `POST` | `/v1/interactions` | `/v1beta/interactions` 的别名 |
 
 ### 模型名称格式
 

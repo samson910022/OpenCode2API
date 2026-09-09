@@ -10,7 +10,7 @@
 >
 > 📖 [Docs](./docs/README.md) | 🚀 [Quick Start](#quick-start) | 🐛 [Issues](https://github.com/samson910022/OpenCode2API/issues)
 
-Turn a local [OpenCode](https://opencode.ai) runtime into an OpenAI- and Anthropic-compatible API gateway. Use free models (Big Pickle, Ling, MiMo, Muse Spark, Nemotron) from any OpenAI or Anthropic client — the free lineup rotates, so query `/v1/models` for the live list.
+Turn a local [OpenCode](https://opencode.ai) runtime into an OpenAI-, Anthropic-, and Gemini-compatible API gateway. Use free models (Big Pickle, Ling, MiMo, Muse Spark, Nemotron) from any OpenAI, Anthropic, or Gemini client — the free lineup rotates, so query `/v1/models` for the live list.
 
 ---
 
@@ -20,6 +20,10 @@ Turn a local [OpenCode](https://opencode.ai) runtime into an OpenAI- and Anthrop
 |:-----|:-----|
 | 🟢 **OpenAI compatible** | `/v1/models`, `/v1/chat/completions`, `/v1/responses` |
 | 🟣 **Anthropic compatible** | `/v1/messages` (with `tool_use` / `thinking` / SSE streaming) |
+| 🔁 **Gemini compatible (thin)** | `POST /v1beta/interactions` (alias `POST /v1/interactions`, text + `google_search` grounding) |
+| 🌐 **Server-side web search** | `/v1/responses` `tools: [{type: "web_search"}]` drives opencode websearch, returns `web_search_call` + honest `url_citation` |
+| 🔑 **Multi-key auth** | `API_KEY` + `OPENCODE_API_KEYS` / `API_KEYS` merge; `Bearer` or `x-api-key`, any match passes; empty means no auth |
+| 🔀 **Free-limit fallback proxy** | Direct-only until a 429 free-limit error engages `OPENCODE_UPSTREAM_PROXIES` (`failover-rr`, cooldown, loopback bypass) |
 | 📡 **Streaming** | Full SSE streaming for Chat Completions, Responses, and Messages APIs |
 | 🧠 **Reasoning control** | Supports `reasoning_effort` and `reasoning: { "effort": "high" }` |
 | 🐳 **Docker deploy** | One-command deploy, auto-starts the OpenCode backend |
@@ -173,6 +177,36 @@ curl -X POST http://127.0.0.1:10000/v1/messages \
 
 > You may use `x-api-key: YOUR_API_KEY` instead of `Authorization: Bearer`; `max_tokens` is required; on stream the API returns `message_start/content_block_start/content_block_delta/content_block_stop/message_delta/message_stop` (no `[DONE]`).
 
+### Responses API + web_search grounding
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1/responses \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/muse-spark-1.3-contributor-free",
+    "input": "What is the latest PostgreSQL release?",
+    "tools": [{"type": "web_search"}]
+  }'
+```
+
+> `web_search` (also `web_search_preview` / `web_search_*` / `google_search`) is an explicit grant: the proxy drives the opencode built-in `websearch` and returns `web_search_call` + `url_citation` annotations only for sources actually cited (no fabrication). `web_search` on chat/messages is rejected with 400 + a pointer to this endpoint.
+
+### Interactions API (Gemini-compatible thin layer)
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1beta/interactions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/muse-spark-1.3-contributor-free",
+    "input": "What is the latest PostgreSQL release?",
+    "tools": [{"type": "google_search"}]
+  }'
+```
+
+> Alias `POST /v1/interactions`; supports `system_instruction`, `previous_interaction_id`, `store: false` (ephemeral), and SSE (`interaction.created` / `step.delta` / `interaction.completed`, no `[DONE]`). Client-executed function tools are rejected with 400 — use `/v1/responses` for those.
+
 ---
 
 ## 📦 Deployment Modes
@@ -193,6 +227,7 @@ curl -X POST http://127.0.0.1:10000/v1/messages \
 | `PORT` / `OPENCODE_PROXY_PORT` | `10000` | Proxy listen port |
 | `OPENCODE_SERVER_PORT` | `10001` | OpenCode backend port |
 | `API_KEY` | - | Bearer token secret |
+| `API_KEYS` / `OPENCODE_API_KEYS` | `(none)` | Extra client keys, comma-separated; merged with `API_KEY`, any match passes; empty falls back to no auth |
 | `BIND_HOST` | `0.0.0.0` | Bind address |
 | `DISABLE_TOOLS` | `true` | Disable OpenCode tool calling |
 | `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | External tool bridge mode; only `proxy-bridge` is supported |
@@ -213,6 +248,10 @@ curl -X POST http://127.0.0.1:10000/v1/messages \
 | `OPENCODE_PROXY_CLEANUP_MAX_AGE_MS` | `86400000` | Max retention (ms) |
 | `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `180000` | Request timeout (ms) |
 | `OPENCODE_PROXY_RETRY_MAX_RETRIES` | `3` | Retries after the first attempt (0-5, total attempts 1+n; exponential backoff+jitter, honors `retry-after`) |
+| `OPENCODE_UPSTREAM_PROXIES` | `(none)` | Fallback proxy URLs, comma-separated (`socks5://` preferred, `http(s)://` ok; file key `UPSTREAM_PROXIES`) |
+| `OPENCODE_UPSTREAM_PROXY_STRATEGY` | `failover-rr` | `failover-rr` / `round-robin` (aliases) / `random`; rotates on consecutive free-limit 429s |
+| `OPENCODE_UPSTREAM_PROXY_COOLDOWN_MS` | `300000` | How long an engaged proxy sticks before returning to direct (ms) |
+| `OPENCODE_UPSTREAM_PROXY_NO_PROXY` | `localhost,127.0.0.1,::1` | Target hosts that never use the proxy (backend `127.0.0.1` always direct) |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode backend address |
 | `OPENCODE_SERVER_PASSWORD` | - | OpenCode backend password |
 | `OPENCODE_PATH` | `opencode` | OpenCode binary path |
@@ -280,6 +319,8 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 | `POST` | `/v1/chat/completions` | Chat Completions API |
 | `POST` | `/v1/responses` | Responses API |
 | `POST` | `/v1/messages` | Anthropic Messages API (`max_tokens` required, supports `x-api-key`) |
+| `POST` | `/v1beta/interactions` | Gemini-compatible thin layer (text + `google_search` grounding, `previous_interaction_id`, `store`, SSE without `[DONE]`) |
+| `POST` | `/v1/interactions` | Alias of `/v1beta/interactions` |
 
 ### Model name formats
 

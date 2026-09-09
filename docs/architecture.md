@@ -20,6 +20,7 @@ index.ts (env > file > default merge + bootstrap)
               ├─> registerSystemRoutes   [src/routes/system.ts]    (models / health / metrics, no lock)
               ├─> registerChatRoutes     [src/routes/chat.ts]      (POST /v1/chat/completions, request lock)
               ├─> registerResponsesRoutes[src/routes/responses.ts] (POST /v1/responses, cancel race)
+              ├─> registerInteractionsRoutes[src/routes/interactions.ts] (POST /v1beta|/v1/interactions, Gemini thin layer)
               └─> registerMessagesRoutes [src/routes/messages.ts] (POST /v1/messages, Anthropic converters first)
 ```
 
@@ -38,7 +39,7 @@ Cross-cutting helpers (all routes depend on them one-way; no cycles):
 `retry/policy`, `converters/anthropic`, and `errors/upstream` are pure
 (no Express/SDK imports) — keep them that way.
 
-## 2. Request template (all three main routes)
+## 2. Request template (all four main routes)
 
 Every `POST` route repeats the same template with small per-protocol
 differences:
@@ -53,16 +54,17 @@ differences:
 Known intentional differences — do not "unify" them without approval:
 stream `flushHeaders` timing (responses flushes before preflight, chat /
 messages after), `lock()` wrapping (chat + messages only), cancel via
-`res 'close'`, `forbidThinkBlock` per route, and the three error-exit
+`res 'close'`, `forbidThinkBlock` per route, and the four error-exit
 shapes (chat non-stream JSON; responses-stream `response.failed` SSE +
-`[DONE]`; messages-stream `error` event without `[DONE]`).
+`[DONE]`; messages-stream `error` event without `[DONE]`;
+interactions-stream `interaction.completed` / `error` event without `[DONE]`).
 
 ## 3. Extension points
 
 - **New route:** add `src/routes/xxx.ts` exporting
   `registerXxxRoutes(app, ctx)`, wire it in `src/proxy.ts` before the
   404 fallback, add request/response types under `src/types/`. Copy the
-  §2 template; do not refactor the existing three routes in the same
+  §2 template; do not refactor the existing four routes in the same
   change.
 - **New converter** (e.g. another vendor protocol): add a pure module
   next to `src/converters/anthropic.ts` (`toChat` / `fromChat` /
