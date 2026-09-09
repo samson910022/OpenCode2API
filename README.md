@@ -6,57 +6,59 @@
   <img src="https://img.shields.io/badge/Node.js-18+-orange" alt="Node">
 </p>
 
-> 📖 [文档](./docs/README.md) | 🚀 [快速开始](#-快速开始)
+> **Language:** [English](./README.md) | [简体中文](./README.zh-CN.md)
+>
+> 📖 [Docs](./docs/README.md) | 🚀 [Quick Start](#quick-start) | 🐛 [Issues](https://github.com/samson910022/OpenCode2API/issues)
 
-将本地 [OpenCode](https://opencode.ai) 运行时转换为 OpenAI 兼容 API 网关。在任何 OpenAI 客户端中使用免费模型 (GPT, Nemotron, MiniMax)。
+Turn a local [OpenCode](https://opencode.ai) runtime into an OpenAI-compatible API gateway. Use free models (GPT, Nemotron, MiniMax) from any OpenAI client.
 
 ---
 
-## ✨ 功能特性
+## ✨ Features
 
-| 特性 | 说明 |
+| Feature | Description |
 |:-----|:-----|
-| 🟢 **OpenAI 兼容** | `/v1/models`, `/v1/chat/completions`, `/v1/responses` |
-| 🟣 **Anthropic 兼容** | `/v1/messages`（含 `tool_use` / `thinking` / SSE 流式） |
-| 📡 **流式输出** | Chat Completions、Responses 与 Messages API 的完整 SSE 流式支持 |
-| 🧠 **推理控制** | 支持 `reasoning_effort` 和 `reasoning: { "effort": "high" }` |
-| 🐳 **Docker 部署** | 一键部署，自动启动 OpenCode 后端 |
-| 🛡️ **工具安全** | 默认禁用工具调用 |
-| 🔧 **外部工具桥接** | 支持外部客户端传入 `tools`，由代理桥接为 OpenAI-compatible `tool_calls` / `function_call`，避免命中 OpenCode 内置工具 |
-| 🌐 **内置 web_fetch 透传** | 当请求未传入 `tools` 且显式开启特性时，仅允许 OpenCode 内置 `web_fetch` 参与该次请求 |
+| 🟢 **OpenAI compatible** | `/v1/models`, `/v1/chat/completions`, `/v1/responses` |
+| 🟣 **Anthropic compatible** | `/v1/messages` (with `tool_use` / `thinking` / SSE streaming) |
+| 📡 **Streaming** | Full SSE streaming for Chat Completions, Responses, and Messages APIs |
+| 🧠 **Reasoning control** | Supports `reasoning_effort` and `reasoning: { "effort": "high" }` |
+| 🐳 **Docker deploy** | One-command deploy, auto-starts the OpenCode backend |
+| 🛡️ **Tool safety** | Tool calling disabled by default |
+| 🔧 **External tool bridge** | External `tools` from clients are bridged by the proxy into OpenAI-compatible `tool_calls` / `function_call`, without hitting OpenCode built-in tools |
+| 🌐 **Built-in web_fetch passthrough** | When a request carries no `tools` and the feature is explicitly enabled, only the OpenCode built-in `web_fetch` may participate in that request |
 
 ---
 
-## 🚀 快速开始
+## 🚀 Quick Start
 
-### Docker 部署 (推荐)
+### Docker deploy (recommended)
 
 ```bash
-# 1. 克隆并配置
+# 1. Clone and configure
 git clone https://github.com/samson910022/OpenCode2API.git
 cd OpenCode2API
 cp .env.example .env
 
-# 2. 编辑 .env 设置你的配置
-# 必填: API_KEY, OPENCODE_SERVER_PASSWORD
+# 2. Edit .env and set your config
+# Required: API_KEY, OPENCODE_SERVER_PASSWORD
 
-# 3. 启动
+# 3. Start
 docker compose up -d
 
-# 4. 测试
+# 4. Test
 curl http://127.0.0.1:10000/health
 ```
 
-> 默认 `docker-compose.yml` 不会把宿主机项目目录挂载到容器内，因为那会覆盖镜像里已安装的 `node_modules`，导致容器依赖宿主机先执行 `npm install`。如果你需要本地源码热更新，建议单独使用开发专用的 Compose 覆盖配置。
+> The default `docker-compose.yml` does not mount the host project directory into the container, because that would shadow the image's installed `node_modules` and force the container to rely on a host-side `npm install`. For live local-source reload, use a dedicated dev Compose override instead.
 
-### Node.js (本地开发)
+### Node.js (local dev)
 
 ```bash
-# 1. 安装 OpenCode CLI
+# 1. Install the OpenCode CLI
 npm install -g opencode-ai
 # Linux/macOS: curl -fsSL https://opencode.ai/install | bash
 
-# 2. 克隆并运行
+# 2. Clone and run
 git clone https://github.com/samson910022/OpenCode2API.git
 cd OpenCode2API
 npm install
@@ -67,7 +69,7 @@ npm start
 
 ---
 
-## 💡 使用示例
+## 💡 Usage Examples
 
 ### Chat Completions
 
@@ -77,12 +79,12 @@ curl -X POST http://127.0.0.1:10000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "opencode/big-pickle",
-    "messages": [{"role": "user", "content": "你好!"}],
+    "messages": [{"role": "user", "content": "Hello!"}],
     "stream": false
   }'
 ```
 
-### Responses API (带推理)
+### Responses API (with reasoning)
 
 ```bash
 curl -N -X POST http://127.0.0.1:10000/v1/responses \
@@ -90,13 +92,13 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
   -H "Content-Type: application/json" \
   -d '{
     "model": "opencode/muse-spark-1.3-contributor-free",
-    "input": "用一句话打招呼",
+    "input": "Say hi in one sentence",
     "reasoning": {"effort": "high"},
     "stream": true
   }'
 ```
 
-### Chat Completions + 外部工具
+### Chat Completions + external tools
 
 ```bash
 curl -X POST http://127.0.0.1:10000/v1/chat/completions \
@@ -104,7 +106,7 @@ curl -X POST http://127.0.0.1:10000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "opencode/big-pickle",
-    "messages": [{"role": "user", "content": "帮我获取 https://example.com 的标题"}],
+    "messages": [{"role": "user", "content": "Fetch the title of https://example.com"}],
     "tools": [
       {
         "type": "function",
@@ -124,7 +126,7 @@ curl -X POST http://127.0.0.1:10000/v1/chat/completions \
   }'
 ```
 
-### Responses API + 外部工具流式
+### Responses API + external tools (streaming)
 
 ```bash
 curl -N -X POST http://127.0.0.1:10000/v1/responses \
@@ -132,7 +134,7 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
   -H "Content-Type: application/json" \
   -d '{
     "model": "opencode/muse-spark-1.3-contributor-free",
-    "input": "查询东京天气",
+    "input": "Look up the weather in Tokyo",
     "stream": true,
     "tools": [
       {
@@ -154,7 +156,7 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
   }'
 ```
 
-### Messages API (Anthropic 兼容)
+### Messages API (Anthropic compatible)
 
 ```bash
 curl -X POST http://127.0.0.1:10000/v1/messages \
@@ -165,61 +167,61 @@ curl -X POST http://127.0.0.1:10000/v1/messages \
     "model": "opencode/muse-spark-1.3-contributor-free",
     "max_tokens": 1024,
     "system": "You are a helpful assistant.",
-    "messages": [{"role": "user", "content": "用一句话打招呼"}]
+    "messages": [{"role": "user", "content": "Say hi in one sentence"}]
   }'
 ```
 
-> 也可用 `x-api-key: YOUR_API_KEY` 代替 `Authorization: Bearer`；`max_tokens` 必填；流式时返回 `message_start/content_block_start/content_block_delta/content_block_stop/message_delta/message_stop`（无 `[DONE]`）。
+> You may use `x-api-key: YOUR_API_KEY` instead of `Authorization: Bearer`; `max_tokens` is required; on stream the API returns `message_start/content_block_start/content_block_delta/content_block_stop/message_delta/message_stop` (no `[DONE]`).
 
 ---
 
-## 📦 部署方式
+## 📦 Deployment Modes
 
-| 模式 | 说明 | 适用场景 |
+| Mode | Description | Best for |
 |:-----|:-----|:---------|
-| 🐳 **Docker** | 完整栈，自动启动 OpenCode 后端 | 生产环境，最简配置 |
-| 💻 **独立 Node** | 手动管理后端 | 开发、自定义集成 |
+| 🐳 **Docker** | Full stack, auto-starts the OpenCode backend | Production, minimal config |
+| 💻 **Standalone Node** | You manage the backend yourself | Development, custom integrations |
 
 ---
 
-## ⚙️ 配置
+## ⚙️ Configuration
 
-### 快速参考
+### Quick reference
 
-| 环境变量 | 默认值 | 说明 |
+| Env var | Default | Description |
 |:--------|:-------|:------|
-| `PORT` / `OPENCODE_PROXY_PORT` | `10000` | 代理服务端口 |
-| `OPENCODE_SERVER_PORT` | `10001` | OpenCode 后端服务端口 |
-| `API_KEY` | - | Bearer Token 认证密钥 |
-| `BIND_HOST` | `0.0.0.0` | 绑定地址 |
-| `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用 |
-| `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式；当前仅支持 `proxy-bridge` |
-| `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 外部工具与 OpenCode 内置工具的冲突隔离策略；当前仅支持 `namespace` |
-| `OPENCODE_INTERNAL_WEB_FETCH_ENABLED` | `false` | 兼容旧开关；当未显式配置 allowlist 时，启用后默认放行 `web_fetch` |
-| `OPENCODE_INTERNAL_ALLOWED_TOOLS` | `(none)` | 当请求未传入 `tools` 时，允许使用的 OpenCode 内置工具列表，逗号分隔 |
-| `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED` | `true` | 输出 internal allowlist 模式的调试/指标日志 |
-| `OPENCODE_TOOL_DISCOVERY_FIXTURE` | `(none)` | 集成测试/本地调试用的后端工具 ID 固定列表，逗号分隔 |
-| `OPENCODE_HEALTH_DETAILS_ENABLED` | `true` | 控制 `/health/details` 是否暴露 |
-| `OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH` | `true` | 控制 `/health/details` 是否要求 Bearer 认证 |
-| `OPENCODE_METRICS_ENABLED` | `false` | 控制 `/metrics` 是否暴露 |
-| `OPENCODE_METRICS_REQUIRE_AUTH` | `true` | 控制 `/metrics` 是否要求 Bearer 认证 |
-| `USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录 |
-| `OPENCODE_PROXY_PROMPT_MODE` | `standard` | 提示词处理模式 |
-| `OPENCODE_PROXY_OMIT_SYSTEM_PROMPT` | `false` | 忽略传入的 system prompt |
-| `OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS` | `false` | 自动清理会话存储 |
-| `OPENCODE_PROXY_CLEANUP_INTERVAL_MS` | `43200000` | 清理间隔 (毫秒) |
-| `OPENCODE_PROXY_CLEANUP_MAX_AGE_MS` | `86400000` | 最大存储时间 (毫秒) |
-| `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `180000` | 请求超时时间 (毫秒) |
-| `OPENCODE_PROXY_RETRY_MAX_RETRIES` | `3` | 首次失败后重试次数 (0-5，总尝试 1+n；退避指数+jitter 并优先 `retry-after`) |
-| `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode 后端地址 |
-| `OPENCODE_SERVER_PASSWORD` | - | OpenCode 后端密码 |
-| `OPENCODE_PATH` | `opencode` | OpenCode 可执行文件路径 |
-| `OPENCODE_ZEN_API_KEY` | - | Zen API Key 透传 |
-| `DEBUG` / `OPENCODE_PROXY_DEBUG` | `false` | 调试日志 |
+| `PORT` / `OPENCODE_PROXY_PORT` | `10000` | Proxy listen port |
+| `OPENCODE_SERVER_PORT` | `10001` | OpenCode backend port |
+| `API_KEY` | - | Bearer token secret |
+| `BIND_HOST` | `0.0.0.0` | Bind address |
+| `DISABLE_TOOLS` | `true` | Disable OpenCode tool calling |
+| `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | External tool bridge mode; only `proxy-bridge` is supported |
+| `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | Conflict isolation for external vs built-in tools; only `namespace` is supported |
+| `OPENCODE_INTERNAL_WEB_FETCH_ENABLED` | `false` | Legacy shortcut; when no allowlist is configured, enabling it defaults the allowlist to `web_fetch` |
+| `OPENCODE_INTERNAL_ALLOWED_TOOLS` | `(none)` | OpenCode built-in tools allowed when a request carries no `tools`, comma-separated |
+| `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED` | `true` | Emit debug/metric logs for internal-allowlist mode |
+| `OPENCODE_TOOL_DISCOVERY_FIXTURE` | `(none)` | Fixed backend tool-ID list for integration tests / local debugging, comma-separated |
+| `OPENCODE_HEALTH_DETAILS_ENABLED` | `true` | Whether `/health/details` is exposed |
+| `OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH` | `true` | Whether `/health/details` requires Bearer auth |
+| `OPENCODE_METRICS_ENABLED` | `false` | Whether `/metrics` is exposed |
+| `OPENCODE_METRICS_REQUIRE_AUTH` | `true` | Whether `/metrics` requires Bearer auth |
+| `OPENCODE_USE_ISOLATED_HOME` | `false` | Use an isolated OpenCode config directory (`USE_ISOLATED_HOME` in `config.json`) |
+| `OPENCODE_PROXY_PROMPT_MODE` | `standard` | Prompt handling mode |
+| `OPENCODE_PROXY_OMIT_SYSTEM_PROMPT` | `false` | Drop the incoming system prompt |
+| `OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS` | `false` | Auto-clean conversation storage |
+| `OPENCODE_PROXY_CLEANUP_INTERVAL_MS` | `43200000` | Cleanup interval (ms) |
+| `OPENCODE_PROXY_CLEANUP_MAX_AGE_MS` | `86400000` | Max retention (ms) |
+| `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `180000` | Request timeout (ms) |
+| `OPENCODE_PROXY_RETRY_MAX_RETRIES` | `3` | Retries after the first attempt (0-5, total attempts 1+n; exponential backoff+jitter, honors `retry-after`) |
+| `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode backend address |
+| `OPENCODE_SERVER_PASSWORD` | - | OpenCode backend password |
+| `OPENCODE_PATH` | `opencode` | OpenCode binary path |
+| `OPENCODE_ZEN_API_KEY` | - | Zen API key passthrough |
+| `OPENCODE_PROXY_DEBUG` | `false` | Debug logs (`DEBUG` in `config.json`) |
 
-> 📄 完整配置参考: [配置详解](./docs/configuration.md)
+> 📄 Full reference: [Configuration](./docs/configuration.md)
 
-### 推荐生产配置
+### Recommended production config
 
 ```env
 API_KEY=your-secret-key
@@ -239,122 +241,114 @@ OPENCODE_PROXY_OMIT_SYSTEM_PROMPT=true
 OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 ```
 
+### External tool bridge
 
-### 外部工具桥接说明
+- External `tools` sent by clients are never registered as OpenCode built-in tools.
+- The proxy virtualizes them for the model and reshapes model output into OpenAI-compatible `tool_calls` / `function_call`.
+- Same-name conflicts are isolated via an internal namespace (e.g. a client-side `web_fetch` never triggers the in-container OpenCode tool).
+- Internal namespace names (e.g. `external__web_fetch`) are proxy implementation details, not public API.
 
-- 外部客户端传入的 `tools` 不会被注册为 OpenCode 内置工具。
-- 代理会把这些工具虚拟化后交给模型使用，并把模型输出重新整理为 OpenAI-compatible `tool_calls` / `function_call`。
-- 同名冲突默认通过内部命名空间隔离处理，例如客户端的 `web_fetch` 不会误触发 OpenCode 容器内工具。
-- 内部命名空间名（如 `external__web_fetch`）是代理内部实现细节，不属于公开 API。
+### Built-in tool allowlist
 
-### 内置工具 allowlist 说明
+- When a request carries **no** `tools`, the proxy enters internal-allowlist mode and only enables the OpenCode built-in tools listed in `OPENCODE_INTERNAL_ALLOWED_TOOLS`.
+- `OPENCODE_INTERNAL_WEB_FETCH_ENABLED=true` is only a legacy shortcut: when `OPENCODE_INTERNAL_ALLOWED_TOOLS` is unset, the allowlist defaults to `web_fetch`.
+- The proxy reads the backend tool list and resolves the final set via exact or `.<tool>` / `/<tool>` suffix match.
+- If nothing in the allowlist matches the backend tool list, the proxy falls back to the safe mode with all built-in tools disabled.
+- With `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED=true`, the proxy logs internal-allowlist debug/metric info (mode selection, backend discovery, allowlist hits, downgrade reasons) without logging tool outputs.
+- `OPENCODE_TOOL_DISCOVERY_FIXTURE` bypasses the real `client.tool.ids()` with a fixed tool-ID list for integration tests / local debugging.
+- Once a client explicitly passes `tools`, the request returns to the external-tool bridge path and OpenCode built-in tools stay disabled.
 
-- 当请求 **未传入** `tools` 时，代理会进入 internal allowlist 模式，并只允许 `OPENCODE_INTERNAL_ALLOWED_TOOLS` 中声明的 OpenCode 内置工具。
-- `OPENCODE_INTERNAL_WEB_FETCH_ENABLED=true` 仅作为兼容旧配置的快捷方式：当未显式配置 `OPENCODE_INTERNAL_ALLOWED_TOOLS` 时，会默认把 allowlist 视为 `web_fetch`。
-- 代理会读取后端工具列表，并通过精确匹配或 `.<tool>` / `/<tool>` 后缀匹配解析最终可用工具。
-- 如果配置的 allowlist 在后端工具列表中一个也匹配不到，代理会自动回退到“全部内置工具禁用”的安全模式。
-- `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED=true` 时，代理会输出 internal allowlist 模式的调试/指标日志，包括模式选择、后端工具发现、allowlist 命中结果和降级原因，但不会记录工具返回内容。
-- `OPENCODE_TOOL_DISCOVERY_FIXTURE` 可用于集成测试或本地调试，绕过真实 `client.tool.ids()` 返回固定工具 ID 列表。
-- 一旦客户端显式传入 `tools`，请求立即回到现有外部工具桥接逻辑，OpenCode 内置工具继续保持禁用。
+### Structured diagnostics & Prometheus metrics
 
-### 结构化诊断与 Prometheus 指标
-
-- `/health` 始终保持为轻量健康检查接口。
-- `/health/details` 返回结构化 JSON 诊断数据，可通过 `OPENCODE_HEALTH_DETAILS_ENABLED` 控制是否暴露，并通过 `OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH` 控制是否要求 Bearer 认证。
-- `/metrics` 返回 Prometheus 文本格式指标，可通过 `OPENCODE_METRICS_ENABLED` 控制是否暴露，并通过 `OPENCODE_METRICS_REQUIRE_AUTH` 控制是否要求 Bearer 认证。
-- `/metrics` 目前暴露 internal tool mode、tool discovery failures、fallback count 和 tool-id cache 数量等指标。
+- `/health` stays a lightweight health check.
+- `/health/details` returns structured JSON diagnostics; exposure via `OPENCODE_HEALTH_DETAILS_ENABLED`, auth via `OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH`.
+- `/metrics` returns Prometheus text metrics; exposure via `OPENCODE_METRICS_ENABLED`, auth via `OPENCODE_METRICS_REQUIRE_AUTH`.
+- `/metrics` currently exposes internal tool mode, tool discovery failures, fallback counts, and tool-ID cache size.
 
 ---
 
-## 🔌 API 参考
+## 🔌 API Reference
 
-### 端点
+### Endpoints
 
-| 方法 | 路径 | 说明 |
+| Method | Path | Description |
 |:-----|:-----|:-----|
-| `GET` | `/health` | 健康检查 |
-| `GET` | `/health/details` | 结构化诊断接口（可配置开关/鉴权） |
-| `GET` | `/metrics` | Prometheus 指标接口（可配置开关/鉴权） |
-| `GET` | `/v1/models` | 获取可用模型列表 |
+| `GET` | `/health` | Health check |
+| `GET` | `/health/details` | Structured diagnostics (configurable exposure/auth) |
+| `GET` | `/metrics` | Prometheus metrics (configurable exposure/auth) |
+| `GET` | `/v1/models` | List available models |
 | `POST` | `/v1/chat/completions` | Chat Completions API |
 | `POST` | `/v1/responses` | Responses API |
-| `POST` | `/v1/messages` | Anthropic Messages API（`max_tokens` 必填，支持 `x-api-key`） |
+| `POST` | `/v1/messages` | Anthropic Messages API (`max_tokens` required, supports `x-api-key`) |
 
-### 模型名称格式
+### Model name formats
 
-- 直接使用: `opencode/big-pickle`
-- 带别名: `gpt5-nano` (自动解析为 `gpt-5-nano`)
-- 带前缀: `opencode/gpt5-nano`
+- Direct: `opencode/big-pickle`
+- Aliased: `gpt5-nano` (auto-resolved to `gpt-5-nano`)
+- Prefixed: `opencode/gpt5-nano`
 
-> 📖 详见 [API 参考文档](./docs/api-reference.md)
+> 📖 See [API Reference](./docs/api-reference.md)
 
 ---
 
-## 🔧 故障排查
+## 🔧 Troubleshooting
 
-### 请求卡住但 `/v1/models` 正常
+### Requests hang but `/v1/models` works
 ```bash
-USE_ISOLATED_HOME=false  # 让 OpenCode 复用本地登录态
+OPENCODE_USE_ISOLATED_HOME=false  # Let OpenCode reuse the local login state
 ```
 
-### 模型找不到
-- 查看可用模型: `curl http://127.0.0.1:10000/v1/models`
-- 确认模型 ID 完全匹配
+### Model not found
+- List models: `curl http://127.0.0.1:10000/v1/models`
+- Confirm the model ID matches exactly
 
-### 没有推理输出
-- 使用 `stream: true` 的 Responses API
-- 发送 `reasoning.effort` 或 `reasoning_effort`
+### No reasoning output
+- Use the Responses API with `stream: true`
+- Send `reasoning.effort` or `reasoning_effort`
 
-> 📖 完整指南: [故障排查](./docs/troubleshooting.md)
+> 📖 Full guide: [Troubleshooting](./docs/troubleshooting.md)
 
 ---
 
-## 🔨 开发
+## 🔨 Development
 
 ```bash
-# 类型检查（tsc --noEmit）
+# Typecheck (tsc --noEmit)
 npm run typecheck
 
-# 构建（tsc -> dist/，入口 dist/index.js）
+# Build (tsc -> dist/, entry dist/index.js)
 npm run build
 
-# 本地开发（tsx watch，源码入口 index.ts）
+# Local dev (tsx watch, source entry index.ts)
 npm run dev
 
-# 生产启动（运行构建产物）
+# Production start (run build output)
 npm start
 
-# 运行测试
+# Run tests
 npm test -- --runInBand
 
-# Docker 开发
+# Docker dev
 docker compose up -d --build
 ```
 
-> TypeScript 源码：`index.ts` + `src/**/*.ts`；构建产物：`dist/`（`dist/index.js` 为运行时入口，本地 `dist/` 不进 git/docker context）。
+> TypeScript sources: `index.ts` + `src/**/*.ts`; build output: `dist/` (`dist/index.js` is the runtime entry; local `dist/` is not committed and stays out of the Docker context).
 
 ---
 
-## 📄 许可证
+## 📄 License
 
-MIT · 详见 [LICENSE](./LICENSE.md)
+MIT · See [LICENSE](./LICENSE.md)
 
 ---
 
-## 🙏 致谢 / Acknowledgments
-
-本项目由 [samson910022/OpenCode2API](https://github.com/samson910022/OpenCode2API) 独立维护，复刻（Fork）自
-[TiaraBasori/opencode2api](https://github.com/TiaraBasori/opencode2api)：
-
-- [TiaraBasori/opencode2api](https://github.com/TiaraBasori/opencode2api) — 直接上游，本项目的起点（MIT）
-
-另受以下开源项目启发：
-
-- [dxxzst/opencode-to-openai](https://github.com/dxxzst/opencode-to-openai) — 早期设计参考（MIT）
-- [lucasliet/opencode-openai-proxy](https://github.com/lucasliet/opencode-openai-proxy) — 早期设计参考（MIT）
+## 🙏 Acknowledgments
 
 This project is independently maintained at [samson910022/OpenCode2API](https://github.com/samson910022/OpenCode2API),
 forked from [TiaraBasori/opencode2api](https://github.com/TiaraBasori/opencode2api) and inspired by
 [dxxzst/opencode-to-openai](https://github.com/dxxzst/opencode-to-openai) and
 [lucasliet/opencode-openai-proxy](https://github.com/lucasliet/opencode-openai-proxy).
 Upstream code remains under its original MIT license; see [LICENSE](./LICENSE.md).
+
+本项目由 [samson910022/OpenCode2API](https://github.com/samson910022/OpenCode2API) 独立维护，复刻（Fork）自
+[TiaraBasori/opencode2api](https://github.com/TiaraBasori/opencode2api)；另受以下开源项目启发：[dxxzst/opencode-to-openai](https://github.com/dxxzst/opencode-to-openai)、[lucasliet/opencode-openai-proxy](https://github.com/lucasliet/opencode-openai-proxy)。中文版见 [README.zh-CN.md](./README.zh-CN.md)。

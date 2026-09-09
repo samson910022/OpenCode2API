@@ -13,11 +13,9 @@
 | 项目 | 说明 |
 |:-----|:-----|
 | **症状** | 模型列表接口正常，但实际请求无响应 |
-| **解决方案** | 设置 `USE_ISOLATED_HOME=false` 让 OpenCode 复用本机登录态 |
+| **解决方案** | 设置 `OPENCODE_USE_ISOLATED_HOME=false` 让 OpenCode 复用本机登录态（`config.json` 中用短键 `USE_ISOLATED_HOME`） |
 
 ```bash
-USE_ISOLATED_HOME=false
-# 或
 OPENCODE_USE_ISOLATED_HOME=false
 ```
 
@@ -126,8 +124,6 @@ curl -H "Authorization: Bearer YOUR_API_KEY" ...
 
 ```bash
 # 环境变量
-DEBUG=true
-# 或
 OPENCODE_PROXY_DEBUG=true
 ```
 

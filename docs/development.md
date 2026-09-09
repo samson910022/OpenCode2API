@@ -87,11 +87,7 @@ docker compose logs -f
 
 ### 格式化
 
-项目使用 ESLint (如有配置):
-
-```bash
-npm run lint
-```
+项目暂无代码风格检查脚本；以 `npm run typecheck` + 现有测试为门禁。
 
 ### 提交规范
 

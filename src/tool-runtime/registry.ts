@@ -6,6 +6,7 @@ import {
   normalizeSideEffect
 } from './contracts.js';
 import type { ToolRiskLevel, ToolSideEffect } from './contracts.js';
+import { asRecord } from '../utils/guards.js';
 
 /** Shared extension fields carried alongside a tool definition. */
 export interface ToolDefinitionExtras {
@@ -141,13 +142,6 @@ export function normalizeToolDefinition(tool: unknown): NormalizedToolDefinition
     x_proxy_requires_confirmation:
       definition['x_proxy_requires_confirmation'] ?? topLevel['x_proxy_requires_confirmation']
   };
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    return value as Record<string, unknown>;
-  }
-  return {};
 }
 
 function inferSideEffect(definition: unknown = {}): ToolSideEffect {

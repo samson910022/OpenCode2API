@@ -32,20 +32,7 @@ import { getImageDataUri } from '../stream/collector.js';
 import type { Application, Request, Response } from 'express';
 import type { AppContext } from '../types/context.js';
 import type { FinalToolCall } from '../tool-runtime/parser.js';
-
-function asRecord(value: unknown): Record<string, unknown> {
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    return value as Record<string, unknown>;
-  }
-  return {};
-}
-
-function toErrorMessage(e: unknown): string {
-  if (e instanceof Error) return e.message;
-  const r = asRecord(e);
-  const m: unknown = r['message'];
-  return typeof m === 'string' ? m : String(e);
-}
+import { asRecord, toErrorMessage } from '../utils/guards.js';
 
 export function registerMessagesRoutes(app: Application, ctx: AppContext): void {
   const {
