@@ -92,6 +92,8 @@ docker run -d \
 
 > 后端 `10001` 仅容器内部使用，不要对外发布（compose 默认也只映射代理端口；改端口用 `OPENCODE_PROXY_PORT`，如 `8090`）。
 
+> 注意：镜像构建时**不会**把本地 `config.json` 烘焙进去（多阶段构建只复制 `dist/` 与依赖，避免把本地密钥带进镜像）。容器内配置请用环境变量，或 `-v ./config.json:/home/node/project/config.json:ro` 挂载（代理会按 `dist/` 同层 → 项目根 → 工作目录顺序查找）。
+
 ### 多架构
 
 `ghcr.io/samson910022/opencode2api:latest` 同时含 `linux/amd64` 与 `linux/arm64`，ARM 机器可直接 pull，无需本地 build（仅自带 `custom-bin/opencode` 二进制时才需按架构重建）。
