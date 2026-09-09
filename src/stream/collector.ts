@@ -5,13 +5,7 @@ import { sleep } from '../backend/manager.js';
 import { withTimeout, DEFAULT_POLL_INTERVAL_MS } from '../config/proxy-config.js';
 import type { ProxyClient } from '../types/client.js';
 import type { CollectorHandle } from '../types/context.js';
-
-function asRecord(value: unknown): Record<string, unknown> {
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    return value as Record<string, unknown>;
-  }
-  return {};
-}
+import { asRecord } from '../utils/guards.js';
 
 function toErrorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String((e as Record<string, unknown>)?.['message'] ?? e);

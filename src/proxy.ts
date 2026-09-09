@@ -45,19 +45,7 @@ import type { ResponseStateEntry } from './types/backend.js';
 // (tests/env-alias.test.js, stream-hardening.test.js import these from '../src/proxy.js').
 export { normalizeBool, resolveDisableTools, withTimeout };
 
-function asRecord(value: unknown): Record<string, unknown> {
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    return value as Record<string, unknown>;
-  }
-  return {};
-}
-
-function toErrorMessage(e: unknown): string {
-  if (e instanceof Error) return e.message;
-  const r = asRecord(e);
-  const m: unknown = r['message'];
-  return typeof m === 'string' ? m : String(e);
-}
+import { asRecord, toErrorMessage } from './utils/guards.js';
 
 export function createApp(config: ProxyConfig): CreateAppResult {
   const {

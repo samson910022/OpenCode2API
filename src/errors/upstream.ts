@@ -1,12 +1,6 @@
 // P4 TS: upstream error classification/normalization (ported from P3 .js, behavior identical).
 import type { NormalizedUpstreamError, RawBackendErrorLike, TransformedUpstreamError } from '../types/errors.js';
-
-function asRecord(value: unknown): Record<string, unknown> {
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    return value as Record<string, unknown>;
-  }
-  return {};
-}
+import { asRecord } from '../utils/guards.js';
 
 function readStringField(record: Record<string, unknown>, key: string): string | null {
   const v: unknown = record[key];

@@ -40,14 +40,14 @@
 | `OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH` | `true` | 控制 `/health/details` 是否要求 Bearer 认证 |
 | `OPENCODE_METRICS_ENABLED` | `false` | 控制 Prometheus `/metrics` 是否暴露 |
 | `OPENCODE_METRICS_REQUIRE_AUTH` | `true` | 控制 `/metrics` 是否要求 Bearer 认证 |
-| `USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录 |
-| `PROMPT_MODE` | `standard` | 提示词处理模式 |
-| `OMIT_SYSTEM_PROMPT` | `false` | 忽略传入的 system prompt |
-| `AUTO_CLEANUP_CONVERSATIONS` | `false` | 自动清理会话存储 |
-| `CLEANUP_INTERVAL_MS` | `43200000` | 清理间隔 (毫秒) |
-| `CLEANUP_MAX_AGE_MS` | `86400000` | 最大存储时间 (毫秒) |
-| `REQUEST_TIMEOUT_MS` | `180000` | 请求超时时间 (毫秒) |
-| `RETRY_MAX_RETRIES` / `OPENCODE_PROXY_RETRY_MAX_RETRIES` | `3` | 首次失败后重试次数 (0-5，总尝试 1+n；退避指数+jitter 并优先 `retry-after`) |
+| `OPENCODE_USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录（`config.json` 中用短键 `USE_ISOLATED_HOME`） |
+| `OPENCODE_PROXY_PROMPT_MODE` | `standard` | 提示词处理模式（`config.json` 中用短键 `PROMPT_MODE`） |
+| `OPENCODE_PROXY_OMIT_SYSTEM_PROMPT` | `false` | 忽略传入的 system prompt（`config.json` 中用短键 `OMIT_SYSTEM_PROMPT`） |
+| `OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS` | `false` | 自动清理会话存储（`config.json` 中用短键 `AUTO_CLEANUP_CONVERSATIONS`） |
+| `OPENCODE_PROXY_CLEANUP_INTERVAL_MS` | `43200000` | 清理间隔 (毫秒)（`config.json` 中用短键 `CLEANUP_INTERVAL_MS`） |
+| `OPENCODE_PROXY_CLEANUP_MAX_AGE_MS` | `86400000` | 最大存储时间 (毫秒)（`config.json` 中用短键 `CLEANUP_MAX_AGE_MS`） |
+| `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `180000` | 请求超时时间 (毫秒)（`config.json` 中用短键 `REQUEST_TIMEOUT_MS`） |
+| `OPENCODE_PROXY_RETRY_MAX_RETRIES` | `3` | 首次失败后重试次数 (0-5，总尝试 1+n；退避指数+jitter 并优先 `retry-after`)（`config.json` 中用短键 `RETRY_MAX_RETRIES`） |
 
 > 重试退避移植自上游 `session/retry.ts`（`2s×2ⁿ⁻¹` +25% jitter），但 `retry-after` 等待 clamp 在 30s（上游近无界；网关面对自带超时的客户端不宜久睡）。旧部署注意：默认总尝试由 3 次变为 1+3=4 次，如需接近旧次数可设 `2`。
 
@@ -55,7 +55,7 @@
 
 | 变量 | 默认值 | 说明 |
 |:-----|:-------|:-----|
-| `DEBUG` / `OPENCODE_PROXY_DEBUG` | `false` | 开启调试日志 |
+| `OPENCODE_PROXY_DEBUG` | `false` | 开启调试日志（`config.json` 中用短键 `DEBUG`） |
 | `OPENCODE_PATH` | `opencode` | OpenCode 可执行文件路径 |
 | `OPENCODE_ZEN_API_KEY` | - | Zen API Key 透传 |
 
@@ -99,8 +99,8 @@ OpenCode2API 现在支持把外部客户端传入的 OpenAI-compatible `tools` �
 
 | 配置项 | 支持值 | 说明 |
 |:------|:------|:-----|
-| `OPENCODE_EXTERNAL_TOOLS_MODE` / `EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 由代理虚拟化外部工具，并返回 OpenAI-compatible tool calling 结果 |
-| `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` / `EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 使用代理内部命名空间隔离同名冲突 |
+| `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 由代理虚拟化外部工具，并返回 OpenAI-compatible tool calling 结果（`config.json` 中用短键 `EXTERNAL_TOOLS_MODE`） |
+| `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 使用代理内部命名空间隔离同名冲突（`config.json` 中用短键 `EXTERNAL_TOOLS_CONFLICT_POLICY`） |
 
 ### 工具冲突策略
 
@@ -129,7 +129,7 @@ OpenCode2API 现在支持把外部客户端传入的 OpenAI-compatible `tools` �
 **示例：**
 ```json
 {
-  "model": "opencode/kimi-k2.5",
+  "model": "opencode/muse-spark-1.3-contributor-free",
   "messages": [{"role": "user", "content": "Fetch this URL"}],
   "opencode": {
     "internal_allowed_tools": ["web_fetch"]
@@ -218,7 +218,7 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 | 模式 | 说明 |
 |:-----|:-----|
 | **standard** (默认) | 标准模式，完整处理提示词 |
-| **plugin-inject** | 插件注入模式，减小模型侧提示词大小，通常与 `OMIT_SYSTEM_PROMPT=true` 配合使用 |
+| **plugin-inject** | 插件注入模式，减小模型侧提示词大小，通常与 `OPENCODE_PROXY_OMIT_SYSTEM_PROMPT=true` 配合使用 |
 
 ---
 
