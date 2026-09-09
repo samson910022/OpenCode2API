@@ -10,7 +10,7 @@
 >
 > 📖 [Docs](./docs/README.md) | 🚀 [Quick Start](#quick-start) | 🐛 [Issues](https://github.com/samson910022/OpenCode2API/issues)
 
-Turn a local [OpenCode](https://opencode.ai) runtime into an OpenAI-compatible API gateway. Use free models (GPT, Nemotron, MiniMax) from any OpenAI client.
+Turn a local [OpenCode](https://opencode.ai) runtime into an OpenAI- and Anthropic-compatible API gateway. Use free models (Big Pickle, Ling, MiMo, Muse Spark, Nemotron) from any OpenAI or Anthropic client — the free lineup rotates, so query `/v1/models` for the live list.
 
 ---
 
