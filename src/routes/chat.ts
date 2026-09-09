@@ -10,6 +10,8 @@ import {
   createExternalToolCallStreamParser,
 } from '../tool-runtime/parser.js';
 import { isTransientUpstreamError, transformUpstreamError } from '../errors/upstream.js';
+import { engageFallbackForFreeLimit } from '../upstream-proxy/fallback.js';
+import { detectHostedSearchTools } from '../search/grounding.js';
 import {
   withTimeout,
   DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
@@ -69,6 +71,10 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
     promptWithTimeout,
     collectFromEvents,
     pollForAssistantResponse,
+    proxyPool,
+    proxyClient,
+    proxyPromptWithTimeout,
+    proxyPollForAssistantResponse,
   } = ctx;
 
   // Chat completions endpoint
@@ -83,6 +89,29 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
           let mID = 'kimi-k2.5-free';
           let id = `chatcmpl-${crypto.randomUUID()}`;
           let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
+          // P3 fallback bundle: direct by default; switched to the proxy
+          // bundle for subsequent attempts once a free-limit error engages it.
+          let activeClient = client;
+          let activePromptWithTimeout = promptWithTimeout;
+          let activePollForAssistantResponse = pollForAssistantResponse;
+          let fallbackToProxy = false;
+          // Set once the fallback branch serves content, so the shared
+          // post-loop poll below is skipped (avoids a duplicate poll +
+          // duplicate tool_calls for markup-only answers).
+          let fallbackServed = false;
+          const switchToProxyBundle = (): boolean => {
+            if (!proxyClient) return false;
+            activeClient = proxyClient;
+            activePromptWithTimeout = proxyPromptWithTimeout;
+            activePollForAssistantResponse = proxyPollForAssistantResponse;
+            fallbackToProxy = true;
+            return true;
+          };
+          const engageProxyFallback = (err: unknown): boolean => {
+            if (!engageFallbackForFreeLimit(err, proxyPool)) return false;
+            return switchToProxyBundle();
+          };
+          if (proxyPool.isEngaged()) switchToProxyBundle();
 
           try {
             const body = asRecord((req as unknown as { body: unknown }).body);
@@ -104,6 +133,19 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
             stream = Boolean(requestStream);
             if (!messages || !Array.isArray(messages) || (messages as unknown[]).length === 0) {
               res.status(400).json({ error: { message: 'messages array is required' } });
+              return;
+            }
+            // Hosted search (web_search) is a Responses/Interactions API tool;
+            // on chat completions it would be silently dropped by the function
+            // registry, so fail loudly with a pointer instead.
+            if (detectHostedSearchTools(tools).requested) {
+              res.status(400).json({
+                error: {
+                  message:
+                    'web_search is not supported on /v1/chat/completions; use POST /v1/responses with tools:[{type:"web_search"}] or POST /v1beta/interactions with tools:[{type:"google_search"}]',
+                  type: 'invalid_request_error',
+                },
+              });
               return;
             }
 
@@ -319,7 +361,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
 
             // Set active model
             try {
-              await client.config.update({
+              await activeClient.config.update({
                 body: {
                   activeModel: { providerID: pID, modelID: mID },
                 },
@@ -329,7 +371,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
             }
 
             // Create session (bounded: a hung backend must 504, not stall).
-            const sessionRes = (await withTimeout(client.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
+            const sessionRes = (await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
             sessionId = (asRecord(asRecord(sessionRes)['data'])['id'] as string | undefined) ?? null;
             if (!sessionId) throw new Error('Failed to create OpenCode session');
             logDebug('Session created', { sessionId });
@@ -474,12 +516,12 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
                 if (attempt > 1) {
                   try {
-                    await client.session.delete({ path: { id: sessionId } });
+                    await activeClient.session.delete({ path: { id: sessionId } });
                   } catch (e: unknown) {
                     logDebug('Failed to delete retried session', { sessionId, error: toErrorMessage(e) });
                   }
                   const retrySessionRes = (await withTimeout(
-                    client.session.create(),
+                    activeClient.session.create(),
                     REQUEST_TIMEOUT_MS,
                     'create session',
                   )) as unknown;
@@ -497,24 +539,50 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   await sleep(computeRetryDelay(attempt - 1, lastStreamAttemptError));
                 }
                 try {
-                  const collectPromise = collectFromEvents(
-                    sessionId as string,
-                    REQUEST_TIMEOUT_MS,
-                    sendDelta,
-                    DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-                    DEFAULT_EVENT_IDLE_TIMEOUT_MS,
-                  );
-                  const safeCollect = collectPromise.catch((err: unknown) => ({ __error: err }));
-                  client.session.prompt(promptParams).catch((err: unknown) => logDebug('Prompt error:', toErrorMessage(err)));
-                  collected = (await safeCollect) as Record<string, unknown>;
+                  if (fallbackToProxy) {
+                    // SSE subscribe ignores custom fetch (SDK gap): prompt+poll
+                    // through the proxy bundle instead of the event stream.
+                    // Deltas go out immediately so the post-loop poll is skipped.
+                    await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                    const pres = (await activePollForAssistantResponse(
+                      sessionId as string,
+                      REQUEST_TIMEOUT_MS,
+                    )) as { content: string; reasoning: string; error: unknown };
+                    if (pres.reasoning) sendDelta(pres.reasoning, true);
+                    if (pres.content) sendDelta(pres.content, false);
+                    // Only mark served when something arrived: error-only
+                    // results must still reach the terminal poll/error report.
+                    if (pres.content || pres.reasoning) fallbackServed = true;
+                    collected = {
+                      content: pres.content,
+                      reasoning: pres.reasoning,
+                      ...(pres.error ? { error: pres.error } : {}),
+                    };
+                  } else {
+                    const collectPromise = collectFromEvents(
+                      sessionId as string,
+                      REQUEST_TIMEOUT_MS,
+                      sendDelta,
+                      DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
+                      DEFAULT_EVENT_IDLE_TIMEOUT_MS,
+                    );
+                    const safeCollect = collectPromise.catch((err: unknown) => ({ __error: err }));
+                    activeClient.session.prompt(promptParams).catch((err: unknown) => logDebug('Prompt error:', toErrorMessage(err)));
+                    collected = (await safeCollect) as Record<string, unknown>;
+                  }
                 } catch (e: unknown) {
                   logDebug('Stream error:', toErrorMessage(e));
+                  collected = { __error: e };
                 }
 
                 const collectedRecord = asRecord(collected);
                 const attemptError: unknown = collectedRecord['error'] ?? collectedRecord['__error'] ?? null;
                 const nothingStreamed =
                   !rawStreamedContent && !rawStreamedReasoning && streamedToolCalls.length === 0;
+                if (attemptError && nothingStreamed && attempt < maxAttempts && engageProxyFallback(attemptError)) {
+                  lastStreamAttemptError = attemptError;
+                  continue;
+                }
                 if (attemptError && nothingStreamed && attempt < maxAttempts && isTransientUpstreamError(attemptError)) {
                   console.warn(
                     `[Proxy] Transient upstream error (attempt ${attempt}/${maxAttempts}), retrying:`,
@@ -527,12 +595,18 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               }
 
               const collectedR = asRecord(collected);
+              // NOTE: success and __error shapes are mutually exclusive here —
+              // the fallback branch above stores content (no __error) while
+              // transport exceptions store __error only — so this recovery poll
+              // must always run regardless of fallbackServed.
               if (collected && collectedR['__error']) {
                 logDebug('SSE collect error, falling back to polling', {
                   sessionId,
                   error: toErrorMessage(collectedR['__error']),
                 });
-                const { content, reasoning, error } = await pollForAssistantResponse(
+                // The collect error itself may be the free-limit signal.
+                if (!fallbackToProxy) engageProxyFallback(collectedR['__error']);
+                const { content, reasoning, error } = await activePollForAssistantResponse(
                   sessionId as string,
                   REQUEST_TIMEOUT_MS,
                 );
@@ -547,7 +621,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 }
               } else if (collected && collectedR['noData']) {
                 logDebug('Fallback to polling (stream)', { sessionId });
-                const { content, reasoning, error } = await pollForAssistantResponse(
+                const { content, reasoning, error } = await activePollForAssistantResponse(
                   sessionId as string,
                   REQUEST_TIMEOUT_MS,
                 );
@@ -562,7 +636,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 }
               } else if (collected && collectedR['idleTimeout']) {
                 logDebug('SSE idle timeout, polling for completion', { sessionId });
-                const { content, reasoning, error } = await pollForAssistantResponse(
+                const { content, reasoning, error } = await activePollForAssistantResponse(
                   sessionId as string,
                   REQUEST_TIMEOUT_MS,
                 );
@@ -587,6 +661,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
 
               if (
                 collected &&
+                !fallbackServed &&
                 !streamedContent &&
                 !streamedReasoning &&
                 ((collectedR['reasoning'] as string) || (collectedR['content'] as string))
@@ -595,9 +670,9 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 if (collectedR['content']) sendDelta(String(collectedR['content']), false);
               }
 
-              if (!streamedContent && !streamedReasoning) {
+              if (!fallbackServed && !streamedContent && !streamedReasoning) {
                 logDebug('SSE returned empty, falling back to polling', { sessionId });
-                const { content, reasoning, error } = await pollForAssistantResponse(
+                const { content, reasoning, error } = await activePollForAssistantResponse(
                   sessionId as string,
                   REQUEST_TIMEOUT_MS,
                 );
@@ -612,7 +687,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 }
               } else if (streamedReasoning && !streamedContent) {
                 logDebug('Reasoning streamed but no content, reconciling from snapshot', { sessionId });
-                const snapshot = await pollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS).catch(
+                const snapshot = await activePollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS).catch(
                   () => null,
                 );
                 if (snapshot && snapshot.content) {
@@ -725,12 +800,12 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 }
                 if (attempt > 1) {
                   try {
-                    await client.session.delete({ path: { id: sessionId } });
+                    await activeClient.session.delete({ path: { id: sessionId } });
                   } catch (e: unknown) {
                     logDebug('Failed to delete retried session', { sessionId, error: toErrorMessage(e) });
                   }
                   const retrySessionRes = (await withTimeout(
-                    client.session.create(),
+                    activeClient.session.create(),
                     REQUEST_TIMEOUT_MS,
                     'create session',
                   )) as unknown;
@@ -742,9 +817,9 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 }
                 const attemptStart = Date.now();
                 try {
-                  await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                  await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
                   logDebug('Prompt sent', { sessionId, ms: Date.now() - attemptStart, attempt });
-                  const collected = await pollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
+                  const collected = await activePollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
                   content = collected.content || '';
                   reasoning = collected.reasoning || '';
                   error = collected.error || null;
@@ -752,6 +827,9 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   content = '';
                   reasoning = '';
                   error = promptError;
+                }
+                if (error && !content && !reasoning && attempt < maxAttempts && engageProxyFallback(error)) {
+                  continue;
                 }
                 if (error && !content && !reasoning && attempt < maxAttempts && isTransientUpstreamError(error)) {
                   console.warn(
@@ -830,6 +908,9 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
           } catch (error: unknown) {
             console.error('[Proxy] API Error:', toErrorMessage(error));
             console.error('[Proxy] Error details:', error);
+            // Single-shot paths (and exhausted loops): engage the pool so the
+            // next request benefits even though this one cannot retry further.
+            if (!fallbackToProxy) engageProxyFallback(error);
 
             if (keepaliveInterval) clearInterval(keepaliveInterval);
 
@@ -842,7 +923,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
             }
             if (sessionId) {
               try {
-                await client.session.delete({ path: { id: sessionId } });
+                await activeClient.session.delete({ path: { id: sessionId } });
               } catch (e: unknown) {
                 console.error('[Proxy] Failed to cleanup session on error:', toErrorMessage(e));
               }

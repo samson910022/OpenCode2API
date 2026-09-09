@@ -21,6 +21,7 @@
 | `PORT` / `OPENCODE_PROXY_PORT` | `10000` | 代理服务端口 |
 | `OPENCODE_SERVER_PORT` | `10001` | OpenCode 后端服务端口 |
 | `API_KEY` | - | Bearer Token 认证密钥 |
+| `API_KEYS` / `OPENCODE_API_KEYS` | - | 多 client keys（逗号分隔，任一通过；与 `API_KEY` 合并；为空回退免认证） |
 | `BIND_HOST` | `0.0.0.0` | 绑定地址（`BIND_HOST` 优先，`OPENCODE_PROXY_BIND_HOST` 为后备） |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode 后端地址 |
 | `OPENCODE_SERVER_PASSWORD` | - | OpenCode 后端密码 |
@@ -33,7 +34,7 @@
 | `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式；当前仅支持 `proxy-bridge` |
 | `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 外部工具冲突隔离策略；当前仅支持 `namespace` |
 | `OPENCODE_INTERNAL_WEB_FETCH_ENABLED` | `false` | 兼容旧开关；未显式配置 allowlist 时，启用后默认放行 `web_fetch` |
-| `OPENCODE_INTERNAL_ALLOWED_TOOLS` | `(none)` | 当请求未传入 `tools` 时允许使用的 OpenCode 内置工具列表，逗号分隔 |
+| `OPENCODE_INTERNAL_ALLOWED_TOOLS` | `(none)` | 当请求未传入 `tools` 时允许使用的 OpenCode 内置工具列表，逗号分隔（例 `websearch,webfetch`；`web_fetch` 等旧写法仍可匹配，大小写/分隔符不敏感） |
 | `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED` | `true` | 输出 internal allowlist 模式的调试/指标日志 |
 | `OPENCODE_TOOL_DISCOVERY_FIXTURE` | `(none)` | 集成测试/本地调试用的固定后端工具 ID 列表，逗号分隔 |
 | `OPENCODE_HEALTH_DETAILS_ENABLED` | `true` | 控制 `/health/details` 是否暴露 |
@@ -51,6 +52,21 @@
 
 > 重试退避移植自上游 `session/retry.ts`（`2s×2ⁿ⁻¹` +25% jitter），但 `retry-after` 等待 clamp 在 30s（上游近无界；网关面对自带超时的客户端不宜久睡）。旧部署注意：默认总尝试由 3 次变为 1+3=4 次，如需接近旧次数可设 `2`。
 
+### 免费额度 fallback 代理
+
+平时直连、零开销；仅当上游返回免费/Go 配额耗尽（`429 + FreeUsageLimitError/GoUsageLimitError`）时自动切到代理并按冷却粘滞，普通 5xx 不触发。
+
+> 两跳模型：代理作用于网关 → OpenCode 后端这一跳。若后端是远端地址（`OPENCODE_SERVER_URL` 非 loopback），切换出口 IP 可命中新的匿名/IP 配额；若是默认本地托管后端（`127.0.0.1`，恒直连 bypass），fallback 退化为同后端直接重试 + engaged 状态标记——此时如需改变后端 → Zen 的出口 IP，需给后端进程配 `HTTP(S)_PROXY`（`spawn` 会继承环境）。
+
+| 变量 | 默认值 | 说明 |
+|:-----|:-------|:-----|
+| `OPENCODE_UPSTREAM_PROXIES` | `(none)` | 逗号分隔的代理 URL（`socks5://` 优先，亦支持 `http(s)://`；`config.json` 中用短键 `UPSTREAM_PROXIES` 数组） |
+| `OPENCODE_UPSTREAM_PROXY_STRATEGY` | `failover-rr` | `failover-rr` / `round-robin` / `random`（连续限流即轮换下一个） |
+| `OPENCODE_UPSTREAM_PROXY_COOLDOWN_MS` | `300000` |  engaged 粘滞时长（毫秒），到期回直连 |
+| `OPENCODE_UPSTREAM_PROXY_NO_PROXY` | `localhost,127.0.0.1,::1` | 永不走代理的目标 host（默认后端 `127.0.0.1` 恒直连） |
+
+> 注意：`GET /health/details` 的 `internal_tools.fallback_proxies` 可观察 engaged 状态；`/metrics` 有 `opencode_fallback_proxy_engaged` gauge。流式 SSE 不走自定义 fetch（上游 SDK 缺口），fallback 自动降级为轮询。
+
 ### 调试配置
 
 | 变量 | 默认值 | 说明 |
@@ -67,6 +83,7 @@
 {
     "PORT": 10000,
     "API_KEY": "your-secret-api-key",
+    "API_KEYS": ["key-alpha", "key-beta"],
     "BIND_HOST": "0.0.0.0",
     "DISABLE_TOOLS": true,
     "EXTERNAL_TOOLS_MODE": "proxy-bridge",
@@ -113,7 +130,8 @@ OpenCode2API 现在支持把外部客户端传入的 OpenAI-compatible `tools` �
 
 - 当请求 **未传入** `tools` 时，代理会进入 internal allowlist 模式，只允许 `OPENCODE_INTERNAL_ALLOWED_TOOLS` 中声明的 OpenCode 内置工具。
 - `OPENCODE_INTERNAL_WEB_FETCH_ENABLED=true` 仅用于兼容旧配置：如果未显式配置 allowlist，则默认把 allowlist 视为 `web_fetch`。
-- 代理会读取后端工具列表，并通过精确匹配或 `.<tool>` / `/<tool>` 后缀匹配解析最终可用工具。
+- 代理会读取后端工具列表，并通过精确匹配、`.<tool>` / `/<tool>` 后缀匹配或大小写/分隔符不敏感匹配（如 `web_fetch` ↔ `webfetch`）解析最终可用工具。
+- 要启用上游搜索（`opencode`/`opencode-go` provider 自带 `websearch`，免额外 key）：`OPENCODE_INTERNAL_ALLOWED_TOOLS=websearch,webfetch`，模型用 `opencode-go/<model>`，并确保后端 `permission.websearch=allow`（默认 agent 已放行，无人值守勿设 `ask`）。
 - 如果配置的 allowlist 在后端工具列表中一个也没有匹配到，代理会自动回退到“全部内置工具禁用”的安全模式。
 - `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED=true` 时，会输出 internal allowlist 模式的调试/指标日志，记录模式选择、后端工具发现、allowlist 命中情况和降级原因，但不会记录工具输出内容。
 - `OPENCODE_TOOL_DISCOVERY_FIXTURE` 可在集成测试或本地调试时绕过真实 `client.tool.ids()`，直接提供固定工具 ID 列表。

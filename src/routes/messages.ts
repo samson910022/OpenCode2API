@@ -22,6 +22,8 @@ import {
   createExternalToolCallStreamParser,
 } from '../tool-runtime/parser.js';
 import { isTransientUpstreamError, normalizeBackendError, transformUpstreamError } from '../errors/upstream.js';
+import { engageFallbackForFreeLimit } from '../upstream-proxy/fallback.js';
+import { detectHostedSearchTools } from '../search/grounding.js';
 import {
   withTimeout,
   DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
@@ -57,6 +59,10 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
     promptWithTimeout,
     collectFromEvents,
     pollForAssistantResponse,
+    proxyPool,
+    proxyClient,
+    proxyPromptWithTimeout,
+    proxyPollForAssistantResponse,
   } = ctx;
 
   app.post('/v1/messages', async (req: Request, res: Response): Promise<void> => {
@@ -64,6 +70,25 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
       await lock(async (): Promise<void> => {
         let sessionId: string | null = null;
         let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
+        // P3 fallback bundle: direct by default; adopts the proxy bundle when
+        // this request hits a free-limit error (or the pool is already engaged).
+        let activeClient = client;
+        let activePromptWithTimeout = promptWithTimeout;
+        let activePollForAssistantResponse = pollForAssistantResponse;
+        let fallbackToProxy = false;
+        const switchToProxyBundle = (): boolean => {
+          if (!proxyClient) return false;
+          activeClient = proxyClient;
+          activePromptWithTimeout = proxyPromptWithTimeout;
+          activePollForAssistantResponse = proxyPollForAssistantResponse;
+          fallbackToProxy = true;
+          return true;
+        };
+        const engageProxyFallback = (err: unknown): boolean => {
+          if (!engageFallbackForFreeLimit(err, proxyPool)) return false;
+          return switchToProxyBundle();
+        };
+        if (proxyPool.isEngaged()) switchToProxyBundle();
         try {
           const rawBody: unknown = (req as unknown as { body: unknown }).body;
           const validationError = validateMessagesRequest(rawBody);
@@ -77,6 +102,27 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           const messagesRaw: unknown = body['messages'];
           const toolsRaw: unknown = body['tools'];
           const tools: unknown[] = Array.isArray(toolsRaw) ? (toolsRaw as unknown[]) : [];
+          // Anthropic server-side web_search would be silently dropped by the
+          // function-tool bridge; fail loudly with a pointer instead. Uses the
+          // shared helper (covers versioned types like web_search_20260222)
+          // plus the bare `web_search` name for name-only defs.
+          const hasHostedSearch =
+            detectHostedSearchTools(tools).requested ||
+            tools.some((def: unknown) => {
+              const r = asRecord(def);
+              return typeof r['name'] === 'string' && String(r['name']) === 'web_search';
+            });
+          if (hasHostedSearch) {
+            res.status(400).json({
+              type: 'error',
+              error: {
+                type: 'invalid_request_error',
+                message:
+                  'web_search is not supported on /v1/messages; use POST /v1/responses with tools:[{type:"web_search"}] or POST /v1beta/interactions with tools:[{type:"google_search"}]',
+              },
+            });
+            return;
+          }
           const tool_choice: unknown = body['tool_choice'];
           const requestStream: unknown = body['stream'];
           const temperature: unknown = body['temperature'];
@@ -86,6 +132,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           const stop_sequences: unknown = body['stop_sequences'];
           const thinking: unknown = body['thinking'];
           const stream = Boolean(requestStream);
+          const requestOpencodeConfig: unknown = body['opencode'];
           const chatMessages = anthropicMessagesToChatMessages(messagesRaw);
           const systemText = extractSystemText(system);
           if (systemText) chatMessages.unshift({ role: 'system', content: systemText } as unknown as (typeof chatMessages)[number]);
@@ -110,7 +157,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           const mID = String(asRecord(resolvedModel)['modelID']);
           const publicModel = `${pID}/${mID}`;
 
-          const requestToolContext = createRequestToolContext(chatTools, chatToolChoice, undefined);
+          const requestToolContext = createRequestToolContext(chatTools, chatToolChoice, requestOpencodeConfig);
           const toolMode: string = requestToolContext.mode;
           const externalToolContext = requestToolContext.external;
           const externalToolRegistry = externalToolContext.registry;
@@ -207,11 +254,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           );
           await ensureBackend(config);
           try {
-            await client.config.update({ body: { activeModel: { providerID: pID, modelID: mID } } });
+            await activeClient.config.update({ body: { activeModel: { providerID: pID, modelID: mID } } });
           } catch (e: unknown) {
             logDebug('Failed to set active model', { error: toErrorMessage(e) });
           }
-          const sessionRes = (await withTimeout(client.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
+          const sessionRes = (await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
           sessionId = (asRecord(asRecord(sessionRes)['data'])['id'] as string | undefined) ?? null;
           if (!sessionId) throw new Error('Failed to create OpenCode session');
 
@@ -296,11 +343,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
               }
               if (attempt > 1) {
                 try {
-                  await client.session.delete({ path: { id: sessionId } });
+                  await activeClient.session.delete({ path: { id: sessionId } });
                 } catch {
                   // ignore
                 }
-                const r = (await withTimeout(client.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
+                const r = (await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
                 sessionId = (asRecord(asRecord(r)['data'])['id'] as string | undefined) ?? null;
                 if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
                 promptParams.path.id = sessionId;
@@ -308,8 +355,8 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                 await sleep(computeRetryDelay(attempt - 1, error));
               }
               try {
-                await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-                const collected = await pollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
+                await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                const collected = await activePollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
                 content = collected.content || '';
                 reasoning = collected.reasoning || '';
                 error = collected.error || null;
@@ -318,6 +365,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                 reasoning = '';
                 error = promptError;
               }
+              if (error && !content && !reasoning && attempt < maxAttempts && engageProxyFallback(error)) continue;
               if (error && !content && !reasoning && attempt < maxAttempts && isTransientUpstreamError(error)) continue;
               break;
             }
@@ -419,38 +467,61 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
             else sendTextDelta(filtered);
           };
           let collected: Record<string, unknown> | null = null;
-          const collectPromise = collectFromEvents(
-            sessionId as string,
-            REQUEST_TIMEOUT_MS,
-            sendDelta,
-            DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-            DEFAULT_EVENT_IDLE_TIMEOUT_MS,
-          ).catch((err: unknown) => ({ __error: err }));
-          client.session.prompt(promptParams).catch((err: unknown) => logDebug('Prompt error:', toErrorMessage(err)));
-          const raced = (await Promise.race([collectPromise, resClosed.then(() => ({ __cancelled: true }))])) as Record<string, unknown>;
-          collected = raced;
-          if (raced['__cancelled']) {
-            if (keepaliveInterval) clearInterval(keepaliveInterval);
+          if (fallbackToProxy) {
+            // SSE subscribe ignores custom fetch (SDK gap): prompt+poll
+            // through the proxy bundle instead of the event stream.
             try {
-              if (sessionId) await client.session.delete({ path: { id: sessionId } });
+              await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+              const pres = await activePollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
+              if (pres.error && !pres.content && !pres.reasoning) throw normalizeBackendError(pres.error);
+              if (res.destroyed || res.writableEnded) {
+                if (keepaliveInterval) clearInterval(keepaliveInterval);
+                return;
+              }
+              // Raw text: sendDelta parses tool calls and filters display markup.
+              if (pres.content) sendDelta(pres.content, false);
+              if (pres.reasoning) sendDelta(pres.reasoning, true);
+              collected = { content: pres.content, reasoning: pres.reasoning };
             } catch (e: unknown) {
-              logDebug('Failed to cleanup cancelled messages session', { error: toErrorMessage(e) });
+              throw normalizeBackendError(e);
             }
-            try {
-              if (!res.destroyed) res.end();
-            } catch {
-              // ignore
+          } else {
+            const collectPromise = collectFromEvents(
+              sessionId as string,
+              REQUEST_TIMEOUT_MS,
+              sendDelta,
+              DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
+              DEFAULT_EVENT_IDLE_TIMEOUT_MS,
+            ).catch((err: unknown) => ({ __error: err }));
+            activeClient.session.prompt(promptParams).catch((err: unknown) => logDebug('Prompt error:', toErrorMessage(err)));
+            const raced = (await Promise.race([collectPromise, resClosed.then(() => ({ __cancelled: true }))])) as Record<string, unknown>;
+            collected = raced;
+            if (raced['__cancelled']) {
+              if (keepaliveInterval) clearInterval(keepaliveInterval);
+              try {
+                if (sessionId) await activeClient.session.delete({ path: { id: sessionId } });
+              } catch (e: unknown) {
+                logDebug('Failed to cleanup cancelled messages session', { error: toErrorMessage(e) });
+              }
+              try {
+                if (!res.destroyed) res.end();
+              } catch {
+                // ignore
+              }
+              return;
             }
-            return;
-          }
           if (raced['error'] && !rawContent && !rawReasoning) throw normalizeBackendError(raced['error']);
           if (raced['__error']) {
-            const polled = await pollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
+            // The collect error itself may be the free-limit signal.
+            if (!fallbackToProxy) engageProxyFallback(raced['__error']);
+            const polled = await activePollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
             if (polled.error && !polled.content && !polled.reasoning && !rawContent && !rawReasoning)
               throw normalizeBackendError(polled.error);
-            const { content, reasoning } = polled;
-            if (content && !rawContent) sendTextDelta(stripFunctionCallMarkup(content) as string);
-            if (reasoning && !rawReasoning) sendReasoningDelta(stripFunctionCallMarkup(reasoning) as string);
+            // Raw text through sendDelta so tool calls are parsed and raw
+            // snapshots stay consistent with the fallback branch above.
+            if (polled.content && !rawContent) sendDelta(polled.content, false);
+            if (polled.reasoning && !rawReasoning) sendDelta(polled.reasoning, true);
+          }
           }
           if (textBlockOpen) res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
           if (thinkingBlockOpen) res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: thinkingIndex }));
@@ -521,9 +592,10 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           return;
         } catch (error: unknown) {
           if (keepaliveInterval) clearInterval(keepaliveInterval);
+          if (!fallbackToProxy) engageProxyFallback(error);
           if (sessionId) {
             try {
-              await client.session.delete({ path: { id: sessionId } });
+              await activeClient.session.delete({ path: { id: sessionId } });
             } catch (e: unknown) {
               logDebug('Failed to cleanup messages session on error', { error: toErrorMessage(e) });
             }

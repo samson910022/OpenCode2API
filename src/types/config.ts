@@ -3,6 +3,7 @@
 export interface ProxyConfig {
   PORT: number;
   API_KEY: string;
+  API_KEYS: string[];
   OPENCODE_SERVER_URL: string;
   OPENCODE_SERVER_PASSWORD: string;
   OPENCODE_PATH: string;
@@ -30,6 +31,10 @@ export interface ProxyConfig {
   CLEANUP_MAX_AGE_MS: number;
   OPENCODE_HOME_BASE: string | null;
   RETRY_MAX_RETRIES?: unknown;
+  UPSTREAM_PROXIES: string[];
+  UPSTREAM_PROXY_STRATEGY: string;
+  UPSTREAM_PROXY_COOLDOWN_MS: number;
+  UPSTREAM_PROXY_NO_PROXY: string[];
   [key: string]: unknown;
 }
 
@@ -37,6 +42,7 @@ export interface ProxyConfig {
 export interface ProxyConfigOptions {
   PORT?: unknown;
   API_KEY?: unknown;
+  API_KEYS?: unknown;
   OPENCODE_SERVER_URL?: unknown;
   OPENCODE_SERVER_PASSWORD?: unknown;
   OPENCODE_PATH?: unknown;
@@ -69,6 +75,10 @@ export interface ProxyConfigOptions {
   CLEANUP_MAX_AGE_MS?: unknown;
   OPENCODE_HOME_BASE?: unknown;
   RETRY_MAX_RETRIES?: unknown;
+  UPSTREAM_PROXIES?: unknown;
+  UPSTREAM_PROXY_STRATEGY?: unknown;
+  UPSTREAM_PROXY_COOLDOWN_MS?: unknown;
+  UPSTREAM_PROXY_NO_PROXY?: unknown;
   PROMPT_MODE_ALIAS?: unknown;
   [key: string]: unknown;
 }

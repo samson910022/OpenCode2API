@@ -203,6 +203,40 @@ curl -X POST http://127.0.0.1:10000/v1/responses \
 
 非流式 `responses` 响应会在 `response.output` 中返回 `type: "function_call"` 项；流式模式会发送 function_call 生命周期和参数增量事件。
 
+**服务端联网搜索（`web_search`）:**
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1/responses \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode-go/kimi-k2.5-free",
+    "input": "PostgreSQL 最新版本是多少？",
+    "tools": [{"type": "web_search"}]
+  }'
+```
+
+`tools: [{"type": "web_search"}]`（亦接受 `web_search_preview` / `google_search`）是显式授权：代理将其从外部 function 注册表剔除，转驱动 opencode 内置 `websearch`（需模型 provider 为 `opencode`/`opencode-go`，否则需 `OPENCODE_ENABLE_EXA=1`），并在输出中返回 `type: "web_search_call"` 项（含真实执行的 `action.query`）与 `url_citation` 引用（仅标注答案中实际出现的来源 URL，无编造）。流式模式会发送 `response.web_search_call.searching/completed` 事件，最终 `response.completed` 携带完整引用。
+
+### 🔁 Interactions API（Gemini 兼容薄层）
+
+```http
+POST /v1beta/interactions
+POST /v1/interactions
+```
+
+| 参数 | 类型 | 必填 | 说明 |
+|:-----|:-----|:-----|:-----|
+| `model` / `agent` | string | ✅（二选一） | 模型 ID（`agent` 暂仅占位） |
+| `input` | string \| array | ✅ | 输入文本/消息 |
+| `system_instruction` | string | - | 系统指令 |
+| `tools` | array | - | 仅支持 `{type: "google_search"}`（等价 `web_search`），其余 function 工具返回 400 |
+| `previous_interaction_id` | string | - | 续写上轮会话（等价 responses 的 `previous_response_id`） |
+| `stream` | boolean | - | SSE：`interaction.created` / `step.delta` / `interaction.completed`（无 `[DONE]`，错误为 `{type:'error'}` 事件；15s heartbeat） |
+| `store` | boolean | - | `false` 则不持久化；仅删除本请求新建的会话，复用的父会话保留（注意：带 `previous_interaction_id` 的 `store:false` 轮次仍会追加到父会话历史，并非完全无痕） |
+
+响应为 `Interaction` 资源：`{id, status, model, output_text, steps[], usage: {grounding_tool_count}}`，其中 `steps` 含 `google_search_call{queries}`、`google_search_result{sources}`（标注为 opencode websearch 代理结果，非 Google 原生）、`model_output{text, annotations}`。文本往返与 `web_search` 接地逻辑复用 Responses 管线；限流错误的重试与代理 fallback 和其余路由一致（engage + 换 session，最多 `maxAttempts` 次），普通错误直接返回。
+
 ### 🧭 推荐提示模板（OpenClaw / Claude Code）
 
 在真实运行环境中，如果你希望第一跳**稳定先产出 tool call**，推荐把“调用工具”和“基于工具结果继续回答”拆成两步，而不是混在同一句里。

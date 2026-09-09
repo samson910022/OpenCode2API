@@ -10,6 +10,15 @@ import {
   createExternalToolCallStreamParser,
 } from '../tool-runtime/parser.js';
 import { isTransientUpstreamError, normalizeBackendError, transformUpstreamError } from '../errors/upstream.js';
+import { engageFallbackForFreeLimit } from '../upstream-proxy/fallback.js';
+import {
+  buildCitationAnnotations,
+  buildWebSearchCallItems,
+  detectHostedSearchTools,
+  extractSearchEvidence,
+  SEARCH_GROUNDING_INSTRUCTION,
+  stripHostedSearchTools,
+} from '../search/grounding.js';
 import {
   withTimeout,
   DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
@@ -60,8 +69,14 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
     createForcedToolCallRequester,
     trackToolMode,
     getToolOverridesForMode,
+    promptWithTimeout,
     collectFromEvents,
     pollForAssistantResponse,
+    TOOL_MODE,
+    proxyPool,
+    proxyClient,
+    proxyPromptWithTimeout,
+    proxyPollForAssistantResponse,
   } = ctx;
 
   app.post('/v1/responses', async (req: Request, res: Response): Promise<void> => {
@@ -73,6 +88,26 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         responsesKeepalive = null;
       }
     };
+    // P3 fallback bundle: direct by default; adopts the proxy bundle when
+    // this request hits a free-limit error (or the pool is already engaged).
+    // NOTE: declared outside try so the terminal catch can read the flag.
+    let activeClient = client;
+    let activePromptWithTimeout = promptWithTimeout;
+    let activePollForAssistantResponse = pollForAssistantResponse;
+    let fallbackToProxy = false;
+    const switchToProxyBundle = (): boolean => {
+      if (!proxyClient) return false;
+      activeClient = proxyClient;
+      activePromptWithTimeout = proxyPromptWithTimeout;
+      activePollForAssistantResponse = proxyPollForAssistantResponse;
+      fallbackToProxy = true;
+      return true;
+    };
+    const engageProxyFallback = (err: unknown): boolean => {
+      if (!engageFallbackForFreeLimit(err, proxyPool)) return false;
+      return switchToProxyBundle();
+    };
+    if (proxyPool.isEngaged()) switchToProxyBundle();
     try {
       const body = asRecord((req as unknown as { body: unknown }).body);
       const model: unknown = body['model'];
@@ -105,9 +140,44 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         null,
       );
 
-      const requestToolContext = createRequestToolContext(tools, tool_choice, requestOpencodeConfig);
-      const toolMode: string = requestToolContext.mode;
-      const internalToolContext = requestToolContext.internal;
+      // P4: hosted search tools (web_search/google_search) are explicit client
+      // grants for server-side grounding: keep them out of the external
+      // function registry and drive opencode `websearch` instead.
+      const hostedSearch = detectHostedSearchTools(tools);
+      const bridgeTools = stripHostedSearchTools(tools);
+      const requestToolContext = createRequestToolContext(bridgeTools, tool_choice, requestOpencodeConfig);
+      let toolMode: string = requestToolContext.mode;
+      let internalToolContext = requestToolContext.internal;
+      if (hostedSearch.requested && toolMode === TOOL_MODE.DISABLED) {
+        toolMode = TOOL_MODE.INTERNAL_ALLOWLIST;
+        internalToolContext = {
+          ...internalToolContext,
+          allowedToolNames: ['websearch'],
+          requestedAllowlist: null,
+          deniedRequestedTools: [],
+          resolutionPath: 'hosted-search-grant',
+          resultingMode: toolMode,
+          metricsEnabled: internalToolContext.metricsEnabled,
+        };
+      } else if (hostedSearch.requested && toolMode === TOOL_MODE.INTERNAL_ALLOWLIST) {
+        if (!internalToolContext.allowedToolNames.includes('websearch')) {
+          internalToolContext = {
+            ...internalToolContext,
+            allowedToolNames: [...internalToolContext.allowedToolNames, 'websearch'],
+            resolutionPath: 'hosted-search-grant',
+            resultingMode: toolMode,
+          };
+        }
+      } else if (hostedSearch.requested && toolMode === TOOL_MODE.EXTERNAL_BRIDGE) {
+        // Metadata only: the overrides union below already grants websearch,
+        // but without this trackToolMode/health would under-report it.
+        if (!internalToolContext.allowedToolNames.includes('websearch')) {
+          internalToolContext = {
+            ...internalToolContext,
+            allowedToolNames: [...internalToolContext.allowedToolNames, 'websearch'],
+          };
+        }
+      }
       trackToolMode(toolMode, {
         configuredAllowlist: internalToolContext.allowedToolNames,
         requestedAllowlist: internalToolContext.requestedAllowlist,
@@ -287,7 +357,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       await ensureBackend(config);
 
       try {
-        await client.config.update({
+        await activeClient.config.update({
           body: { activeModel: { providerID: pID, modelID: mID } },
         });
       } catch {
@@ -296,7 +366,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
 
       let sessionId: string | null = previousState?.sessionId || null;
       if (!sessionId) {
-        const sessionRes = (await withTimeout(client.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
+        const sessionRes = (await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
         sessionId = (asRecord(asRecord(sessionRes)['data'])['id'] as string | undefined) ?? null;
         if (!sessionId) {
           throw new Error('Failed to create OpenCode session');
@@ -325,17 +395,46 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       }
 
       const systemWithGuard = buildSystemPrompt(
-        [instructions, ...systemChunks, externalToolContext.prompt].filter(Boolean).join('\n\n'),
+        [
+          instructions,
+          ...systemChunks,
+          externalToolContext.prompt,
+          hostedSearch.requested ? SEARCH_GROUNDING_INSTRUCTION : '',
+        ]
+          .filter(Boolean)
+          .join('\n\n'),
         reasoningLevel,
         toolMode,
         internalToolContext.allowedToolNames,
       );
 
-      const toolOverrides = (await withTimeout(
+      const baseToolOverrides = (await withTimeout(
         getToolOverridesForMode(toolMode, internalToolContext),
         REQUEST_TIMEOUT_MS,
         'load tool overrides',
       )) as Record<string, boolean> | null;
+      // P4: union the websearch grant onto any mode (bridge/disabled modes
+      // otherwise force all-false and would switch the grounding tool back
+      // off). Only `true` grants merge — never copy `false` entries, which
+      // would extinguish an existing allowlist (e.g. webfetch) or a backend
+      // without websearch (all-false disabled fallback).
+      let toolOverrides = baseToolOverrides;
+      if (hostedSearch.requested) {
+        const searchOverrides = (await withTimeout(
+          getToolOverridesForMode(TOOL_MODE.INTERNAL_ALLOWLIST, {
+            allowedToolNames: ['websearch'],
+          }),
+          REQUEST_TIMEOUT_MS,
+          'load search overrides',
+        )) as Record<string, boolean> | null;
+        if (searchOverrides) {
+          const merged: Record<string, boolean> = { ...(baseToolOverrides ?? {}) };
+          for (const [id, granted] of Object.entries(searchOverrides)) {
+            if (granted === true) merged[id] = true;
+          }
+          toolOverrides = merged;
+        }
+      }
       const makeForcedResponsesToolCallRequester = (): (() => Promise<Record<string, unknown> | null>) =>
         createForcedToolCallRequester({
           mode: externalToolChoice.mode,
@@ -379,6 +478,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       const buildResponsesMessageOutputItem = (
         text: unknown,
         messageId: string = `msg_${crypto.randomUUID()}`,
+        annotations: unknown[] = [],
       ): Record<string, unknown> | null => {
         if (!text || (typeof text === 'string' && !text)) return null;
         if (typeof text === 'string' && !text.trim()) return null;
@@ -392,7 +492,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             {
               type: 'output_text',
               text,
-              annotations: [],
+              annotations,
             },
           ],
         };
@@ -552,47 +652,64 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
 
         let collected: Record<string, unknown> | null = null;
         try {
-          const collectPromise = collectFromEvents(
-            sessionId as string,
-            REQUEST_TIMEOUT_MS,
-            sendResponsesDelta,
-            DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-            DEFAULT_EVENT_IDLE_TIMEOUT_MS,
-          );
-          const safeCollect = collectPromise.catch((err: unknown) => ({ __error: err }));
-          client.session.prompt(promptParams).catch((err: unknown) => logDebug('Responses prompt error:', toErrorMessage(err)));
-          const raced = responsesResClosed
-            ? await Promise.race([safeCollect, responsesResClosed.then(() => ({ __cancelled: true }))])
-            : await safeCollect;
-          const racedRecord = asRecord(raced);
-          if (racedRecord['__cancelled']) {
-            stopResponsesKeepalive();
-            try {
-              if (sessionId) await client.session.delete({ path: { id: sessionId } });
-            } catch (e: unknown) {
-              logDebug('Failed to cleanup cancelled responses session', { error: toErrorMessage(e) });
+          if (fallbackToProxy) {
+            // SSE subscribe ignores custom fetch (SDK gap): prompt through the
+            // proxy bundle; the poll below (line ~614) fills content/reasoning.
+            await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+          } else {
+            const collectPromise = collectFromEvents(
+              sessionId as string,
+              REQUEST_TIMEOUT_MS,
+              sendResponsesDelta,
+              DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
+              DEFAULT_EVENT_IDLE_TIMEOUT_MS,
+            );
+            const safeCollect = collectPromise.catch((err: unknown) => ({ __error: err }));
+            activeClient.session.prompt(promptParams).catch((err: unknown) => logDebug('Responses prompt error:', toErrorMessage(err)));
+            const raced = responsesResClosed
+              ? await Promise.race([safeCollect, responsesResClosed.then(() => ({ __cancelled: true }))])
+              : await safeCollect;
+            const racedRecord = asRecord(raced);
+            if (racedRecord['__cancelled']) {
+              stopResponsesKeepalive();
+              try {
+                if (sessionId) await activeClient.session.delete({ path: { id: sessionId } });
+              } catch (e: unknown) {
+                logDebug('Failed to cleanup cancelled responses session', { error: toErrorMessage(e) });
+              }
+              try {
+                if (!res.destroyed) res.end();
+              } catch {
+                // ignore
+              }
+              return;
             }
-            try {
-              if (!res.destroyed) res.end();
-            } catch {
-              // ignore
-            }
-            return;
+            collected = raced as Record<string, unknown>;
           }
-          collected = raced as Record<string, unknown>;
         } catch (e: unknown) {
           collected = { __error: e };
         }
 
         const collectedR = asRecord(collected);
+        // P4: retain tool parts from recovery polls for grounding evidence.
+        let streamSearchToolParts: unknown[] = [];
+        const keepStreamToolParts = (polled: { toolParts?: unknown }): void => {
+          if (hostedSearch.requested && Array.isArray(polled.toolParts) && polled.toolParts.length > 0) {
+            streamSearchToolParts = polled.toolParts;
+          }
+        };
         if (!content && !reasoning) {
-          const polled = await pollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
+          // The collect error itself may be the free-limit signal.
+          if (collectedR['__error'] && !fallbackToProxy) engageProxyFallback(collectedR['__error']);
+          const polled = await activePollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
           if (polled.error && !polled.content && !polled.reasoning) throw normalizeBackendError(polled.error);
+          keepStreamToolParts(polled);
           if (polled.reasoning) sendResponsesDelta(polled.reasoning, true);
           if (polled.content) sendResponsesDelta(polled.content, false);
         } else if (collected && collectedR['idleTimeout']) {
-          const polled = await pollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
+          const polled = await activePollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
           if (polled.error && !polled.content && !polled.reasoning) throw normalizeBackendError(polled.error);
+          keepStreamToolParts(polled);
           const remainingReasoning =
             polled.reasoning && polled.reasoning.startsWith(rawReasoning)
               ? polled.reasoning.slice(rawReasoning.length)
@@ -605,6 +722,56 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           if (!reasoning && collectedR['reasoning']) sendResponsesDelta(String(collectedR['reasoning']), true);
           if (!content && collectedR['content']) sendResponsesDelta(String(collectedR['content']), false);
         }
+
+        // P4: grounding evidence for citations + web_search_call items.
+        // Reuses recovery-poll parts when present; otherwise one capped
+        // best-effort read. Skipped unless the client asked for hosted search.
+        if (hostedSearch.requested && streamSearchToolParts.length === 0) {
+          try {
+            const evPoll = await activePollForAssistantResponse(
+              sessionId as string,
+              Math.min(15000, REQUEST_TIMEOUT_MS),
+            );
+            if (Array.isArray(evPoll.toolParts)) streamSearchToolParts = evPoll.toolParts;
+          } catch {
+            // ignore — citations are best-effort
+          }
+        }
+        const streamEvidence = hostedSearch.requested
+          ? extractSearchEvidence(streamSearchToolParts)
+          : { queries: [] as string[], sources: [] as { url: string; title: string }[] };
+        const streamSearchCallItems = buildWebSearchCallItems(streamEvidence);
+        const emitWebSearchCallItem = (item: { id: string }): void => {
+          const outputIndex = nextOutputIndex++;
+          emit({
+            type: 'response.output_item.added',
+            sequence_number: nextSeq(),
+            output_index: outputIndex,
+            item: { id: item.id, type: 'web_search_call', status: 'in_progress' },
+          });
+          emit({
+            type: 'response.web_search_call.searching',
+            sequence_number: nextSeq(),
+            output_index: outputIndex,
+            item_id: item.id,
+          });
+          emit({
+            type: 'response.web_search_call.completed',
+            sequence_number: nextSeq(),
+            output_index: outputIndex,
+            item_id: item.id,
+          });
+        };
+        // Search items first so emission order matches the final output array.
+        streamSearchCallItems.forEach((item) => {
+          emitWebSearchCallItem(item);
+          emit({
+            type: 'response.output_item.done',
+            sequence_number: nextSeq(),
+            output_index: nextOutputIndex - 1,
+            item: { ...item },
+          });
+        });
 
         if (announcedReasoning) {
           emit({
@@ -626,6 +793,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         const hasMeaningfulContent = Boolean(content && content.trim());
 
         if (announcedContent && hasMeaningfulContent) {
+          const contentAnnotations = buildCitationAnnotations(content, streamEvidence.sources);
           emit({
             type: 'response.output_text.done',
             sequence_number: nextSeq(),
@@ -640,20 +808,20 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             output_index: messageOutputIndex,
             content_index: contentIndex,
             item_id: outputItemId,
-            part: { type: 'output_text', text: content, annotations: [] },
+            part: { type: 'output_text', text: content, annotations: contentAnnotations },
           });
           emit({
             type: 'response.output_item.done',
             sequence_number: nextSeq(),
             output_index: messageOutputIndex,
-            item: { id: outputItemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: content, annotations: [] }] },
+            item: { id: outputItemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: content, annotations: contentAnnotations }] },
           });
         }
 
-        let polledForToolCalls: { content: string; reasoning: string; error: unknown } | null = null;
+        let polledForToolCalls: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
         if (externalToolRegistry.length > 0 && streamedToolCalls.length === 0) {
           try {
-            polledForToolCalls = await pollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
+            polledForToolCalls = await activePollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
           } catch {
             // ignore
           }
@@ -704,9 +872,12 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           });
         }
         const streamOutput: Record<string, unknown>[] = [];
+        streamSearchCallItems.forEach((item) => streamOutput.push({ ...item }));
+        const streamAnnotations = buildCitationAnnotations(safeContent, streamEvidence.sources);
         const streamMessageOutputItem = buildResponsesMessageOutputItem(
           safeContent && safeContent.trim() ? safeContent : '',
           outputItemId,
+          streamAnnotations,
         );
         if (streamMessageOutputItem) streamOutput.push(streamMessageOutputItem);
         validatedStreamedToolCalls.forEach((toolCall) => {
@@ -759,6 +930,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       let promptParsedToolCalls: FinalToolCall[] = [];
       let polledFilled = false;
       let lastResponsesAttemptError: unknown = null;
+      let searchToolParts: unknown[] = [];
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         if (res.writableEnded || res.destroyed) {
           logDebug('Client gone, stop retrying', { sessionId, attempt });
@@ -766,20 +938,20 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         }
         if (attempt > 1) {
           try {
-            await client.session.delete({ path: { id: sessionId } });
+            await activeClient.session.delete({ path: { id: sessionId } });
           } catch (e: unknown) {
             logDebug('Failed to delete retried session', { sessionId, error: toErrorMessage(e) });
           }
-          const retrySessionRes = (await withTimeout(client.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
+          const retrySessionRes = (await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
           sessionId = (asRecord(asRecord(retrySessionRes)['data'])['id'] as string | undefined) ?? null;
           if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
           promptParams.path.id = sessionId;
           requestForcedResponsesToolCall = makeForcedResponsesToolCallRequester();
           await sleep(computeRetryDelay(attempt - 1, lastResponsesAttemptError));
         }
-        let polledResponse: { content: string; reasoning: string; error: unknown } | null = null;
+        let polledResponse: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
         try {
-          responseRes = await withTimeout(client.session.prompt(promptParams), REQUEST_TIMEOUT_MS, 'prompt backend');
+          responseRes = await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
           const dataParts: unknown = asRecord(asRecord(responseRes)['data'])['parts'];
           responseParts = Array.isArray(dataParts) ? (dataParts as unknown[]) : [];
           promptContent = responseParts
@@ -795,8 +967,12 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               ? parseExternalToolCallsFromText(externalToolRegistry, promptReasoning, promptContent)
               : [];
           if (promptContent || promptReasoning) break;
-          polledResponse = await pollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
+          polledResponse = await activePollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
         } catch (loopError: unknown) {
+          if (attempt < maxAttempts && engageProxyFallback(loopError)) {
+            lastResponsesAttemptError = loopError;
+            continue;
+          }
           if (attempt < maxAttempts && isTransientUpstreamError(loopError)) {
             console.warn(
               `[Proxy] Transient upstream error (attempt ${attempt}/${maxAttempts}), retrying:`,
@@ -808,6 +984,10 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           throw normalizeBackendError(loopError);
         }
         if (polledResponse && polledResponse.error && !polledResponse.content && !polledResponse.reasoning) {
+          if (attempt < maxAttempts && engageProxyFallback(polledResponse.error)) {
+            lastResponsesAttemptError = polledResponse.error;
+            continue;
+          }
           if (attempt < maxAttempts && isTransientUpstreamError(polledResponse.error)) {
             console.warn(
               `[Proxy] Transient upstream error (attempt ${attempt}/${maxAttempts}), retrying:`,
@@ -822,8 +1002,25 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           content = polledResponse.content || content;
           reasoning = polledResponse.reasoning || reasoning;
           polledFilled = true;
+          if (Array.isArray(polledResponse.toolParts) && polledResponse.toolParts.length > 0) {
+            searchToolParts = polledResponse.toolParts;
+          }
         }
         break;
+      }
+
+      // P4: the loop breaks early once prompt parts carry text, skipping the
+      // poll that surfaces server-side tool executions. One capped best-effort
+      // read so grounding evidence is not lost when the answer came with the prompt.
+      if (hostedSearch.requested && searchToolParts.length === 0 && sessionId) {
+        try {
+          const evPoll = await activePollForAssistantResponse(sessionId as string, Math.min(15000, REQUEST_TIMEOUT_MS));
+          if (Array.isArray(evPoll.toolParts) && evPoll.toolParts.length > 0) {
+            searchToolParts = evPoll.toolParts;
+          }
+        } catch {
+          // ignore — citations are best-effort
+        }
       }
 
       if (!polledFilled) {
@@ -866,11 +1063,19 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content) as string) as string;
       const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning) as string) as string;
 
+      // P4: server-side grounding evidence → web_search_call items + citations.
+      const searchEvidence = hostedSearch.requested
+        ? extractSearchEvidence(searchToolParts)
+        : { queries: [] as string[], sources: [] as { url: string; title: string }[] };
+      const searchCallItems = buildWebSearchCallItems(searchEvidence);
+      const citationAnnotations = buildCitationAnnotations(safeContent, searchEvidence.sources);
+
       const promptTokens = Math.ceil(fullPromptText.length / 4);
       const completionTokens = Math.ceil(content.length / 4);
       const reasoningTokens = Math.ceil(reasoning.length / 4);
       const output: Record<string, unknown>[] = [];
-      const messageOutputItem = buildResponsesMessageOutputItem(safeContent);
+      searchCallItems.forEach((item) => output.push(item as unknown as Record<string, unknown>));
+      const messageOutputItem = buildResponsesMessageOutputItem(safeContent, undefined, citationAnnotations);
       if (messageOutputItem) output.push(messageOutputItem);
       validatedToolCalls.forEach((toolCall) => {
         const record = toolCall as unknown as Record<string, unknown>;
@@ -914,6 +1119,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
     } catch (error: unknown) {
       stopResponsesKeepalive();
       console.error('[Proxy] Responses API Error:', toErrorMessage(error));
+      if (!fallbackToProxy) engageProxyFallback(error);
       const transformed = transformUpstreamError(error);
       if (res.headersSent) {
         try {

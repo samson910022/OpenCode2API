@@ -13,7 +13,7 @@
 
 ## 2. Tech stack & commands (single source of truth)
 
-- `node >= 18`, TypeScript (`tsconfig.json`: `module/moduleResolution NodeNext`, `strict`, `noEmitOnError`), Express, Jest 30 + Supertest via `@swc/jest`, `tsx` for dev.
+- `node >= 22.19` (undici 8 `engines` floor), TypeScript (`tsconfig.json`: `module/moduleResolution NodeNext`, `strict`, `noEmitOnError`), Express, Jest 30 + Supertest via `@swc/jest`, `tsx` for dev.
 - Run in this order:
   ```bash
   npm run typecheck   # tsc --noEmit (covers index.ts + src/**/*.ts only; tests excluded by design)
@@ -69,6 +69,8 @@ config.json.example / .env.example   # examples only, never real secrets
 | Binary / zen | `OPENCODE_PATH` / `OPENCODE_ZEN_API_KEY` | `OPENCODE_PATH` / `ZEN_API_KEY` | `opencode` / `''` |
 | Backend mgmt | `OPENCODE_PROXY_MANAGE_BACKEND` | `MANAGE_BACKEND` | see known drift below |
 | Auth | `API_KEY` (env+file same name) | `API_KEY` | `''` (= no auth) |
+| Auth multi-key (A) | `OPENCODE_API_KEYS` canonical, `API_KEYS` legacy alias (merge; empty never blocks) | `API_KEYS` | `(none, merges with API_KEY)` |
+| Fallback proxies | `OPENCODE_UPSTREAM_PROXIES` / `OPENCODE_UPSTREAM_PROXY_STRATEGY` / `OPENCODE_UPSTREAM_PROXY_COOLDOWN_MS` / `OPENCODE_UPSTREAM_PROXY_NO_PROXY` | `UPSTREAM_*` short forms | `(none)` / `failover-rr` / `300000` / `localhost,127.0.0.1,::1` |
 
 - `DISABLE_TOOLS` resolution: `OPENCODE_DISABLE_TOOLS > DISABLE_TOOLS > file > true` via `resolveDisableTools` (`src/config/proxy-config.ts:47-57`); covered by `tests/env-alias.test.js`. Never `??`-chain booleans by hand; call the helper.
 - `RETRY`: raw `env ?? file ?? 3`, normalized by `resolveMaxRetries` (`src/retry/policy.ts:51-58`, clamp 0–5, total attempts `1+n`, `2s×2ⁿ⁻¹` + 25% jitter, `retry-after` clamped to 30s).
