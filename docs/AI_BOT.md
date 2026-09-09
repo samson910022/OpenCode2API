@@ -24,8 +24,11 @@ always echo session/response IDs so runs can chain via `previous_response_id`.
 | `CPA_BASE_URL` / `CPA_API_KEY` | CPA Responses channel (fallback). |
 
 Upstream Zen blocks APIKEY-direct free-model calls, so the bot never calls
-Zen directly: free models go through the self-hosted gateway (host reuses its
-opencode login state), CPA models go through `CPA_BASE_URL`.
+Zen directly: free models go through an opencode2api gateway (its credentials
+are auto-generated on first start — no login needed, out-of-box anonymous
+free quota), CPA models go through `CPA_BASE_URL`. The gateway can be a
+long-lived host or spun up ephemerally inside the workflow job pointing at
+`127.0.0.1:10000`.
 
 ## Model routing (maintainer config — never in public comments)
 

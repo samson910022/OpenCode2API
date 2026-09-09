@@ -1,9 +1,11 @@
 """Unified LLM client for OpenCode2API AI bot: self-hosted gateway + CPA.
 
 Dual-channel design (see github_bot/config/LLM_config.example.json):
-- ``gateway``: self-hosted opencode2api (OpenAI-compatible ``/v1/chat/completions``).
-  Required because upstream Zen blocks APIKEY-direct free-model calls; the gateway
-  reuses the host opencode login state. Primary free model:
+- ``gateway``: opencode2api (OpenAI-compatible ``/v1/chat/completions``).
+  Required because upstream Zen blocks APIKEY-direct free-model calls; the
+  gateway serves anonymous free quota with auto-generated credentials on
+  first start (no login needed). It can be long-lived or spun up
+  ephemerally in CI pointing at ``127.0.0.1:10000``. Primary free model:
   ``muse-spark-1.3-contributor-free`` (reasoningEffort ``xhigh``), fallbacks
   ``big-pickle`` and other ``*-free`` models with live discovery via ``GET /models``.
 - ``cpa``: CPA Responses API (``POST {base}/responses`` with 404 fallback to

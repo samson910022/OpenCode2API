@@ -22,7 +22,7 @@ When symptoms look like "model not found", "hangs", "401/402/429", or "empty rep
 
 1. Model string: `provider/model` form (`opencode/<id>`), `-free` suffix fuzzy match; unknown IDs return `400 model_not_found + available_models` — ask for `GET /v1/models` output.
 2. Ports/URLs: `OPENCODE_PROXY_PORT` (default 10000) vs `OPENCODE_SERVER_PORT` (default 10001) vs `OPENCODE_SERVER_URL`; `BIND_HOST` conflicts.
-3. Backend login state: `OPENCODE_USE_ISOLATED_HOME=false` reuses local opencode login; isolated HOME loses free quota.
+3. Anonymous free quota: no login needed — credentials are auto-generated on first start and free models work out-of-box. If free models 429, check `FreeUsageLimitError`/`GoUsageLimitError` handling, not login state.
 4. Tool switch: `OPENCODE_DISABLE_TOOLS` > `DISABLE_TOOLS` > file > `true` via `resolveDisableTools`; never `??`-chain booleans.
 5. Retry/timeout: `OPENCODE_PROXY_RETRY_MAX_RETRIES` 0–5 (total attempts 1+n), `REQUEST_TIMEOUT_MS` prod 180000 vs library 300000 drift — do not "fix" silently.
 6. Free-limit 429 `FreeUsageLimitError`/`GoUsageLimitError` → egress proxy failover only; `UPSTREAM_PROXIES` is not a model pool.
