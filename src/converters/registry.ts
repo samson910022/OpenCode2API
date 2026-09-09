@@ -20,8 +20,8 @@
  * are omitted in P0; middleware currently cannot fail, only rewrite).
  *
  * Reference:
- * - /home/samson1357924/projects/CLIProxyAPI/sdk/translator/registry.go
- * - /home/samson1357924/projects/CLIProxyAPI/internal/translator/init.go
+ * - github.com/router-for-me/CLIProxyAPI/sdk/translator/registry.go
+ * - github.com/router-for-me/CLIProxyAPI/internal/translator/init.go
  */
 
 import type { Format } from './formats.js';

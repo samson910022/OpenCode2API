@@ -11,15 +11,8 @@
  */
 
 import { asRecord } from '../../utils/guards.js';
+import { num, str } from '../json.js';
 import { usageToChat } from '../usage.js';
-
-function str(value: unknown): string {
-    return typeof value === 'string' ? value : '';
-}
-
-function num(value: unknown): number {
-    return typeof value === 'number' && Number.isFinite(value) ? value : 0;
-}
 
 function newResponseId(): string {
     try {
@@ -238,6 +231,9 @@ export function createChatToResponsesStreamTranslator(model: string, responseId?
                         output_index: idx + 1,
                         item: { type: 'function_call', id: callId, call_id: callId, name, arguments: '' },
                     });
+                } else if (name && !funcNameOf.get(key)) {
+                    // Late-arriving name (first delta carried id only).
+                    funcNameOf.set(key, name);
                 }
                 if (args) {
                     funcArgs.set(key, `${funcArgs.get(key) ?? ''}${args}`);
@@ -249,7 +245,6 @@ export function createChatToResponsesStreamTranslator(model: string, responseId?
                         delta: args,
                     });
                 }
-                void name;
             }
         }
         if (finish) {

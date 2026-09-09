@@ -87,6 +87,21 @@ describe('P3 interactions stream (route wire: created->step.delta->completed, no
         expect(next({ choices: [{ delta: {}, finish_reason: 'stop' }] })).toEqual([]);
     });
 
+    test('google_search detected across tool shapes (chat/responses/messages)', () => {
+        const fromResponsesStyle = convertChatRequestToInteractions('m', {
+            messages: [{ role: 'user', content: 'hi' }],
+            tools: [{ type: 'function', name: 'web_search' }],
+        }, false);
+        expect(fromResponsesStyle.tools).toEqual([{ type: 'google_search' }]);
+        const fromMessagesStyle = convertMessagesRequestToInteractions('m', {
+            messages: [{ role: 'user', content: 'hi' }],
+            tools: [{ name: 'google_search', description: '', input_schema: { type: 'object' } }],
+        }, false);
+        expect(fromMessagesStyle.tools).toEqual([{ type: 'google_search' }]);
+        const none = convertChatRequestToInteractions('m', { messages: [{ role: 'user', content: 'hi' }] }, false);
+        expect('tools' in none).toBe(false);
+    });
+
     test('system_instruction string survives; tool text kept as role:tool', () => {
         const toChat = convertInteractionsRequestToChat('m', { input: [{ type: 'text', text: 'bare' }], system_instruction: 'sys-s' }, false);
         expect(toChat.messages[0]).toEqual({ role: 'system', content: 'sys-s' });

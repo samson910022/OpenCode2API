@@ -140,6 +140,22 @@ describe('P1 chat-stream -> responses-events (Go response.go state machine core)
         expect(e3).toContainEqual(expect.objectContaining({ type: 'response.function_call_arguments.done', arguments: '{"a":1}' }));
         expect(e3[e3.length - 1].response.status).toBe('incomplete');
     });
+
+    test('late-arriving tool name fills output_item.done', () => {
+        const next = createChatToResponsesStreamTranslator('m', 'resp_late');
+        next({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_7', function: { arguments: '{}' } }] } }] });
+        next({ choices: [{ delta: { tool_calls: [{ index: 0, function: { name: 'late_tool' } }] } }] });
+        const done = next({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] });
+        const itemDone = done.find((e) => e.type === 'response.output_item.done' && e.item?.type === 'function_call');
+        expect(itemDone.item.name).toBe('late_tool');
+    });
+
+    test('array system content extracts text instead of JSON', () => {
+        const out = convertChatRequestToResponses('m', {
+            messages: [{ role: 'system', content: [{ type: 'text', text: 'sys-arr' }] }],
+        }, false);
+        expect(out.instructions).toBe('sys-arr');
+    });
 });
 
 describe('P1 registry wiring (init.go port)', () => {

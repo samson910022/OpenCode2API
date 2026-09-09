@@ -8,14 +8,7 @@
  */
 
 import { asRecord } from '../../utils/guards.js';
-
-function str(value: unknown): string {
-    return typeof value === 'string' ? value : '';
-}
-
-function num(value: unknown): number {
-    return typeof value === 'number' && Number.isFinite(value) ? value : 0;
-}
+import { num, str } from '../json.js';
 
 function newId(prefix: string): string {
     try {
@@ -126,6 +119,7 @@ export function createResponsesToMessagesStreamTranslator(model: string, message
     let nextIx = 0;
     let stopped = false;
     let outputTokens = 0;
+    let inputTokens = 0;
     return (event: unknown): { event: string; data: unknown }[] => {
         if (stopped) return [];
         const ev = asRecord(event);
@@ -136,6 +130,8 @@ export function createResponsesToMessagesStreamTranslator(model: string, message
             out.push({ event: 'message_start', data: { type: 'message_start', message: { id, type: 'message', role: 'assistant', model, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } } } });
         }
         if (type === 'response.output_text.delta' && str(ev['delta'])) {
+            // Lazy text block (matches chat->messages): empty streams emit
+            // no content block at all.
             if (textIx < 0) {
                 textIx = nextIx++;
                 out.push({ event: 'content_block_start', data: { type: 'content_block_start', index: textIx, content_block: { type: 'text', text: '' } } });
@@ -145,9 +141,11 @@ export function createResponsesToMessagesStreamTranslator(model: string, message
         if (type === 'response.completed') {
             stopped = true;
             const resp = asRecord(ev['response']);
-            outputTokens = num(asRecord(resp['usage'])['output_tokens']);
+            const completedUsage = asRecord(resp['usage']);
+            outputTokens = num(completedUsage['output_tokens']);
+            inputTokens = num(completedUsage['input_tokens']);
             if (textIx >= 0) out.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: textIx } });
-            out.push({ event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: outputTokens } } });
+            out.push({ event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { input_tokens: inputTokens, output_tokens: outputTokens } } });
             out.push({ event: 'message_stop', data: { type: 'message_stop' } });
         }
         return out;

@@ -13,10 +13,7 @@
  */
 
 import { asRecord } from '../utils/guards.js';
-
-function num(value: unknown): number {
-    return typeof value === 'number' && Number.isFinite(value) ? value : 0;
-}
+import { num } from './json.js';
 
 export interface ChatUsage {
     prompt_tokens: number;

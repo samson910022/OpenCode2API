@@ -20,14 +20,7 @@
  */
 
 import { asRecord } from '../../utils/guards.js';
-
-function str(value: unknown): string {
-    return typeof value === 'string' ? value : '';
-}
-
-function asArray(value: unknown): unknown[] {
-    return Array.isArray(value) ? value : [];
-}
+import { asArray, str } from '../json.js';
 
 function textOf(value: unknown): string {
     if (typeof value === 'string') return value;
@@ -89,8 +82,9 @@ function hasGoogleSearch(tools: unknown): boolean {
         const tool = asRecord(t);
         const type = str(tool['type']).toLowerCase();
         if (type === 'google_search' || type === 'web_search' || type === 'web_search_preview') return true;
-        const fn = asRecord(tool['function']);
-        const name = str(fn['name']).toLowerCase();
+        // Responses function tools carry the name at top level; messages
+        // tools are bare {name, ...} without type/function wrappers.
+        const name = str(asRecord(tool['function'])['name'] || tool['name']).toLowerCase();
         return name === 'google_search' || name === 'web_search';
     });
 }

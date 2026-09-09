@@ -10,14 +10,7 @@
  */
 
 import { asRecord } from '../../utils/guards.js';
-
-function str(value: unknown): string {
-    return typeof value === 'string' ? value : '';
-}
-
-function asArray(value: unknown): unknown[] {
-    return Array.isArray(value) ? value : [];
-}
+import { asArray, str } from '../json.js';
 
 function parseJsonObject(text: string): unknown {
     try {

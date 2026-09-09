@@ -5,8 +5,8 @@
  * scoped to the four protocols this gateway serves. No Express/SDK deps (pure layer).
  *
  * Reference:
- * - /home/samson1357924/projects/CLIProxyAPI/sdk/translator/formats.go
- * - /home/samson1357924/projects/CLIProxyAPI/internal/constant/constant.go
+ * - github.com/router-for-me/CLIProxyAPI/sdk/translator/formats.go
+ * - github.com/router-for-me/CLIProxyAPI/internal/constant/constant.go
  *
  * TODO: CLIProxyAPI also defines `gemini` / `codex` / `antigravity`
  * (`formats.go:8-10`); out of scope for P0 (four local protocols only).

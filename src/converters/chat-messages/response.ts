@@ -13,14 +13,7 @@
 
 import { buildAnthropicMessage, mapFinishToStopReason, sanitizeClaudeToolId } from '../anthropic.js';
 import { asRecord } from '../../utils/guards.js';
-
-function str(value: unknown): string {
-    return typeof value === 'string' ? value : '';
-}
-
-function num(value: unknown): number {
-    return typeof value === 'number' && Number.isFinite(value) ? value : 0;
-}
+import { num, str } from '../json.js';
 
 function newMessageId(): string {
     try {
@@ -227,18 +220,33 @@ export function createChatToMessagesStreamTranslator(model: string, messageId?: 
                 events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: textIndex } });
                 textOpen = false;
             }
+            // Flush id-less buffered fragments with generated ids instead of
+            // dropping them when the provider never sent an id.
+            for (const [idx, pending] of pendingByIndex) {
+                const generatedId = sanitizeClaudeToolId('');
+                const key = `${idx}:${generatedId}`;
+                const blockIx = nextIndex++;
+                toolIndexOf.set(key, blockIx);
+                toolJsonOf.set(blockIx, pending.json);
+                events.push({
+                    event: 'content_block_start',
+                    data: { type: 'content_block_start', index: blockIx, content_block: { type: 'tool_use', id: generatedId, name: pending.name, input: {} } },
+                });
+                if (pending.json) {
+                    events.push({ event: 'content_block_delta', data: { type: 'content_block_delta', index: blockIx, delta: { type: 'input_json_delta', partial_json: pending.json } } });
+                }
+            }
+            pendingByIndex.clear();
             for (const [, blockIx] of toolIndexOf) {
                 events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: blockIx } });
             }
-            const stopReason = toolIndexOf.size === 0 && finish !== 'length'
-                ? 'end_turn'
-                : finish === 'tool_calls' || finish === 'tool'
-                    ? (toolIndexOf.size > 0 ? 'tool_use' : 'end_turn')
-                    : finish === 'length' ? 'max_tokens' : 'end_turn';
+            // Aligned with mapFinishToStopReason (anthropic.ts): any opened
+            // tool block forces tool_use, regardless of the terminal finish
+            // value, so streaming and non-stream agree on tool loops.
+            const stopReason = mapFinishToStopReason(finish, toolIndexOf.size > 0);
             const outputTokens = num(usage['completion_tokens']);
-            events.push({ event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: stopReason }, usage: { output_tokens: outputTokens } } });
+            events.push({ event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: stopReason }, usage: { input_tokens: inputTokens, output_tokens: outputTokens } } });
             events.push({ event: 'message_stop', data: { type: 'message_stop' } });
-            void inputTokens;
             stopped = true;
         }
         return events;

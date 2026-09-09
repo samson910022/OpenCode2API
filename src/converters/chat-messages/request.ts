@@ -18,14 +18,7 @@ import {
     extractSystemText,
 } from '../anthropic.js';
 import { asRecord } from '../../utils/guards.js';
-
-function str(value: unknown): string {
-    return typeof value === 'string' ? value : '';
-}
-
-function asArray(value: unknown): unknown[] {
-    return Array.isArray(value) ? value : [];
-}
+import { asArray, str } from '../json.js';
 
 /** messages.request -> chat.request (thin wrapper over anthropic.ts). */
 export function convertMessagesRequestToChat(model: string, body: unknown, stream: boolean): unknown {
@@ -80,7 +73,12 @@ export function convertChatRequestToMessages(model: string, body: unknown, strea
         const role = str(msg['role']);
         if (role === 'system') {
             const content = msg['content'];
-            systemParts.push(typeof content === 'string' ? content : JSON.stringify(content ?? ''));
+            const text = typeof content === 'string'
+                ? content
+                : Array.isArray(content)
+                    ? content.map((p) => str(asRecord(p)['text'])).filter(Boolean).join('')
+                    : JSON.stringify(content ?? '');
+            systemParts.push(text);
             continue;
         }
         const content = msg['content'];

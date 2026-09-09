@@ -93,7 +93,25 @@ describe('P4 stream matrix has no missing directed edge', () => {
         expect(intrToResp({ type: 'step.delta', delta: 'v' })[0]).toMatchObject({ type: 'response.output_text.delta', delta: 'v' });
         const intrToMsg = createInteractionsToMessagesStreamTranslator('m', 'msg_8');
         intrToMsg({ type: 'interaction.created', interaction: {} });
-        expect(intrToMsg({ type: 'step.delta', delta: 'w' })[0]).toMatchObject({ event: 'content_block_delta' });
+        const wEvents = intrToMsg({ type: 'step.delta', delta: 'w' });
+        expect(wEvents).toContainEqual(expect.objectContaining({ event: 'content_block_delta' }));
+    });
+
+    test('empty interaction stream emits no spurious content block', () => {
+        const next = createInteractionsToMessagesStreamTranslator('m', 'msg_empty');
+        next({ type: 'interaction.created', interaction: {} });
+        const done = next({ type: 'interaction.completed', interaction: {} });
+        expect(done.some((e) => e.event === 'content_block_start')).toBe(false);
+        expect(done[done.length - 1]).toMatchObject({ event: 'message_stop' });
+    });
+
+    test('empty responses stream emits no spurious content block; usage flows', () => {
+        const next = createResponsesToMessagesStreamTranslator('m', 'msg_rempty');
+        const e1 = next({ type: 'response.created', response: {} });
+        expect(e1.some((e) => e.event === 'content_block_start')).toBe(false);
+        const done = next({ type: 'response.completed', response: { usage: { input_tokens: 4, output_tokens: 5 } } });
+        const delta = done.find((e) => e.event === 'message_delta');
+        expect(delta.data.usage).toEqual({ input_tokens: 4, output_tokens: 5 });
     });
 });
 

@@ -6,8 +6,8 @@
  * instead of `[][]byte`. No Express/SDK deps (pure layer).
  *
  * Reference:
- * - /home/samson1357924/projects/CLIProxyAPI/sdk/translator/types.go
- * - /home/samson1357924/projects/CLIProxyAPI/sdk/translator/registry.go
+ * - github.com/router-for-me/CLIProxyAPI/sdk/translator/types.go
+ * - github.com/router-for-me/CLIProxyAPI/sdk/translator/registry.go
  *
  * TODO(P1): Go signatures carry `context.Context` + return errors
  * (`types.go:9,14,18`); P0 middleware/transforms are infallible rewrites.

@@ -24,10 +24,7 @@
  */
 
 import { asRecord } from '../../utils/guards.js';
-
-function str(value: unknown): string {
-    return typeof value === 'string' ? value : '';
-}
+import { str } from '../json.js';
 
 function newInteractionId(): string {
     try {
@@ -312,10 +309,14 @@ export function createInteractionsToMessagesStreamTranslator(model: string, mess
         if (!started) {
             started = true;
             out.push({ event: 'message_start', data: { type: 'message_start', message: { id, type: 'message', role: 'assistant', model, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } } } });
-            textIx = 0;
-            out.push({ event: 'content_block_start', data: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } });
         }
         if (str(ev['type']) === 'step.delta' && str(ev['delta'])) {
+            // Lazy text block (matches chat/responses->messages): empty
+            // streams emit no content block at all.
+            if (textIx < 0) {
+                textIx = 0;
+                out.push({ event: 'content_block_start', data: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } });
+            }
             out.push({ event: 'content_block_delta', data: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: str(ev['delta']) } } });
         }
         if (str(ev['type']) === 'interaction.completed') {

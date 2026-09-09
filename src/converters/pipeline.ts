@@ -11,7 +11,7 @@
  * `Result`/`throw`) to match Go `pipeline.go:23,26` ctx/error signatures.
  *
  * Reference:
- * - /home/samson1357924/projects/CLIProxyAPI/sdk/translator/pipeline.go
+ * - github.com/router-for-me/CLIProxyAPI/sdk/translator/pipeline.go
  */
 
 import type { Format } from './formats.js';

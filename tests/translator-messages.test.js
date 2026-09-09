@@ -80,6 +80,33 @@ describe('P2 chat.response <-> messages.response', () => {
         expect(e3[e3.length - 1]).toMatchObject({ event: 'message_stop' });
         expect(e3.some((e) => e.event === 'message_delta')).toBe(true);
     });
+
+    test('tools + finish stop still reports tool_use with input tokens', () => {
+        const next = createChatToMessagesStreamTranslator('m', 'msg_tools');
+        next({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'toolu_9', function: { name: 't', arguments: '{}' } }] } }], usage: { prompt_tokens: 10 } });
+        const done = next({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { completion_tokens: 3 } });
+        const delta = done.find((e) => e.event === 'message_delta');
+        expect(delta.data.delta.stop_reason).toBe('tool_use');
+        expect(delta.data.usage).toEqual({ input_tokens: 10, output_tokens: 3 });
+    });
+
+    test('id-less fragments flush on finish with generated id', () => {
+        const next = createChatToMessagesStreamTranslator('m', 'msg_noid');
+        const e1 = next({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"a":1}' } }] } }] });
+        expect(e1.some((e) => e.event === 'content_block_start')).toBe(false);
+        const e2 = next({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] });
+        const start = e2.find((e) => e.event === 'content_block_start');
+        expect(start.data.content_block.type).toBe('tool_use');
+        expect(start.data.content_block.id).toMatch(/^toolu_/);
+        expect(e2).toContainEqual(expect.objectContaining({ event: 'message_stop' }));
+    });
+
+    test('array system content extracts text', () => {
+        const out = convertChatRequestToMessages('m', {
+            messages: [{ role: 'system', content: [{ type: 'text', text: 'sys-arr' }] }],
+        }, false);
+        expect(out.system).toBe('sys-arr');
+    });
 });
 
 describe('P2 responses.request <-> messages.request', () => {

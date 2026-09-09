@@ -12,24 +12,7 @@
  */
 
 import { asRecord } from '../../utils/guards.js';
-
-function str(value: unknown): string {
-    return typeof value === 'string' ? value : '';
-}
-
-function asArray(value: unknown): unknown[] {
-    return Array.isArray(value) ? value : [];
-}
-
-function normalizeArgs(args: unknown): string {
-    if (args === undefined || args === null || args === '') return '{}';
-    if (typeof args === 'string') return args;
-    try {
-        return JSON.stringify(args);
-    } catch {
-        return '{}';
-    }
-}
+import { asArray, normalizeArgs, str } from '../json.js';
 
 /** Mirrors Go combineOpenAIResponsesReasoning (request.go:552-568). */
 function combineReasoning(existing: string, incoming: string): string {
@@ -133,10 +116,6 @@ export function convertResponsesRequestToChat(model: string, body: unknown, stre
     const root = asRecord(body);
     const out: Record<string, unknown> = { model, messages: [], stream };
     const messages: Record<string, unknown>[] = [];
-
-    const textFormat = asRecord(root['text']);
-    const format = asRecord(textFormat['format'] ?? root['text.format']);
-    void format;
 
     const rawFormat = (() => {
         const tf = root['text'];
@@ -393,8 +372,14 @@ export function convertChatRequestToResponses(model: string, body: unknown, stre
         const msg = asRecord(m);
         const role = str(msg['role']) || 'user';
         if (role === 'system') {
+            // Extract text from string or content-part arrays (matches the
+            // textOf convention used by the other request translators).
             const content = msg['content'];
-            const text = typeof content === 'string' ? content : JSON.stringify(content ?? '');
+            const text = typeof content === 'string'
+                ? content
+                : Array.isArray(content)
+                    ? content.map((p) => str(asRecord(p)['text'])).filter(Boolean).join('')
+                    : JSON.stringify(content ?? '');
             out['instructions'] = out['instructions'] ? `${str(out['instructions'])}\n\n${text}` : text;
             continue;
         }
