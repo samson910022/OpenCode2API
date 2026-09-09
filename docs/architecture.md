@@ -32,11 +32,11 @@ Cross-cutting helpers (all routes depend on them one-way; no cycles):
 | Stream | `src/stream/collector.ts` | prompt → poll → collect-from-events SSE pipeline |
 | Errors | `src/errors/upstream.ts` | `normalizeBackendError`, `transformUpstreamError`, `isTransient*` |
 | Retry | `src/retry/policy.ts` | pure `resolveMaxRetries` / backoff+jitter / `retry-after` parsing |
-| Converters | `src/converters/anthropic.ts` | pure Anthropic ↔ chat shapes |
+| Converters | `src/converters/` (N×N registry) | pure protocol↔protocol shapes; see §4 |
 | Tool runtime | `src/tool-runtime/` | `contracts → registry → router → parser → validator → policy` |
 | Guards | `src/utils/guards.ts` | shared `asRecord` / `toErrorMessage` (single source) |
 
-`retry/policy`, `converters/anthropic`, and `errors/upstream` are pure
+`retry/policy`, `converters/*`, and `errors/upstream` are pure
 (no Express/SDK imports) — keep them that way.
 
 ## 2. Request template (all four main routes)
@@ -67,9 +67,10 @@ interactions-stream `interaction.completed` / `error` event without `[DONE]`).
   §2 template; do not refactor the existing four routes in the same
   change.
 - **New converter** (e.g. another vendor protocol): add a pure module
-  next to `src/converters/anthropic.ts` (`toChat` / `fromChat` /
-  `estimate`), keep route glue (choice mapping, id round-trip) in the
-  route file.
+  under `src/converters/<pair>/` (`request.ts` / `response.ts` / `init.ts`
+  with `register*Pair`), wire it in `src/converters/init.ts`
+  (`registerAllTranslatorPairs`), and add `tests/translator-*.test.js`.
+  Keep route glue (choice mapping, id round-trip) in the route file.
 - **New tool dialect:** extend `src/tool-runtime/parser.ts` (regex +
   extractor + registration in the collector) and add fixtures to
   `tests/parser-foreign-formats.test.js`. The ambiguity policy is
@@ -88,7 +89,40 @@ spawn/jail/HOME isolation, collector `finish === 'tool'` /
 idle-exemption logic, and bool-fallthrough semantics. See `AGENTS.md`
 §9 for the full list.
 
-## 5. Roadmap (accepted, not yet implemented)
+## 5. N×N translator registry (`src/converters/`)
+
+Port of CLIProxyAPI `sdk/translator/` (`registry.go` / `pipeline.go` /
+`formats.go` / `types.go`) plus per-pair translators under
+`internal/translator/`. Four formats — `openai` (chat), `openai-response`
+(responses), `claude` (messages), `interactions` — give 12 directed request
+pairs and 12 directed response pairs (stream + non-stream), all registered
+explicitly in `src/converters/init.ts` (`registerAllTranslatorPairs`;
+no Go-style blank-import side effects so Jest ESM ordering stays
+deterministic).
+
+Rules that keep the port safe:
+
+- Translators are pure JSON→JSON (no Express/SDK). Shared guards come
+  from `src/utils/guards.ts`.
+- Wire stays route-owned: SSE envelopes, `[DONE]` presence, the four
+  error-exit shapes, and usage key names are never normalized by the
+  registry. Error bodies must bypass translators (converters assume valid
+  requests).
+- Lookup contract differs from Go on purpose: Go reads
+  `responses[to][from]` in `TranslateStream/NonStream` while `Has*` reads
+  `[from][to]`; here everything is `[from][to]` = (source, target) so
+  `Has*` and `Translate*` agree (see `registry.ts` header).
+- Stream state rides `param` holder objects (one per stream), mirroring
+  Go `param *any`; callers must reuse the holder across chunks.
+- Fidelity is recorded in `src/converters/fidelity.ts`: the three forward
+  edges out of chat (→ responses / messages / interactions) are FULL
+  fidelity; the other nine stream edges are TEXT-CORE (text deltas +
+  terminal mapping, zero-filled usage). TokenCount translators are
+  intentionally unregistered — counting stays in the collector.
+- `usage.ts` maps usage legs with zero-filled unknowns; interactions
+  responses never carry tokens (`grounding_tool_count` only).
+
+## 6. Roadmap (accepted, not yet implemented)
 
 - Extract shared `preflight(ctx, body)` (resolve model → tool context →
   system prompt → ensureBackend → create session → tool overrides).
