@@ -1,0 +1,79 @@
+name: AI Scheduled Scan
+
+# Weekly deterministic + LLM repo scan. Opens at most max-issues NEW issues per
+# run (fingerprint dedupe against open issues); never auto-merges anything.
+on:
+  schedule:
+    - cron: "0 2 * * 1" # Mondays 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      max_issues:
+        description: "Max new issues to open this run"
+        required: false
+        default: "3"
+      dry_run:
+        description: "Print findings without opening issues"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ai-scan:
+    name: Repo scan + auto-issue
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Ensure LLM credentials are configured
+        shell: bash
+        env:
+          GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          CPA_BASE_URL: ${{ secrets.CPA_BASE_URL }}
+          CPA_API_KEY: ${{ secrets.CPA_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GATEWAY_API_KEY}${OPENCODE_API_KEY}" && ( -z "${CPA_API_KEY}" || -z "${CPA_BASE_URL}" ) ]]; then
+            echo "Scan needs gateway or CPA credentials in repository secrets." >&2
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Run scheduled scan
+        shell: bash
+        env:
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          CPA_BASE_URL: ${{ secrets.CPA_BASE_URL }}
+          CPA_API_KEY: ${{ secrets.CPA_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SCAN_MAX_ISSUES: ${{ inputs.max_issues || '3' }}
+          PYTHONPATH: github_bot/src
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.dry_run || 'false' }}" == "true" ]]; then
+            python3 github_bot/src/github_runner.py --mode=scan --dry-run
+          else
+            python3 github_bot/src/github_runner.py --mode=scan
+          fi

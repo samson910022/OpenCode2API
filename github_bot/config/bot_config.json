@@ -1,0 +1,210 @@
+{
+  "name": "OpenCode2API-GitHub-AI-Bot",
+  "version": "1.0.0",
+  "description": "Issue investigation (quality score + root-cause hypotheses), multi-agent PR code review, scheduled repo scan with auto-issue, and fix-plan PR proposals for OpenCode2API using CPA priority models and self-hosted gateway free models.",
+  "llmConfigFile": "./config/LLM_config.example.json",
+  "defaultProvider": "gateway",
+  "commentMarker": "<!-- OPENCODE2API_AI_REVIEW_REPORT -->",
+  "triageMarker": "<!-- OPENCODE2API_AI_TRIAGE_REPORT -->",
+  "commandMarker": "<!-- OPENCODE2API_AI_COMMAND_REPORT -->",
+  "scanMarker": "<!-- OPENCODE2API_AI_SCAN_REPORT -->",
+  "defaultBranchCandidates": ["main"],
+  "maxDiffChars": 120000,
+  "maxIssueBodyChars": 40000,
+  "codingModels": [
+    "gemini-3.8-flash-high",
+    "grok-4.6",
+    "muse-spark-1.3-contributor-free"
+  ],
+  "fallbackModels": [
+    "gemini-3.8-flash-high",
+    "grok-4.6",
+    "muse-spark-1.3-contributor-free",
+    "claude-opus-4-6-thinking",
+    "gemini-3.6-flash-high",
+    "big-pickle",
+    "mimo-v2.5-free",
+    "deepseek-v4-flash-free",
+    "nemotron-3-ultra-free",
+    "north-mini-code-free",
+    "grok-composer-2.5-fast",
+    "kimi-k2.5-free"
+  ],
+  "fallbackModel": "gemini-3.8-flash-high",
+  "dynamicModelDiscovery": true,
+  "mediaOcr": {
+    "enabled": true,
+    "model": "gemini-3.8-flash-high",
+    "fallbackModels": ["mimo-v2.5-free", "grok-4.6"],
+    "maxItems": 4,
+    "maxBytesPerItem": 5000000,
+    "maxSummaryChars": 12000,
+    "timeoutSeconds": 300,
+    "extensions": [
+      ".png",
+      ".jpg",
+      ".jpeg",
+      ".gif",
+      ".webp",
+      ".bmp",
+      ".mp4",
+      ".webm",
+      ".mov",
+      ".mp3",
+      ".wav",
+      ".m4a",
+      ".ogg",
+      ".log",
+      ".txt"
+    ]
+  },
+  "roles": {
+    "triage_agent": {
+      "model": "gemini-3.8-flash-high",
+      "description": "Issue investigator: decision-first classification, quality scoring, thread-aware missing-info, root-cause hypotheses",
+      "promptFile": "./prompts/roles/triage_agent.md",
+      "temperature": 0.2,
+      "maxTokens": 6144,
+      "reasoningEffort": "high"
+    },
+    "gateway_safety": {
+      "model": "grok-4.6",
+      "description": "Gateway safety reviewer: secrets/config/auth/tool-safety/bind-host/port invariants",
+      "promptFile": "./prompts/roles/reviewer_gateway_safety.md",
+      "temperature": 0.1,
+      "maxTokens": 6144,
+      "reasoningEffort": "high"
+    },
+    "api_compat": {
+      "model": "claude-opus-4-6-thinking",
+      "description": "Multi-protocol API compatibility reviewer: chat/responses/messages/interactions wire shapes",
+      "promptFile": "./prompts/roles/reviewer_api_compat.md",
+      "temperature": 0.1,
+      "maxTokens": 6144,
+      "reasoningEffort": "high"
+    },
+    "docs_config": {
+      "model": "muse-spark-1.3-contributor-free",
+      "description": "Docs and six-way config matrix reviewer (EN-first, .env.example/config.json.example/Dockerfile/compose/index.ts/docs sync)",
+      "promptFile": "./prompts/roles/reviewer_docs_config.md",
+      "temperature": 0.2,
+      "maxTokens": 4096,
+      "reasoningEffort": "xhigh"
+    },
+    "explainer_agent": {
+      "model": "big-pickle",
+      "description": "Plain-language PR explainer for maintainers",
+      "promptFile": "./prompts/roles/explainer_agent.md",
+      "temperature": 0.3,
+      "maxTokens": 4096,
+      "reasoningEffort": "high"
+    },
+    "scanner_agent": {
+      "model": "grok-composer-2.5-fast",
+      "description": "Scheduled repo scanner: deterministic pre-checks plus LLM re-check, fingerprint-stable findings, never auto-merges",
+      "promptFile": "./prompts/roles/scanner_agent.md",
+      "temperature": 0.1,
+      "maxTokens": 4096,
+      "reasoningEffort": "high"
+    }
+  },
+  "reviewPipeline": ["gateway_safety", "api_compat", "docs_config"],
+  "sensitivePathGlobs": [
+    ".env",
+    ".env.*",
+    "config.json",
+    "opencode.json",
+    "*.log",
+    "index.ts",
+    "src/proxy.ts",
+    "src/routes/**",
+    "src/config/**",
+    "src/tool-runtime/**",
+    "src/retry/policy.ts",
+    "src/errors/upstream.ts",
+    "src/backend/manager.ts",
+    "src/stream/collector.ts",
+    "Dockerfile",
+    "docker-compose.yml",
+    "entrypoint.sh",
+    ".github/workflows/**",
+    "github_bot/**"
+  ],
+  "slashCommands": {
+    "/review": "On PRs: multi-agent code review. On issues: issue investigation.",
+    "/triage": "Issue investigation with quality score and missing-info checklist",
+    "/explain": "On PRs: plain-language explanation. On issues: issue investigation.",
+    "/fix": "On issues: propose a fix plan and open a draft PR (human review required, never auto-merge)"
+  },
+  "triage": {
+    "minResponseChars": 400,
+    "requiredSections": [
+      "CLASSIFICATION",
+      "ACTIONABILITY",
+      "SUMMARY",
+      "EVIDENCE_USED",
+      "ROOT_CAUSE_HYPOTHESES",
+      "REPORTER_NEXT_STEPS",
+      "MAINTAINER_NEXT_STEPS",
+      "SUGGESTED_LABELS",
+      "ISSUE_QUALITY_SCORE",
+      "QUALITY_BREAKDOWN",
+      "MISSING_INFO",
+      "RISK",
+      "SECURITY_ROUTING"
+    ],
+    "failClosedOnIncomplete": true,
+    "publishIncompleteStub": true,
+    "maxThreadCommentChars": 12000,
+    "thread": {
+      "enabled": true,
+      "maxComments": 30,
+      "maxChars": 20000,
+      "excludeBotMarkers": true
+    },
+    "applySuggestedLabels": true,
+    "suggestOnlyLabels": ["security"],
+    "labelAllowlist": [
+      "bug",
+      "documentation",
+      "enhancement",
+      "question",
+      "needs-info",
+      "needs-triage",
+      "api-compat",
+      "config",
+      "tool-safety",
+      "support",
+      "duplicate",
+      "invalid",
+      "wontfix",
+      "good first issue",
+      "help wanted"
+    ]
+  },
+  "scan": {
+    "enabled": true,
+    "notes": "Scheduled scan only comments or opens issues/PRs; auto-merge is forbidden (no auto_merge:true, no gh pr merge --auto).",
+    "fingerprintPrefix": "opencode2api-scan:",
+    "maxIssuesPerRun": 3,
+    "maxCommentsPerRun": 5,
+    "dedupeScope": "open",
+    "autoFix": {
+      "enabled": true,
+      "requireHumanReview": true,
+      "draftPrOnly": true,
+      "maxPrsPerRun": 1
+    }
+  },
+  "sessionHandling": {
+    "preserveThinkingSignatures": true,
+    "returnResponseIds": true,
+    "previousResponseIdTtlMinutes": 30,
+    "notes": "Never strip signature/encrypted_content/redacted_thinking from history blocks. Return upstream response/session IDs in run metadata so callers can chain via previous_response_id. Gateway thinking signatures are empty by design; do not forge them."
+  },
+  "llmResponseGate": {
+    "rejectFinishReasons": ["length", "max_tokens", "content_filter"],
+    "minResponseChars": 0,
+    "sameModelRetryOnLength": 1
+  }
+}

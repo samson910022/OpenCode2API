@@ -50,6 +50,28 @@ jobs:
           fi
           shellcheck -S warning entrypoint.sh tests/test-integration.sh tests/test-streaming-real.sh
 
+  ai-bot-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Validate AI bot (json + py_compile + unittest)
+        run: |
+          python3 -c "import json; json.load(open('github_bot/config/bot_config.json')); json.load(open('github_bot/config/LLM_config.example.json')); print('json OK')"
+          python3 -m py_compile github_bot/src/*.py tests/test_ai_bot.py
+          PYTHONPATH=github_bot/src python3 -m unittest tests.test_ai_bot -v
+      - name: Guard against committed bot secrets
+        run: |
+          if git ls-files | grep -E '(^|/)LLM_config\.json$|(^|/)\.env(\..+)?$|(^|/)config\.json$' | grep -v '\.env\.example$'; then
+            echo "Blocked: filled-in secrets must not be committed." >&2
+            exit 1
+          fi
+
   docker-build:
     runs-on: ubuntu-latest
     timeout-minutes: 15

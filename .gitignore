@@ -23,3 +23,7 @@ opencode.json
 *.tsbuildinfo
 custom-bin/
 docs/host-deployments.md
+# GitHub AI bot: never commit filled-in LLM credentials or bytecode.
+github_bot/config/LLM_config.json
+__pycache__/
+*.pyc

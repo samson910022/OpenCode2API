@@ -1,0 +1,92 @@
+name: AI Fix Proposal
+
+# Turns an issue into a fix PLAN comment, and — only with explicit opt-in —
+# applies a clean unified diff on a new branch and opens a DRAFT PR for human
+# review. Auto-merge is forbidden by bot config and by this workflow (no
+# auto_merge flag, no `gh pr merge` step).
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to propose a fix for"
+        required: true
+        type: number
+      apply_fix:
+        description: "Apply clean diffs and open a draft PR"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: ai-fix-${{ github.event.issue.number || inputs.issue_number }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ai-fix:
+    name: Fix plan (+ opt-in draft PR)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.comment.body, '/fix')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          # Intentionally keeps credentials: this workflow pushes fix branches.
+          persist-credentials: true
+
+      - name: Ensure LLM credentials are configured
+        shell: bash
+        env:
+          GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          CPA_BASE_URL: ${{ secrets.CPA_BASE_URL }}
+          CPA_API_KEY: ${{ secrets.CPA_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GATEWAY_API_KEY}${OPENCODE_API_KEY}" && ( -z "${CPA_API_KEY}" || -z "${CPA_BASE_URL}" ) ]]; then
+            echo "Fix planning needs gateway or CPA credentials in repository secrets." >&2
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Configure git identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "opencode2api-ai-bot"
+          git config user.email "opencode2api-ai-bot@users.noreply.github.com"
+
+      - name: Run fix planner
+        shell: bash
+        env:
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          CPA_BASE_URL: ${{ secrets.CPA_BASE_URL }}
+          CPA_API_KEY: ${{ secrets.CPA_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PYTHONPATH: github_bot/src
+        run: |
+          set -euo pipefail
+          args=(--mode=fix-plan)
+          if [[ "${{ inputs.apply_fix || 'false' }}" == "true" ]]; then
+            args+=(--apply-fix)
+          fi
+          if [[ -n "${{ inputs.issue_number || '' }}" ]]; then
+            args+=(--issue "${{ inputs.issue_number }}")
+          fi
+          python3 github_bot/src/github_runner.py "${args[@]}"

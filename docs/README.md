@@ -23,6 +23,7 @@ Welcome to the OpenCode2API documentation.
 | 🔧 [Troubleshooting](./troubleshooting.md) | FAQ + debug mode |
 | 💻 [Development](./development.md) | Build + test + layout |
 | 🏗️ [Architecture](./architecture.md) | Runtime shape + extension points (incl. §5 N×N translator registry) |
+| 🤖 [AI Bot](./AI_BOT.md) | GitHub AI review/scan/fix bot (gateway + CPA, sticky markers, draft-PR only) |
 | 📄 [Main README](../README.md) | English canonical entrypoint |
 | 📄 [README (简体中文)](../README.zh-CN.md) | Simplified Chinese mirror of the main README |
 
@@ -43,6 +44,7 @@ Docs are migrating to **English-first**: the root [`README.md`](../README.md) is
 | Troubleshooting | 简体中文 | tracked (smallest, do first) |
 | Development | 简体中文 | tracked (dedupe with `CONTRIBUTING.md`) |
 | Architecture | English | canonical (N×N registry §5) |
+| AI Bot | English | canonical |
 
 > Note: `docs/host-deployments.md` and `custom-bin/` are **local-only** (git-ignored via `.gitignore` / `.git/info/exclude`, never committed). They are intentionally absent from this index.
 
