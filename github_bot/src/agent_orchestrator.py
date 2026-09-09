@@ -414,11 +414,13 @@ class AgentOrchestrator:
             "response_ids": [metas[r].get("response_id", "n/a") for r in pipeline if r in metas],
             "roles": {r: metas.get(r, {}) for r in pipeline},
         }
-        # Only the VERDICT: line counts. Prose mentions of NEEDS_CHANGES must
-        # not flip the outcome; unparseable outputs degrade to COMMENT.
+        # Only the VERDICT: line counts (tolerating markdown bold like
+        # **VERDICT: APPROVE**). Prose mentions of NEEDS_CHANGES must not flip
+        # the outcome; unparseable outputs degrade to COMMENT.
         verdict = "APPROVE"
         for text in results.values():
-            m = re.search(r"(?m)^\s*VERDICT\s*:\s*(APPROVE|NEEDS_CHANGES|COMMENT)", text.upper())
+            m = re.search(r"(?m)^\s*\*{0,2}\s*VERDICT\s*:\s*(APPROVE|NEEDS_CHANGES|COMMENT)\b",
+                          text.upper())
             parsed = m.group(1) if m else "COMMENT"
             if parsed == "NEEDS_CHANGES":
                 verdict = "NEEDS_CHANGES"

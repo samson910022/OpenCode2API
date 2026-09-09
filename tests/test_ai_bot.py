@@ -306,6 +306,17 @@ class TestOrchestrator(unittest.TestCase):
         report3 = AgentOrchestrator.run_multi_agent_review(orch, review_ctx)
         self.assertIn("FINAL_VERDICT: NEEDS_CHANGES", report3)
 
+    def test_verdict_aggregation_bold_markdown(self):
+        # Live models wrap the verdict in bold: **VERDICT: APPROVE**.
+        orch = AgentOrchestrator.__new__(AgentOrchestrator)
+        orch.config = load_json(BOT_DIR / "config" / "bot_config.json")
+        import agent_orchestrator as ao
+        review_ctx = ao.ReviewContext(title="t", body="b")
+        orch._run_role = lambda role, prompt, **kw: (
+            "**VERDICT: APPROVE**\n\nAll good.", {"response_id": "r1"})
+        report = AgentOrchestrator.run_multi_agent_review(orch, review_ctx)
+        self.assertIn("FINAL_VERDICT: APPROVE", report)
+
 
 class TestScanAndRunner(unittest.TestCase):
     def test_fingerprint_stable(self):

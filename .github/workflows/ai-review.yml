@@ -104,13 +104,13 @@ jobs:
 
       - name: Detect gateway source
         id: gw
-        if: steps.gate.outputs.skip != 'true'
         shell: bash
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
         run: |
           set -euo pipefail
           # secrets context is not allowed in step `if:`; expose via outputs.
+          # Always runs (trivial check) so downstream never reads an absent output.
           if [[ -n "${GATEWAY_BASE_URL}" ]]; then
             echo "external=true" >> "$GITHUB_OUTPUT"
           else
