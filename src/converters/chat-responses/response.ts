@@ -320,6 +320,9 @@ export function createResponsesToChatStreamTranslator(model: string, completionI
                     indexOf.set(callId, indexOf.size);
                     nameOf.set(callId, str(item['name']));
                 }
+                // A zero-arg call emits no arguments delta: mark tools seen
+                // here so the terminal finish is tool_calls, not stop.
+                if (callId) sawTools = true;
             }
             return [];
         }

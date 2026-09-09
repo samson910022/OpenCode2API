@@ -325,7 +325,7 @@ export function createInteractionsToMessagesStreamTranslator(model: string, mess
         if (str(ev['type']) === 'interaction.completed') {
             stopped = true;
             if (textIx >= 0) out.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: textIx } });
-            out.push({ event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } } });
+            out.push({ event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { input_tokens: 0, output_tokens: 0 } } });
             out.push({ event: 'message_stop', data: { type: 'message_stop' } });
         }
         return out;

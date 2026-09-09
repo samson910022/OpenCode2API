@@ -78,15 +78,25 @@ export class TranslatorPipeline {
     ): ResponseEnvelope {
         const terminal: ResponseHandler = (input) => {
             if (input.stream) {
-                const chunks = this.registry.translateStream(
-                    from,
-                    to,
-                    input.model,
-                    originalRequest,
-                    translatedRequest,
-                    input.body,
-                    param,
-                );
+                // Translate every buffered chunk through the same holder so
+                // stateful translators see the whole stream in order. When no
+                // chunks are buffered, fall back to translating the body once
+                // (single-chunk envelope, mirrors Go pipeline.go:88).
+                const sources = input.chunks.length ? input.chunks : [input.body];
+                const chunks: unknown[] = [];
+                for (const chunk of sources) {
+                    chunks.push(
+                        ...this.registry.translateStream(
+                            from,
+                            to,
+                            input.model,
+                            originalRequest,
+                            translatedRequest,
+                            chunk,
+                            param,
+                        ),
+                    );
+                }
                 return { ...input, format: to, chunks };
             }
             return {

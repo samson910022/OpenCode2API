@@ -136,7 +136,9 @@ export function createChatToMessagesStreamTranslator(model: string, messageId?: 
     const toolJsonOf = new Map<number, string>();
     // Deltas may arrive with index alone before the id shows up; buffer those
     // fragments per index until the id arrives, then emit start + replay.
-    const pendingByIndex = new Map<number, { name: string; json: string }>();
+    // Entries may also carry a bare id (provider sent id with neither name
+    // nor args yet); the block opens once identifying content arrives.
+    const pendingByIndex = new Map<number, { id: string; name: string; json: string }>();
     let stopped = false;
     let inputTokens = 0;
 
@@ -182,7 +184,7 @@ export function createChatToMessagesStreamTranslator(model: string, messageId?: 
                 const name = str(fn['name']);
                 if (!raw) {
                     // No id yet: buffer fragments keyed by index.
-                    const pending = pendingByIndex.get(idx) ?? { name: '', json: '' };
+                    const pending = pendingByIndex.get(idx) ?? { id: '', name: '', json: '' };
                     if (name && !pending.name) pending.name = name;
                     pending.json += frag;
                     pendingByIndex.set(idx, pending);
@@ -192,6 +194,14 @@ export function createChatToMessagesStreamTranslator(model: string, messageId?: 
                 const key = `${idx}:${rawId}`;
                 let blockIx = toolIndexOf.get(key);
                 if (blockIx === undefined) {
+                    const known = pendingByIndex.get(idx);
+                    const priorContent = (known?.name ?? '') !== '' || (known?.json ?? '') !== '';
+                    if (!name && !frag && !priorContent) {
+                        // Bare id with no content yet: remember it and wait
+                        // for the name/args instead of opening a nameless block.
+                        pendingByIndex.set(idx, { id: rawId, name: known?.name ?? '', json: known?.json ?? '' });
+                        continue;
+                    }
                     blockIx = nextIndex++;
                     toolIndexOf.set(key, blockIx);
                     const replayed = pendingByIndex.get(idx);
@@ -220,17 +230,24 @@ export function createChatToMessagesStreamTranslator(model: string, messageId?: 
                 events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: textIndex } });
                 textOpen = false;
             }
-            // Flush id-less buffered fragments with generated ids instead of
-            // dropping them when the provider never sent an id.
+            // Flush buffered fragments instead of dropping them when the
+            // provider never completed the sequence. Entries with neither
+            // name nor args are empty placeholders (some backends emit bare
+            // {index}) — skip those so no spurious tool_use appears. A
+            // remembered id is reused; otherwise one is generated. Nameless
+            // flushes only occur when args arrived without any name, which
+            // violates all three protocols' contracts — data preserved over
+            // wire validity in that pathological case.
             for (const [idx, pending] of pendingByIndex) {
-                const generatedId = sanitizeClaudeToolId('');
-                const key = `${idx}:${generatedId}`;
+                if (!pending.name && !pending.json) continue;
+                const blockId = pending.id || sanitizeClaudeToolId('');
+                const key = `${idx}:${blockId}`;
                 const blockIx = nextIndex++;
                 toolIndexOf.set(key, blockIx);
                 toolJsonOf.set(blockIx, pending.json);
                 events.push({
                     event: 'content_block_start',
-                    data: { type: 'content_block_start', index: blockIx, content_block: { type: 'tool_use', id: generatedId, name: pending.name, input: {} } },
+                    data: { type: 'content_block_start', index: blockIx, content_block: { type: 'tool_use', id: blockId, name: pending.name, input: {} } },
                 });
                 if (pending.json) {
                     events.push({ event: 'content_block_delta', data: { type: 'content_block_delta', index: blockIx, delta: { type: 'input_json_delta', partial_json: pending.json } } });

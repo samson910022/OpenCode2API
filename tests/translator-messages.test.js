@@ -101,11 +101,37 @@ describe('P2 chat.response <-> messages.response', () => {
         expect(e2).toContainEqual(expect.objectContaining({ event: 'message_stop' }));
     });
 
+    test('bare id alone opens no block; later name completes it', () => {
+        const next = createChatToMessagesStreamTranslator('m', 'msg_bareid');
+        const e1 = next({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'toolu_b' }] } }] });
+        expect(e1.some((e) => e.event === 'content_block_start')).toBe(false);
+        const e2 = next({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'toolu_b', function: { name: 't' } }] } }] });
+        const start = e2.find((e) => e.event === 'content_block_start');
+        expect(start.data.content_block).toMatchObject({ id: 'toolu_b', name: 't' });
+    });
+
     test('array system content extracts text', () => {
         const out = convertChatRequestToMessages('m', {
             messages: [{ role: 'system', content: [{ type: 'text', text: 'sys-arr' }] }],
         }, false);
         expect(out.system).toBe('sys-arr');
+    });
+
+    test('empty tool placeholder emits no tool_use', () => {
+        const next = createChatToMessagesStreamTranslator('m', 'msg_empty_tool');
+        const e1 = next({ choices: [{ delta: { tool_calls: [{ index: 0 }] } }] });
+        expect(e1.some((e) => e.event === 'content_block_start')).toBe(false);
+        const done = next({ choices: [{ delta: {}, finish_reason: 'stop' }] });
+        const delta = done.find((e) => e.event === 'message_delta');
+        expect(delta.data.delta.stop_reason).toBe('end_turn');
+        expect(done.some((e) => e.event === 'content_block_start')).toBe(false);
+    });
+
+    test('malformed data URL without comma does not crash', () => {
+        const out = convertChatRequestToMessages('m', {
+            messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:abc' } }] }],
+        }, false);
+        expect(out.messages[0].content[0]).toMatchObject({ type: 'image' });
     });
 });
 

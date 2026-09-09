@@ -102,4 +102,28 @@ describe('TranslatorPipeline P0 (CLIProxyAPI pipeline.go port)', () => {
         expect(r.hasNonStreamResponseTransformer('claude', 'openai')).toBe(false);
         expect(r.translateNonStream('claude', 'openai', 'm', {}, {}, { a: 1 })).toEqual({ a: 1 });
     });
+
+    test('stream terminal translates every buffered chunk through one holder', () => {
+        const r = new TranslatorRegistry();
+        const seen = [];
+        r.register('openai', 'claude', null, {
+            stream: (model, _o, _t, chunk, param) => {
+                seen.push([chunk, param]);
+                return [{ chunk }];
+            },
+        });
+        const p = new TranslatorPipeline(r);
+        const holder = {};
+        const out = p.translateResponse(
+            'openai',
+            'claude',
+            { format: 'openai', model: 'm', stream: true, body: { ignored: true }, chunks: [{ a: 1 }, { b: 2 }] },
+            {},
+            {},
+            holder,
+        );
+        expect(out.chunks).toEqual([{ chunk: { a: 1 } }, { chunk: { b: 2 } }]);
+        expect(seen[0][1]).toBe(holder);
+        expect(seen[1][1]).toBe(holder);
+    });
 });

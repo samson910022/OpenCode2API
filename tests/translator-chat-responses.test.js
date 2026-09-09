@@ -171,6 +171,13 @@ describe('P1 chat-stream -> responses-events (Go response.go state machine core)
         expect(chunks[0].choices[0].delta.tool_calls[0].function).toEqual({ arguments: '{}' });
     });
 
+    test('zero-arg reverse tool call still finishes as tool_calls', () => {
+        const next = createResponsesToChatStreamTranslator('m', 'c_zeroarg');
+        next({ type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_z', name: 'get_time' } });
+        const done = next({ type: 'response.completed', response: { status: 'completed', usage: {} } });
+        expect(done[0].choices[0].finish_reason).toBe('tool_calls');
+    });
+
     test('colon-bearing call ids survive forward translation', () => {
         const next = createChatToResponsesStreamTranslator('m', 'resp_colon');
         next({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call:1:2', function: { name: 'f', arguments: '{}' } }] } }] });

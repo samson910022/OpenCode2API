@@ -92,7 +92,7 @@ export function convertChatRequestToMessages(model: string, body: unknown, strea
                     const url = str(iu['url']);
                     if (url.startsWith('data:')) {
                         const comma = url.indexOf(',');
-                        const meta = url.slice(5, comma);
+                        const meta = url.slice(5, comma < 0 ? undefined : comma);
                         const data = comma >= 0 ? url.slice(comma + 1) : '';
                         const mime = meta.split(';')[0] || 'application/octet-stream';
                         blocks.push({ type: 'image', source: { type: 'base64', media_type: mime, data } });

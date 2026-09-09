@@ -60,12 +60,12 @@ export function usageToInteractions(usage: unknown): InteractionsUsage {
     const u = asRecord(usage);
     const raw = u['grounding_tool_count'];
     if (Array.isArray(raw)) {
-        const entries = raw
-            .map((e) => {
-                const r = asRecord(e);
-                return { type: typeof r['type'] === 'string' ? (r['type'] as string) : 'google_search', count: num(r['count']) };
-            })
-            .filter((e) => e.count > 0 || e.type);
+        // Zero-count entries are kept by design (zero-filled contract):
+        // presence of the tool key matters, not just positive counts.
+        const entries = raw.map((e) => {
+            const r = asRecord(e);
+            return { type: typeof r['type'] === 'string' ? (r['type'] as string) : 'google_search', count: num(r['count']) };
+        });
         if (entries.length) return { grounding_tool_count: entries };
     }
     return { grounding_tool_count: [{ type: 'google_search', count: 0 }] };

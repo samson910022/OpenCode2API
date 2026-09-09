@@ -16,6 +16,7 @@ import {
     convertMessagesResponseToInteractionsNonStream,
     convertResponsesResponseToInteractionsNonStream,
     createChatToInteractionsStreamTranslator,
+    createInteractionsToMessagesStreamTranslator,
 } from '../src/converters/interactions/response.js';
 
 function freshRegistry() {
@@ -85,6 +86,15 @@ describe('P3 interactions stream (route wire: created->step.delta->completed, no
         const e2 = next({ choices: [{ delta: {}, finish_reason: 'stop' }] });
         expect(e2[e2.length - 1]).toMatchObject({ type: 'interaction.completed', interaction: { id: 'intr_1', output_text: 'a'.repeat(1200), steps: [] } });
         expect(next({ choices: [{ delta: {}, finish_reason: 'stop' }] })).toEqual([]);
+    });
+
+    test('interactions message_delta usage carries both token legs', () => {
+        const next = createInteractionsToMessagesStreamTranslator('m', 'msg_legs');
+        next({ type: 'interaction.created', interaction: {} });
+        next({ type: 'step.delta', delta: 'hi' });
+        const done = next({ type: 'interaction.completed', interaction: {} });
+        const delta = done.find((e) => e.event === 'message_delta');
+        expect(delta.data.usage).toEqual({ input_tokens: 0, output_tokens: 0 });
     });
 
     test('google_search detected across tool shapes (chat/responses/messages)', () => {
