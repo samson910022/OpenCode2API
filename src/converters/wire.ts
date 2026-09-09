@@ -41,10 +41,42 @@ export function ensureTranslatorsRegistered(registry: TranslatorRegistry = defau
  */
 export function isErrorEnvelope(payload: unknown): boolean {
     if (typeof payload === 'string') {
-        return payload.includes('event: error') || payload.includes('"type":"error"') || payload.includes('"type": "error"') || payload.includes('response.failed');
+        // SSE `event:` fields are line-anchored: only a real error event
+        // matches (assistant text merely mentioning errors must not bypass).
+        if (/^event:\s*error(\s|$)/m.test(payload)) return true;
+        // Inspect JSON data payloads with the same object rules below, so a
+        // valid delta whose text contains error literals still translates.
+        const tryRecord = (text: string): boolean => {
+            try {
+                const parsed: unknown = JSON.parse(text);
+                return !!parsed && typeof parsed === 'object' && !Array.isArray(parsed) && isErrorRecord(asRecord(parsed));
+            } catch {
+                return false;
+            }
+        };
+        for (const line of payload.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data:')) continue;
+            const jsonText = trimmed.slice(5).trim();
+            if (!jsonText || jsonText === '[DONE]') continue;
+            if (tryRecord(jsonText)) return true;
+        }
+        // Bare JSON string without an SSE envelope.
+        const trimmed = payload.trim();
+        if (trimmed.startsWith('{') && tryRecord(trimmed)) return true;
+        return false;
     }
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
-    const r = asRecord(payload);
+    return isErrorRecord(asRecord(payload));
+}
+
+/**
+ * Object-shape error check shared by the object and string (parsed SSE)
+ * paths: wrapped {error}, error/response.failed type or event, and the bare
+ * TransformedUpstreamErrorBody ({message, type} with none of the
+ * valid-payload markers choices/output/content/data).
+ */
+function isErrorRecord(r: Record<string, unknown>): boolean {
     // Wrapped envelopes: {error: {...}} / {error: 'msg'}. Falsy sentinels
     // (''/0/false) are not error envelopes.
     const wrapped = r['error'];

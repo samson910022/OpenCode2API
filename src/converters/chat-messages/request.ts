@@ -74,6 +74,12 @@ export function resolveMessagesReasoningLevel(
  * Thinking -> reasoning_effort, extending anthropicThinkingToReasoningEffort
  * with adaptive/auto variants (Go claude_openai_request.go:57-98 core):
  * adaptive/auto + output_config.effort|effort passthrough, none/disabled -> none.
+ * NOTE vs legacy: type matching is case-insensitive here (legacy was
+ * exact-match). The only newly-accepted shape is mixed-case Disabled (which
+ * yields 'none', and 'none' adds no prompt line per buildSystemPrompt), plus
+ * mixed-case Adaptive/Auto (collapsed to the legacy fallback by
+ * resolveMessagesReasoningLevel on the live leg). Lowercase spec input —
+ * the only shape clients send — behaves exactly as legacy.
  */
 function messagesThinkingToReasoningEffort(thinking: unknown): string | null {
     if (!thinking || typeof thinking !== 'object' || Array.isArray(thinking)) return null;

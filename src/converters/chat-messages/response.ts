@@ -117,6 +117,9 @@ export function convertMessagesResponseToChatNonStream(
  * Stateful chat-chunk -> Anthropic-SSE translator (one instance per stream).
  * Emits message_start / content_block_start(content text=0, tool_use=1..) /
  * content_block_delta / content_block_stop / message_delta / message_stop.
+ * Single-terminal assumption: usage is read from the finish_reason chunk
+ * only; a trailing usage-only chunk after completion is ignored (the gateway
+ * collector coalesces finish + usage into one terminal chunk).
  * TODO(P4): thinking-delta events + signature passthrough + multi-choice.
  */
 export function createChatToMessagesStreamTranslator(model: string, messageId?: string) {

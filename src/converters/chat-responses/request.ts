@@ -85,7 +85,10 @@ function responsesToolToChatTool(tool: unknown): Record<string, unknown> | null 
         // `custom` may be a name string or a descriptor object. Unlike
         // function tools (dropped when unnamed — validators reject empty
         // names), custom tools always fall back to 'custom_tool' because the
-        // shape itself implies a callable.
+        // shape itself implies a callable. NOTE: several unnamed customs
+        // therefore share that one name and collapse via first-wins dedup
+        // in pushTool — accepted: an unnamed declaration cannot be referenced
+        // by any call, so nothing routable is lost.
         const custom = t['custom'];
         const customName = typeof custom === 'object' && custom !== null ? str(asRecord(custom)['name']) : str(custom);
         const name = str(t['name']) || customName || 'custom_tool';
@@ -431,11 +434,13 @@ export function convertChatRequestToResponses(model: string, body: unknown, stre
                 const part = asRecord(p);
                 if (str(part['type']) === 'image_url') {
                     const iu = asRecord(part['image_url']);
-                    // Preserve detail (Go request.go:207-209); responses side
-                    // carries it on the input_image item itself.
+                    // Preserve detail via the shared normalizer (Go
+                    // request.go:207-209); responses side carries it on the
+                    // input_image item itself. original->high, like the
+                    // responses->chat direction.
                     const imageItem: Record<string, unknown> = { type: 'input_image', image_url: str(iu['url']) };
-                    const detail = str(iu['detail']).toLowerCase().trim();
-                    if (detail === 'auto' || detail === 'low' || detail === 'high') imageItem['detail'] = detail;
+                    const detail = normalizeImageDetail(iu['detail']);
+                    if (detail) imageItem['detail'] = detail;
                     parts.push(imageItem);
                 } else {
                     parts.push({ type: 'input_text', text: str(part['text']) });

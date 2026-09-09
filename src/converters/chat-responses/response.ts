@@ -154,6 +154,9 @@ export interface ResponsesStreamEvent {
  * per-tool-call output_item.added/args-delta/done, message text delta, and
  * response.completed deferred until the terminal chunk carrying finish_reason
  * (and late usage when present).
+ * Single-terminal assumption: usage is read from the finish_reason chunk
+ * only; a trailing usage-only chunk after completion is ignored (the gateway
+ * collector coalesces finish + usage into one terminal chunk).
  */
 export function createChatToResponsesStreamTranslator(model: string, responseId?: string) {
     const id = responseId || newResponseId();

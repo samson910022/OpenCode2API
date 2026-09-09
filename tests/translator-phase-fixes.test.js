@@ -1,5 +1,8 @@
 import { TranslatorRegistry } from '../src/converters/registry.js';
 import { TranslatorPipeline } from '../src/converters/pipeline.js';
+import { registerAllTranslatorPairs } from '../src/converters/init.js';
+import { FormatOpenAI, FormatOpenAIResponse } from '../src/converters/formats.js';
+import { isErrorEnvelope } from '../src/converters/wire.js';
 import { makeId, normalizeArgs, num, asArray, str } from '../src/converters/json.js';
 import {
     usageToChat,
@@ -11,7 +14,8 @@ import {
     convertChatResponseToResponsesNonStream,
     convertResponsesResponseToChatNonStream,
 } from '../src/converters/chat-responses/response.js';
-import { convertChatRequestToMessages } from '../src/converters/chat-messages/request.js';
+import { convertChatRequestToMessages, convertMessagesRequestToChat } from '../src/converters/chat-messages/request.js';
+import { convertChatRequestToResponses } from '../src/converters/chat-responses/request.js';
 import {
     convertMessagesRequestToResponses,
     convertResponsesRequestToMessages,
@@ -164,5 +168,51 @@ describe('Phase4 text-core downgrade pinned (P0)', () => {
         const next = createChatToResponsesStreamTranslator('m', 'resp_pin');
         const deltas = next({ choices: [{ delta: { content: 'hi' }, finish_reason: null }] });
         expect(deltas.some((e) => e.type === 'response.output_text.delta')).toBe(true);
+    });
+});
+
+describe('PR review follow-ups', () => {
+    test('registerAll retry on a wired registry fails loud (no silent half-wire)', () => {
+        const r = new TranslatorRegistry();
+        r.register(FormatOpenAIResponse, FormatOpenAI, (model, body) => ({ ...body, model }), {
+            nonStream: (m, _o, _t, b) => b,
+        });
+        expect(() => registerAllTranslatorPairs(r)).toThrow(/duplicate/);
+    });
+
+    test('registerAll on a fresh registry wires all 12 pairs', () => {
+        const r = new TranslatorRegistry();
+        expect(() => registerAllTranslatorPairs(r)).not.toThrow();
+        expect(r.size()).toEqual({ requests: 12, responses: 12 });
+    });
+
+    test('isErrorEnvelope string path: error markers match, assistant text does not', () => {
+        expect(isErrorEnvelope('event: error\ndata: {"type":"error"}')).toBe(true);
+        expect(isErrorEnvelope('data: {"type":"response.failed"}')).toBe(true);
+        expect(isErrorEnvelope('{"type":"error","error":{"message":"x"}}')).toBe(true);
+        expect(isErrorEnvelope('data: {"type":"response.output_text.delta"}')).toBe(false);
+        // Valid delta whose text mentions error literals must still translate.
+        expect(isErrorEnvelope('data: {"choices":[{"delta":{"content":"she explained \\"type\\":\\"error\\" handling"}}]}')).toBe(false);
+        expect(isErrorEnvelope('data: [DONE]')).toBe(false);
+    });
+
+    test('chat->responses image detail original normalizes to high (symmetric)', () => {
+        const out = convertChatRequestToResponses('m', {
+            messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:x', detail: 'original' } }] }],
+        }, false);
+        expect(out.input[0].content).toEqual([{ type: 'input_image', image_url: 'data:x', detail: 'high' }]);
+        const missing = convertChatRequestToResponses('m', {
+            messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:x' } }] }],
+        }, false);
+        expect(missing.input[0].content).toEqual([{ type: 'input_image', image_url: 'data:x' }]);
+    });
+
+    test('thinking type matching is case-insensitive (Disabled -> none)', () => {
+        const out = convertMessagesRequestToChat('m', {
+            messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+            thinking: { type: 'Disabled' },
+        }, false);
+        // 'none' adds no prompt line downstream; legacy exact-match gave null.
+        expect(out.reasoning_effort).toBe('none');
     });
 });
