@@ -41,7 +41,7 @@ GET /health
 ```json
 {
   "status": "ok",
-  "timestamp": "2024-01-01T00:00:00.000Z"
+  "proxy": true
 }
 ```
 
@@ -52,6 +52,8 @@ GET /health
 ```http
 GET /v1/models
 ```
+
+> 需要认证：当配置了 `API_KEY` / `API_KEYS` / `OPENCODE_API_KEYS` 任一时，需 `Authorization: Bearer` 或 `x-api-key`；均未配置时免认证。
 
 **响应示例:**
 
@@ -216,7 +218,7 @@ curl -X POST http://127.0.0.1:10000/v1/responses \
   }'
 ```
 
-`tools: [{"type": "web_search"}]`（亦接受 `web_search_preview` / `google_search`）是显式授权：代理将其从外部 function 注册表剔除，转驱动 opencode 内置 `websearch`（需模型 provider 为 `opencode`/`opencode-go`，否则需 `OPENCODE_ENABLE_EXA=1`），并在输出中返回 `type: "web_search_call"` 项（含真实执行的 `action.query`）与 `url_citation` 引用（仅标注答案中实际出现的来源 URL，无编造）。流式模式会发送 `response.web_search_call.searching/completed` 事件，最终 `response.completed` 携带完整引用。
+`tools: [{"type": "web_search"}]`（亦接受 `web_search_preview` / `web_search_*` 版本化 / `google_search`）是显式授权：代理将其从外部 function 注册表剔除，转驱动 opencode 内置 `websearch`（需后端暴露该工具；可用性取决于模型/后端），并在输出中返回 `type: "web_search_call"` 项（含真实执行的 `action.query`）与 `url_citation` 引用（仅标注答案中实际出现的来源 URL，无编造）。流式模式会发送 `response.web_search_call.searching/completed` 事件，最终 `response.completed` 携带完整引用。注意：`/v1beta|/v1/interactions` 仅接受字面 `google_search` / `web_search` / `web_search_preview`（版本化 `web_search_YYYYMMDD` 在此会 400）。
 
 ### 🔁 Interactions API（Gemini 兼容薄层）
 
@@ -394,12 +396,24 @@ curl -X POST http://127.0.0.1:10000/v1/messages \
 
 ### 401 Unauthorized
 
+chat / models / responses / interactions（OpenAI 形状）:
+
 ```json
 {
   "error": {
-    "message": "Invalid API key",
-    "type": "invalid_request_error",
-    "code": "invalid_api_key"
+    "message": "Unauthorized"
+  }
+}
+```
+
+messages（Anthropic 形状）:
+
+```json
+{
+  "type": "error",
+  "error": {
+    "type": "authentication_error",
+    "message": "Unauthorized"
   }
 }
 ```
@@ -427,3 +441,5 @@ curl -X POST http://127.0.0.1:10000/v1/messages \
   }
 }
 ```
+
+> 后端偶发 `500 {"message":"Aborted","type":"internal_error","code":"MessageAbortedError"}` 为上游 session 瞬断（非代理超时；代理超时为 504 `Request timeout`），直接重试同一请求即可；`isTransient` 不覆盖该签名，故不自动重试。
