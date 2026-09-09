@@ -7,6 +7,8 @@
  * repo's external-bridge (text <function_calls> markup) model.
  */
 
+import { makeId, normalizeArgs } from './json.js';
+
 export interface ChatToolCallFunction {
     name: string;
     arguments: string;
@@ -142,12 +144,10 @@ export function sanitizeClaudeToolId(id: unknown): string {
 }
 
 export function generateClaudeToolCallId(): string {
-    try {
-        if (typeof globalThis.crypto?.randomUUID === 'function') {
-            return `toolu_${globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
-        }
-    } catch {}
-    return `toolu_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e9).toString(36)}`;
+    // Canonicalized on makeId: legacy fallback had an extra '_' separator
+    // (toolu_{date}_{rand}); wire checks only the toolu_ prefix, so this is
+    // equivalent for targetId/tests.
+    return makeId('toolu_');
 }
 
 export function anthropicError(type: string, message: string, statusCode = 400): AnthropicErrorShape {
@@ -184,13 +184,8 @@ export function extractSystemText(system: unknown): string {
 }
 
 function normalizeToolArguments(args: unknown): string {
-    if (args === undefined || args === null || args === '') return '{}';
-    if (typeof args === 'string') return args;
-    try {
-        return JSON.stringify(args);
-    } catch {
-        return '{}';
-    }
+    // Single source: shared json.ts helper (identical semantics).
+    return normalizeArgs(args);
 }
 
 /**
@@ -252,7 +247,12 @@ export function anthropicMessagesToChatMessages(anthropicMessages: unknown = [])
                 const inner = Array.isArray(resultBlock.content)
                     ? resultBlock.content.map(textOfBlock).filter(Boolean).join('\n')
                     : (typeof resultBlock.content === 'string' ? resultBlock.content : JSON.stringify(resultBlock.content ?? ''));
-                const prefix = resultBlock.is_error ? 'ERROR: ' : '';
+                // Strict is_error check (matches responses-messages/request.ts):
+                // only true/'true' encode as ERROR: prefix; "false" and other
+                // truthy values stay plain text.
+                const isErr = resultBlock.is_error === true ||
+                    (typeof resultBlock.is_error === 'string' && resultBlock.is_error.toLowerCase() === 'true');
+                const prefix = isErr ? 'ERROR: ' : '';
                 flushText();
                 ordered.push({
                     role: 'tool',

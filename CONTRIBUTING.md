@@ -11,11 +11,13 @@ Please be respectful and professional. We follow the [Contributor Covenant](http
 ### Reporting Bugs
 
 1. Check if the issue already exists
-2. Create a detailed issue with:
+2. Rule out backend flakiness first: retry the request and check backend status (`GET /health/details`)
+3. Create a detailed issue with:
    - Clear title and description
    - Steps to reproduce
    - Environment details
-   - Relevant logs
+   - Relevant logs (redact `API_KEY` and other secrets)
+   - For suspected protocol-translation bugs: the endpoint plus the translation direction (e.g. messages→chat), a minimal request JSON, expected vs actual response, and whether the native-protocol endpoint reproduces it
 
 ### Suggesting Features
 

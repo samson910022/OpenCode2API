@@ -22,7 +22,7 @@ Welcome to the OpenCode2API documentation.
 | 🐳 [Docker Deployment](./docker.md) | Compose + `docker run` + multi-arch |
 | 🔧 [Troubleshooting](./troubleshooting.md) | FAQ + debug mode |
 | 💻 [Development](./development.md) | Build + test + layout |
-| 🏗️ [Architecture](./architecture.md) | Runtime shape + extension points |
+| 🏗️ [Architecture](./architecture.md) | Runtime shape + extension points (incl. §5 N×N translator registry) |
 | 📄 [Main README](../README.md) | English canonical entrypoint |
 | 📄 [README (简体中文)](../README.zh-CN.md) | Simplified Chinese mirror of the main README |
 
@@ -42,6 +42,7 @@ Docs are migrating to **English-first**: the root [`README.md`](../README.md) is
 | Docker Deployment | 简体中文 | tracked |
 | Troubleshooting | 简体中文 | tracked (smallest, do first) |
 | Development | 简体中文 | tracked (dedupe with `CONTRIBUTING.md`) |
+| Architecture | English | canonical (N×N registry §5) |
 
 > Note: `docs/host-deployments.md` and `custom-bin/` are **local-only** (git-ignored via `.gitignore` / `.git/info/exclude`, never committed). They are intentionally absent from this index.
 

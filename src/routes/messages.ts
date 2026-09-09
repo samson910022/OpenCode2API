@@ -5,16 +5,14 @@ import { EXTERNAL_TOOL_PREFIX } from '../tool-runtime/contracts.js';
 import { computeRetryDelay } from '../retry/policy.js';
 import {
   validateMessagesRequest,
-  extractSystemText,
-  anthropicMessagesToChatMessages,
-  anthropicToolsToChatTools,
-  anthropicToolChoiceToChat,
-  anthropicThinkingToReasoningEffort,
   mapFinishToStopReason,
   buildAnthropicMessage,
   sseEvent,
   estimateTokens,
 } from '../converters/anthropic.js';
+import { defaultTranslatorRegistry } from '../converters/registry.js';
+import { ensureTranslatorsRegistered } from '../converters/wire.js';
+import { resolveMessagesReasoningLevel } from '../converters/chat-messages/request.js';
 import {
   stripFunctionCallMarkup,
   parseExternalToolCallsFromText,
@@ -63,7 +61,9 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
     proxyClient,
     proxyPromptWithTimeout,
     proxyPollForAssistantResponse,
+    translators,
   } = ctx;
+  const activeTranslators = translators ?? ensureTranslatorsRegistered(defaultTranslatorRegistry());
 
   app.post('/v1/messages', async (req: Request, res: Response): Promise<void> => {
     try {
@@ -133,12 +133,43 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           const thinking: unknown = body['thinking'];
           const stream = Boolean(requestStream);
           const requestOpencodeConfig: unknown = body['opencode'];
-          const chatMessages = anthropicMessagesToChatMessages(messagesRaw);
-          const systemText = extractSystemText(system);
-          if (systemText) chatMessages.unshift({ role: 'system', content: systemText } as unknown as (typeof chatMessages)[number]);
-          const chatTools = anthropicToolsToChatTools(tools);
-          const chatToolChoice = anthropicToolChoiceToChat(tool_choice);
-          const reasoningLevel = anthropicThinkingToReasoningEffort(thinking) || normalizeReasoningEffort(undefined, null);
+          // Phase 2 wiring: inbound claude.request -> chat.request via the wired
+          // N×N registry (thin wrapper over the same anthropic.ts pure layer,
+          // so shapes match). Direct registry call (not the Safe wrapper):
+          // requests are validated above and never error envelopes; an extra
+          // `type:'error'` field must not bypass conversion (mode confusion).
+          // Translated tools still flow through createRequestToolContext below
+          // (external__* bridge + server ∩ request), unchanged.
+          const translatedChatRequest = asRecord(
+            activeTranslators.translateRequest(
+              'claude',
+              'openai',
+              typeof model === 'string' ? model : '',
+              {
+                model,
+                system,
+                messages: messagesRaw,
+                tools,
+                tool_choice,
+                thinking,
+                max_tokens,
+                temperature,
+                top_p,
+                stop_sequences,
+              },
+              stream,
+            ),
+          );
+          const chatMessages = (
+            Array.isArray(translatedChatRequest['messages']) ? (translatedChatRequest['messages'] as unknown[]) : []
+          ) as unknown as Array<{ role?: unknown; content?: unknown }>;
+          const chatTools = Array.isArray(translatedChatRequest['tools']) ? (translatedChatRequest['tools'] as unknown[]) : [];
+          const chatToolChoice = translatedChatRequest['tool_choice'];
+          // Strict legacy parity via the testable gate (collapses the whole
+          // adaptive/auto family to the legacy fallback; translator itself
+          // stays Go-faithful).
+          const translatedEffort = translatedChatRequest['reasoning_effort'];
+          const reasoningLevel = resolveMessagesReasoningLevel(thinking, translatedEffort, normalizeReasoningEffort);
 
           const requestParams: Record<string, unknown> = {
             temperature: typeof temperature === 'number' ? temperature : 0.7,

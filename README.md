@@ -322,6 +322,10 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 | `POST` | `/v1beta/interactions` | Gemini-compatible thin layer (text + `google_search` grounding, `previous_interaction_id`, `store`, SSE without `[DONE]`) |
 | `POST` | `/v1/interactions` | Alias of `/v1beta/interactions` |
 
+### Protocol fidelity
+
+Use the endpoint native to your client (OpenAI SDKs → `/v1/chat/completions` or `/v1/responses`, Anthropic SDKs → `/v1/messages`, Gemini SDKs → `/v1beta/interactions`). Cross-protocol conversion is best-effort and only wired where documented (currently `POST /v1/messages` inbound): non-native paths may drop or zero-fill tool deltas, thinking signatures, token usage, and truncation signals (see [Architecture](./docs/architecture.md#5-nn-translator-registry-srcconverters)). If output looks wrong, first reproduce on the native endpoint and rule out backend flakiness (retry, check `/health/details`); if it persists, file an issue with a minimal repro (see [Troubleshooting](./docs/troubleshooting.md)).
+
 ### Model name formats
 
 - Direct: `opencode/big-pickle`
