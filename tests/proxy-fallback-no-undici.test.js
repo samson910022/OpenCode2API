@@ -10,14 +10,11 @@ const { createProxyPool } = await import('../src/upstream-proxy/pool.js');
 
 describe('proxy pool without undici runtime', () => {
     let savedFetch;
-    let fetchCalls;
+    let fetchMock;
     beforeEach(() => {
-        fetchCalls = [];
         savedFetch = globalThis.fetch;
-        globalThis.fetch = (async (...args) => {
-            fetchCalls.push(args);
-            return new Response('direct-ok');
-        }) as typeof fetch;
+        fetchMock = jest.fn(async () => new Response('direct-ok'));
+        globalThis.fetch = fetchMock;
     });
     afterEach(() => {
         globalThis.fetch = savedFetch;
@@ -28,10 +25,10 @@ describe('proxy pool without undici runtime', () => {
         expect(pool.engage('free')).toContain('socks5://');
         expect(pool.isEngaged()).toBe(true);
         const res = await pool.proxiedFetch('https://example.com/api', {});
-        expect(fetchCalls.length).toBe(1);
+        expect(fetchMock.mock.calls.length).toBe(1);
         expect(await res.text()).toBe('direct-ok');
         // Second call remembers the failure (no repeated import storms).
         await pool.proxiedFetch('https://example.com/api', {});
-        expect(fetchCalls.length).toBe(2);
+        expect(fetchMock.mock.calls.length).toBe(2);
     });
 });
