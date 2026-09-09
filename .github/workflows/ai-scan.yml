@@ -29,7 +29,7 @@ jobs:
   ai-scan:
     name: Repo scan + auto-issue
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
       issues: write
@@ -40,17 +40,57 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Ensure LLM credentials are configured
+      - name: Ensure LLM route is available
         shell: bash
         env:
-          GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           CPA_BASE_URL: ${{ secrets.CPA_BASE_URL }}
           CPA_API_KEY: ${{ secrets.CPA_API_KEY }}
         run: |
           set -euo pipefail
-          if [[ -z "${GATEWAY_API_KEY}${OPENCODE_API_KEY}" && ( -z "${CPA_API_KEY}" || -z "${CPA_BASE_URL}" ) ]]; then
-            echo "Scan needs gateway or CPA credentials in repository secrets." >&2
+          # Free models always have a route: an in-job no-auth gateway is
+          # started below unless an external GATEWAY_BASE_URL secret is set.
+          if [[ -n "${GATEWAY_BASE_URL}" ]]; then
+            echo "Using external gateway (URL from secrets; value not printed)."
+          else
+            echo "No external gateway secret; starting in-job no-auth gateway."
+          fi
+          if [[ -z "${CPA_API_KEY}" || -z "${CPA_BASE_URL}" ]]; then
+            echo "::warning::No CPA credentials; CPA fallback channel disabled (gateway only)."
+          fi
+
+      - name: Set up Node
+        if: secrets.GATEWAY_BASE_URL == ''
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Start in-job gateway (free models, no login needed)
+        if: secrets.GATEWAY_BASE_URL == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+          npm i -g opencode-ai
+          # No-auth localhost gateway: empty API_KEY = no auth; the gateway
+          # spawns its own backend (anonymous out-of-box free quota).
+          API_KEY= OPENCODE_PROXY_MANAGE_BACKEND=true OPENCODE_SERVER_PASSWORD=ci-local-only \
+            nohup node dist/index.js > /tmp/opencode-gateway.log 2>&1 &
+          ok=0
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:10000/health; then
+              echo
+              echo "gateway: /health 200"
+              ok=1
+              break
+            fi
+            sleep 5
+          done
+          if [[ "$ok" != "1" ]]; then
+            echo "gateway failed to start" >&2
+            tail -50 /tmp/opencode-gateway.log || true
             exit 1
           fi
 
@@ -72,6 +112,8 @@ jobs:
           PYTHONPATH: github_bot/src
         run: |
           set -euo pipefail
+          # Default to the in-job no-auth gateway when no external URL secret.
+          export GATEWAY_BASE_URL="${GATEWAY_BASE_URL:-http://127.0.0.1:10000}"
           if [[ "${{ inputs.dry_run || 'false' }}" == "true" ]]; then
             python3 github_bot/src/github_runner.py --mode=scan --dry-run
           else

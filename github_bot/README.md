@@ -23,7 +23,7 @@ response IDs are always echoed for `previous_response_id` chaining.
 | `config/bot_config.json` | Roles, models, triage sections, scan policy, session contract |
 | `config/LLM_config.example.json` | Dual-channel template (`${VAR}` only — never commit filled values) |
 | `prompts/` | Soul + role prompts |
-| `../tests/test_ai_bot.py` | Unit tests (25 tests) |
+| `../tests/test_ai_bot.py` | Unit tests (27 tests) |
 | `../docs/AI_BOT.md` | Maintainer documentation |
 | `../.github/workflows/ai-review.yml` | Review/triage/explain triggers |
 | `../.github/workflows/ai-scan.yml` | Weekly scan + auto-issue |
@@ -31,11 +31,14 @@ response IDs are always echoed for `previous_response_id` chaining.
 
 ## Commands
 
+Default needs no secrets: workflows start their own no-auth localhost gateway.
+To use an external gateway or CPA, export names only (never commit values):
+
 ```bash
-export GATEWAY_BASE_URL='...'   # never commit
-export GATEWAY_API_KEY='...'    # never commit (or legacy OPENCODE_API_KEY)
-export CPA_BASE_URL='...'       # never commit
-export CPA_API_KEY='...'        # never commit
+export GATEWAY_BASE_URL='http://127.0.0.1:10000'  # external override; in-job default when unset
+export GATEWAY_API_KEY='...'    # external gateway key; empty = no-auth localhost
+export CPA_BASE_URL='...'       # never commit (fallback channel)
+export CPA_API_KEY='...'        # never commit (fallback channel)
 export PYTHONPATH=github_bot/src
 python3 github_bot/src/github_runner.py --mode=review --dry-run
 python3 github_bot/src/github_runner.py --mode=triage --dry-run

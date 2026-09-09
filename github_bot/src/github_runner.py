@@ -48,13 +48,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--issue", type=int, default=0, help="fix-plan target issue number")
     args = parser.parse_args(argv)
 
+    # Gateway needs only a base URL (empty key = no-auth localhost gateway,
+    # e.g. spun up ephemerally in the workflow job); CPA needs key + URL.
     has_creds = bool(
-        os.environ.get("GATEWAY_API_KEY")
+        os.environ.get("GATEWAY_BASE_URL")
+        or os.environ.get("GATEWAY_API_KEY")
         or os.environ.get("OPENCODE_API_KEY")
         or (os.environ.get("CPA_API_KEY") and os.environ.get("CPA_BASE_URL"))
     )
     if not has_creds and not args.dry_run:
-        print("GATEWAY_API_KEY (or legacy OPENCODE_API_KEY) or CPA_API_KEY + CPA_BASE_URL is required",
+        print("GATEWAY_BASE_URL (in-job or external gateway) or CPA_API_KEY + CPA_BASE_URL is required",
               file=sys.stderr)
         return 2
 

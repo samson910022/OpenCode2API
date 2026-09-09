@@ -148,6 +148,48 @@ class TestLLMClient(unittest.TestCase):
         self.assertEqual(prepared[0]["signature"], "sig123")
         self.assertEqual(prepared[0]["encrypted_content"], "enc456")
 
+    def test_noauth_gateway_usable_without_any_key(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ,
+                             {"CI": "true", "GATEWAY_BASE_URL": "http://127.0.0.1:10000/"},
+                             clear=False):
+            for k in ("GATEWAY_API_KEY", "OPENCODE_API_KEY", "CPA_API_KEY", "CPA_BASE_URL"):
+                os.environ.pop(k, None)
+            client = LLMClient()
+            # Gateway needs only a base URL: stays default, no switch to CPA.
+            self.assertEqual(client.default_provider, "gateway")
+
+            def fake_single(model_id, messages, **kwargs):
+                return ("hello", {"endpoint": "test"})
+
+            client._single_call = fake_single
+            text, meta = client.chat_completion_with_meta(
+                "big-pickle", [{"role": "user", "content": "hi"}], allow_fallback=False)
+            self.assertEqual(text, "hello")
+            self.assertEqual(meta["provider"], "gateway")
+
+    def test_noauth_gateway_omits_auth_header(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ,
+                             {"CI": "true", "GATEWAY_BASE_URL": "http://127.0.0.1:10000/"},
+                             clear=False):
+            for k in ("GATEWAY_API_KEY", "OPENCODE_API_KEY", "CPA_API_KEY", "CPA_BASE_URL"):
+                os.environ.pop(k, None)
+            client = LLMClient()
+            captured = {}
+
+            def fake_post(endpoint, body, headers, timeout, api_type,
+                          min_chars, required_markers, **kwargs):
+                captured["headers"] = headers
+                return ("hi", {})
+
+            client._post_and_parse = fake_post
+            client.chat_completion_with_meta(
+                "big-pickle", [{"role": "user", "content": "hi"}], allow_fallback=False)
+            self.assertNotIn("Authorization", captured["headers"])
+
     def test_client_loads_dual_channel(self):
         client = LLMClient()
         self.assertIn("gateway", client.providers)

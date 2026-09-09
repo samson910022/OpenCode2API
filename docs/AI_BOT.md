@@ -17,11 +17,17 @@ always echo session/response IDs so runs can chain via `previous_response_id`.
 
 ## Secrets (names only — never commit values)
 
+No secrets are required for the default setup. Each workflow starts its own
+no-auth localhost gateway (`API_KEY` empty = no auth on the ephemeral runner,
+`OPENCODE_PROXY_MANAGE_BACKEND=true` so it spawns its own backend with
+anonymous out-of-box free quota). Optional overrides:
+
 | Secret | Purpose |
 | --- | --- |
-| `GATEWAY_BASE_URL` / `GATEWAY_API_KEY` | Self-hosted opencode2api gateway (OpenAI-compatible free models). Preferred channel. |
+| `GATEWAY_BASE_URL` | External gateway URL. When set, the in-job gateway is skipped. When unset, defaults to `http://127.0.0.1:10000`. |
+| `GATEWAY_API_KEY` | Key for an external gateway (sent as `Bearer`; omitted when empty). |
 | `OPENCODE_API_KEY` | Legacy alias accepted as gateway key when `GATEWAY_API_KEY` is unset. |
-| `CPA_BASE_URL` / `CPA_API_KEY` | CPA Responses channel (fallback). |
+| `CPA_BASE_URL` / `CPA_API_KEY` | CPA Responses channel (fallback). Without these the bot runs gateway-only and logs a warning. |
 
 Upstream Zen blocks APIKEY-direct free-model calls, so the bot never calls
 Zen directly: free models go through an opencode2api gateway (its credentials
@@ -72,8 +78,11 @@ Triage may add allowlisted labels only
 
 ## Local dry-run (placeholder values only)
 
+Point at a local gateway (start one with `API_KEY= OPENCODE_PROXY_MANAGE_BACKEND=true node dist/index.js`)
+or fill placeholders — never commit real values:
+
 ```bash
-export GATEWAY_BASE_URL='...' GATEWAY_API_KEY='...' CPA_BASE_URL='...' CPA_API_KEY='...'
+export GATEWAY_BASE_URL='http://127.0.0.1:10000' GATEWAY_API_KEY='' CPA_BASE_URL='...' CPA_API_KEY='...'
 export PYTHONPATH=github_bot/src
 python3 github_bot/src/github_runner.py --mode=review --dry-run
 python3 github_bot/src/github_runner.py --mode=triage --dry-run

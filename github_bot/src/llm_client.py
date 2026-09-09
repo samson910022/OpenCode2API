@@ -345,11 +345,14 @@ class LLMClient:
                         model_info["maxOutputTokens"] = model_info["maxTokens"]
                     self.models[mid] = model_info
 
-        # Dynamic default: prefer whichever channel actually has credentials.
+        # Dynamic default: prefer whichever channel is actually usable. The
+        # gateway needs only a base URL (empty key = no-auth localhost); CPA
+        # needs key + URL.
         if getattr(self, "default_provider", "gateway") in {"gateway", "opencode"}:
             cpa = self.providers.get("cpa", {})
             gw = self.providers.get("gateway", {}) or self.providers.get("opencode", {})
-            if cpa.get("apikey") and cpa.get("baseUrl") and not gw.get("apikey"):
+            gw_usable = bool(gw.get("baseUrl"))
+            if cpa.get("apikey") and cpa.get("baseUrl") and not gw_usable:
                 self.default_provider = "cpa"
 
         default_pdata = self.providers.get(self.default_provider) or {}
@@ -388,10 +391,15 @@ class LLMClient:
         for pname, pdata in self.providers.items():
             base_url = pdata.get("baseUrl") or ""
             api_key = pdata.get("apikey") or ""
-            if not base_url or not api_key:
+            if not base_url:
+                continue
+            if not api_key and pname != "gateway":
+                # Gateway allows empty key (no-auth localhost); others need one.
                 continue
             models_url = f"{base_url.rstrip('/')}/models"
-            headers = {"Authorization": f"Bearer {api_key}", "User-Agent": USER_AGENT}
+            headers = {"User-Agent": USER_AGENT}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
             try:
                 req = urllib.request.Request(models_url, headers=headers, method="GET")
                 with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
@@ -561,7 +569,7 @@ class LLMClient:
                     else f"Base URL is not configured for provider '{pname}'"
                 )
                 continue
-            if not api_key:
+            if not api_key and pname != "gateway":
                 hint = "set GATEWAY_API_KEY (or legacy OPENCODE_API_KEY) or CPA_API_KEY"
                 errors.append(
                     f"{candidate}: skipped (provider '{pname}' has no API key)"
@@ -569,6 +577,7 @@ class LLMClient:
                     else f"API key is missing for provider '{pname}' ({hint})"
                 )
                 continue
+            # Gateway with an empty key is a no-auth localhost gateway: allowed.
 
             model_info = models.get(candidate, {"id": candidate})
             model_max = int(model_info.get("maxOutputTokens") or 65536)
@@ -633,7 +642,7 @@ class LLMClient:
         )
         if not base_url:
             raise LLMClientError(f"Base URL is not configured for provider '{provider.get('name')}'")
-        if not api_key:
+        if not api_key and provider.get("name") != "gateway":
             raise LLMClientError(
                 f"API key is missing for provider '{provider.get('name')}' "
                 "(set GATEWAY_API_KEY or CPA_API_KEY)"
@@ -678,9 +687,11 @@ class LLMClient:
 
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
             "User-Agent": USER_AGENT,
         }
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        # Empty gateway key = no-auth localhost gateway: header omitted.
         enable_stream = getattr(self, "enable_streaming", True) and provider.get("stream", True)
         if enable_stream:
             body["stream"] = True
@@ -732,8 +743,9 @@ class LLMClient:
             body["reasoning_effort"] = "high" if str(reasoning_effort).lower() == "xhigh" else reasoning_effort
         if thinking is not None:
             body["thinking"] = thinking
-        headers = {"Content-Type": "application/json",
-                   "Authorization": f"Bearer {api_key}", "User-Agent": USER_AGENT}
+        headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         enable_stream = self.enable_streaming if stream_enabled is None else stream_enabled
         if enable_stream:
             body["stream"] = True
