@@ -23,6 +23,7 @@
 | 🔧 [Troubleshooting](./troubleshooting.md) | 常见问题排查 |
 | 💻 [Development](./development.md) | 开发指南 |
 | 🏗️ [Architecture](./architecture.md) | 架构说明（英文，含 §5 N×N 转换矩阵） |
+| 🤖 [AI Bot](./AI_BOT.md) | GitHub AI review/scan/fix 机器人（英文，gateway + CPA，sticky 标记，仅 draft-PR） |
 
 > 说明：`docs/host-deployments.md` 与 `custom-bin/` 为本地专用（经 `.gitignore` / `.git/info/exclude` 忽略，不提交），故不在此索引中。
 
