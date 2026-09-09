@@ -323,6 +323,10 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 | `POST` | `/v1beta/interactions` | Gemini 兼容薄层（文本 + `google_search` 联网、`previous_interaction_id`、`store`、SSE 无 `[DONE]`） |
 | `POST` | `/v1/interactions` | `/v1beta/interactions` 的别名 |
 
+### 协议保真度
+
+请使用与客户端原生对应的端点（OpenAI SDK → `/v1/chat/completions` 或 `/v1/responses`，Anthropic SDK → `/v1/messages`，Gemini SDK → `/v1beta/interactions`）。跨协议转换是 best-effort，且仅在已接线处生效（目前为 `POST /v1/messages` 入站）：非原生路径可能丢失或零填充工具增量、thinking 签名、token 用量与截断信号（见 [Architecture](./docs/architecture.md#5-nn-translator-registry-srcconverters)）。若输出异常，请先在原生端点复现并排除后端波动（重试、检查 `/health/details`）；确认存在后再附最小复现提 issue（见 [故障排查](./docs/troubleshooting.md)）。
+
 ### 模型名称格式
 
 - 直接使用: `opencode/big-pickle`

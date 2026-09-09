@@ -118,6 +118,29 @@ curl -H "Authorization: Bearer YOUR_API_KEY" ...
 
 ---
 
+### 9️⃣ 跨协议转换结果异常
+
+| 项目 | 说明 |
+|:-----|:-----|
+| **症状** | 非原生协议客户端收到缺字段、空工具调用、`usage` 为 0、截断信号丢失 |
+| **说明** | 网关建议各客户端使用原生协议端点（OpenAI SDK → `/v1/chat/completions` 或 `/v1/responses`，Anthropic SDK → `/v1/messages`，Gemini SDK → `/v1beta/interactions`）。跨协议转换是 best-effort，目前仅 `POST /v1/messages` 入站走转换矩阵，其余路径可能降级（纯文本 + 零填充用量），属已知限制而非后端故障 |
+
+提 issue 前请先排除偶发因素：
+
+```bash
+# 1. 重试一次，并检查后端状态（排除波动/限流）
+curl -H "Authorization: Bearer YOUR_API_KEY" http://127.0.0.1:10000/health/details
+
+# 2. 用原生协议端点复现同一请求（确认是转换问题，而非模型/后端问题）
+
+# 3. 开调试日志抓最小复现
+OPENCODE_PROXY_DEBUG=true
+```
+
+提 issue 时请附（并删掉 `API_KEY` 等密钥）：端点 + 协议方向（如 messages→chat）、最小请求 JSON、期望 vs 实际响应、模型 ID、原生端点是否同样复现。
+
+---
+
 ## 🔍 调试模式
 
 开启调试日志:

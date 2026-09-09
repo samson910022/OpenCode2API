@@ -158,6 +158,15 @@ Wiring status (live, not tests-only):
 - TokenCount stays unregistered — use `isTokenCountRegistered(registry)`
   (live registry query).
 
+User-facing guidance (also stated in both READMEs and
+`docs/troubleshooting.md`): clients should use their native protocol
+endpoint. Only `POST /v1/messages` inbound goes through the registry
+today; every other cross-protocol path is best-effort and may degrade
+(TEXT-CORE: dropped tool/thinking deltas, zero-filled usage, lost
+truncation signals). Suspected translation bugs must be reproduced on the
+native endpoint first — ruling out backend flakiness — and reported with
+a minimal repro.
+
 ## 6. Roadmap (accepted, not yet implemented)
 
 - Extract shared `preflight(ctx, body)` (resolve model → tool context →
