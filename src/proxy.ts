@@ -44,6 +44,8 @@ import type { ProxyClient, ProviderInfo, ModelInfo, ResolvedModel } from './type
 import type { ResponseStateEntry } from './types/backend.js';
 import { asRecord, toErrorMessage } from './utils/guards.js';
 import { buildEffectiveApiKeys, createApiKeyVerifier } from './auth/keys.js';
+import { defaultTranslatorRegistry } from './converters/registry.js';
+import { ensureTranslatorsRegistered } from './converters/wire.js';
 
 // P4: thin re-exports to preserve original import paths
 // (tests/env-alias.test.js, stream-hardening.test.js import these from '../src/proxy.js').
@@ -896,6 +898,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     proxyPollForAssistantResponse,
     getCachedToolIds: () => cachedToolIds,
     getCachedToolIdsAt: () => cachedToolIdsAt,
+    translators: ensureTranslatorsRegistered(defaultTranslatorRegistry()),
   };
 
   // P3: register routes (404 last to preserve catch-all order).

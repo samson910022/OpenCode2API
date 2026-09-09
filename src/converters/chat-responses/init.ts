@@ -11,6 +11,8 @@
 import { FormatOpenAI, FormatOpenAIResponse } from '../formats.js';
 import type { TranslatorRegistry } from '../registry.js';
 import { defaultTranslatorRegistry } from '../registry.js';
+import type { StreamHolder } from '../holder.js';
+import { holderTranslatorOf } from '../holder.js';
 import { convertChatRequestToResponses, convertResponsesRequestToChat } from './request.js';
 import {
     convertChatResponseToResponsesNonStream,
@@ -28,34 +30,16 @@ type StreamState = ReturnType<typeof createChatToResponsesStreamTranslator>;
  * each call as an independent single-chunk stream — correct for non-stream
  * tests but NOT for multi-chunk streams.
  */
-export interface ChatResponsesStreamHolder {
-    translator?: StreamState;
-}
+export interface ChatResponsesStreamHolder extends StreamHolder<StreamState> {}
 
-export interface ResponsesChatStreamHolder {
-    translator?: ReturnType<typeof createResponsesToChatStreamTranslator>;
-}
+export interface ResponsesChatStreamHolder extends StreamHolder<ReturnType<typeof createResponsesToChatStreamTranslator>> {}
 
 function responsesStreamStateOf(param: unknown, model: string): ReturnType<typeof createResponsesToChatStreamTranslator> {
-    if (param && typeof param === 'object') {
-        const holder = param as ResponsesChatStreamHolder;
-        if (holder.translator) return holder.translator;
-        const translator = createResponsesToChatStreamTranslator(model);
-        holder.translator = translator;
-        return translator;
-    }
-    return createResponsesToChatStreamTranslator(model);
+    return holderTranslatorOf(param, model, (m) => createResponsesToChatStreamTranslator(m));
 }
 
 function streamStateOf(param: unknown, model: string): StreamState {
-    if (param && typeof param === 'object') {
-        const holder = param as ChatResponsesStreamHolder;
-        if (holder.translator) return holder.translator;
-        const translator = createChatToResponsesStreamTranslator(model);
-        holder.translator = translator;
-        return translator;
-    }
-    return createChatToResponsesStreamTranslator(model);
+    return holderTranslatorOf(param, model, (m) => createChatToResponsesStreamTranslator(m));
 }
 
 export function registerChatResponsesPair(registry: TranslatorRegistry = defaultTranslatorRegistry()): void {

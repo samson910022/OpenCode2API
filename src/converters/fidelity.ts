@@ -43,3 +43,12 @@ export function streamFidelityOf(from: Format, to: Format): StreamFidelity | und
 }
 
 export const TOKEN_COUNT_REGISTERED = false;
+
+/**
+ * Registry-derived source of truth for the TokenCount ledger claim.
+ * @deprecated TOKEN_COUNT_REGISTERED is a static snapshot pinned by legacy
+ * tests; new code MUST use isTokenCountRegistered(registry) instead.
+ */
+export function isTokenCountRegistered(registry: import('./registry.js').TranslatorRegistry): boolean {
+    return registry.hasAnyTokenCount();
+}

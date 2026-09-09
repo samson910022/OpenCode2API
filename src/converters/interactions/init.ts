@@ -13,6 +13,8 @@
 import { FormatClaude, FormatInteractions, FormatOpenAI, FormatOpenAIResponse } from '../formats.js';
 import type { TranslatorRegistry } from '../registry.js';
 import { defaultTranslatorRegistry } from '../registry.js';
+import type { StreamHolder } from '../holder.js';
+import { holderTranslatorOf as holderTranslator } from '../holder.js';
 import {
     convertChatRequestToInteractions,
     convertInteractionsRequestToChat,
@@ -35,19 +37,6 @@ import {
     createMessagesToInteractionsStreamTranslator,
     createResponsesToInteractionsStreamTranslator,
 } from './response.js';
-
-function holderTranslator<T>(param: unknown, model: string, create: (model: string) => T): T {
-    if (param && typeof param === 'object') {
-        const holder = param as StreamHolder<T>;
-        if (!holder.translator) holder.translator = create(model);
-        return holder.translator;
-    }
-    return create(model);
-}
-
-export interface StreamHolder<T> {
-    translator?: T;
-}
 
 export type ChatToInteractionsStreamHolder = StreamHolder<ReturnType<typeof createChatToInteractionsStreamTranslator>>;
 export type InteractionsToChatStreamHolder = StreamHolder<ReturnType<typeof createInteractionsToChatStreamTranslator>>;

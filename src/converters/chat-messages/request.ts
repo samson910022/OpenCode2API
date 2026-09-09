@@ -44,6 +44,33 @@ export function convertMessagesRequestToChat(model: string, body: unknown, strea
 }
 
 /**
+ * Route-level reasoning gate for strict legacy parity (Phase 2接線).
+ *
+ * The translator above is Go-faithful (adaptive/auto + effort passthrough),
+ * but legacy routes treated adaptive as unknown (null → no prompt line).
+ * Collapse the whole adaptive/auto family to the legacy fallback here so no
+ * new "[Reasoning Effort: ...]" line leaks into the system prompt.
+ * Pure: normalizeFn is injected (routes pass ctx.normalizeReasoningEffort).
+ */
+export function resolveMessagesReasoningLevel(
+    thinking: unknown,
+    translatedEffort: unknown,
+    normalizeReasoningEffort: (value: unknown, fallback?: unknown) => string | null,
+): string | null {
+    const thinkingType =
+        thinking && typeof thinking === 'object' && !Array.isArray(thinking)
+            ? str(asRecord(thinking)['type']).toLowerCase()
+            : '';
+    if (thinkingType === 'adaptive' || thinkingType === 'auto') {
+        return normalizeReasoningEffort(undefined, null);
+    }
+    return (
+        (typeof translatedEffort === 'string' ? normalizeReasoningEffort(translatedEffort, null) : null) ??
+        normalizeReasoningEffort(undefined, null)
+    );
+}
+
+/**
  * Thinking -> reasoning_effort, extending anthropicThinkingToReasoningEffort
  * with adaptive/auto variants (Go claude_openai_request.go:57-98 core):
  * adaptive/auto + output_config.effort|effort passthrough, none/disabled -> none.

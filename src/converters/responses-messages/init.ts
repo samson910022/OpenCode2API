@@ -5,6 +5,8 @@
 import { FormatClaude, FormatOpenAIResponse } from '../formats.js';
 import type { TranslatorRegistry } from '../registry.js';
 import { defaultTranslatorRegistry } from '../registry.js';
+import type { StreamHolder } from '../holder.js';
+import { holderTranslatorOf } from '../holder.js';
 import { convertMessagesRequestToResponses, convertResponsesRequestToMessages } from './request.js';
 import {
     convertMessagesResponseToResponsesNonStream,
@@ -13,30 +15,16 @@ import {
     createResponsesToMessagesStreamTranslator,
 } from './response.js';
 
-export interface ResponsesMessagesStreamHolder {
-    translator?: ReturnType<typeof createResponsesToMessagesStreamTranslator>;
-}
+export interface ResponsesMessagesStreamHolder extends StreamHolder<ReturnType<typeof createResponsesToMessagesStreamTranslator>> {}
 
-export interface MessagesResponsesStreamHolder {
-    translator?: ReturnType<typeof createMessagesToResponsesStreamTranslator>;
-}
+export interface MessagesResponsesStreamHolder extends StreamHolder<ReturnType<typeof createMessagesToResponsesStreamTranslator>> {}
 
 function responsesMessagesTranslatorOf(param: unknown, model: string): ReturnType<typeof createResponsesToMessagesStreamTranslator> {
-    if (param && typeof param === 'object') {
-        const holder = param as ResponsesMessagesStreamHolder;
-        if (!holder.translator) holder.translator = createResponsesToMessagesStreamTranslator(model);
-        return holder.translator;
-    }
-    return createResponsesToMessagesStreamTranslator(model);
+    return holderTranslatorOf(param, model, (m) => createResponsesToMessagesStreamTranslator(m));
 }
 
 function messagesResponsesTranslatorOf(param: unknown, model: string): ReturnType<typeof createMessagesToResponsesStreamTranslator> {
-    if (param && typeof param === 'object') {
-        const holder = param as MessagesResponsesStreamHolder;
-        if (!holder.translator) holder.translator = createMessagesToResponsesStreamTranslator(model);
-        return holder.translator;
-    }
-    return createMessagesToResponsesStreamTranslator(model);
+    return holderTranslatorOf(param, model, (m) => createMessagesToResponsesStreamTranslator(m));
 }
 
 export function registerResponsesMessagesPair(registry: TranslatorRegistry = defaultTranslatorRegistry()): void {

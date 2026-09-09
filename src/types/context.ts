@@ -5,6 +5,7 @@ import type { UpstreamProxyPool } from '../upstream-proxy/pool.js';
 import type { ExternalToolEntry } from '../tool-runtime/registry.js';
 import type { ValidatedToolCall } from '../tool-runtime/validator.js';
 import type { FinalToolCall } from '../tool-runtime/parser.js';
+import type { TranslatorRegistry } from '../converters/registry.js';
 
 export type ToolModeName = string;
 
@@ -159,6 +160,8 @@ export interface AppContext {
   proxyPollForAssistantResponse: CollectorHandle['pollForAssistantResponse'];
   getCachedToolIds: () => string[] | null;
   getCachedToolIdsAt: () => number;
+  /** Wired N×N translator registry (Phase 1接線; optional so manual test ctx still compiles). */
+  translators?: TranslatorRegistry;
 }
 
 export interface CreateAppResult {

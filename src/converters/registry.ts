@@ -45,12 +45,22 @@ export class TranslatorRegistry {
     private readonly responses = new Map<Format, Map<Format, ResponseTransform>>();
 
     register(from: Format, to: Format, request: RequestTransform | null, response: ResponseTransform): void {
-        let byTarget = this.requests.get(from);
-        if (!byTarget) {
-            byTarget = new Map<Format, RequestTransform>();
-            this.requests.set(from, byTarget);
+        // Validate duplicates BEFORE mutating (atomic): a throwing register
+        // must not leave a half-wired pair behind.
+        if (request && this.requests.get(from)?.get(to) !== undefined) {
+            throw new Error(`[translators] duplicate request transformer ${from}->${to}`);
         }
-        if (request) byTarget.set(to, request);
+        if (this.responses.get(from)?.get(to) !== undefined) {
+            throw new Error(`[translators] duplicate response transformer ${from}->${to}`);
+        }
+        if (request) {
+            let byTarget = this.requests.get(from);
+            if (!byTarget) {
+                byTarget = new Map<Format, RequestTransform>();
+                this.requests.set(from, byTarget);
+            }
+            byTarget.set(to, request);
+        }
 
         let respByTarget = this.responses.get(from);
         if (!respByTarget) {
@@ -76,6 +86,16 @@ export class TranslatorRegistry {
 
     hasNonStreamResponseTransformer(from: Format, to: Format): boolean {
         return this.responses.get(from)?.get(to)?.nonStream != null;
+    }
+
+    /** True if any registered response pair carries a tokenCount transform. */
+    hasAnyTokenCount(): boolean {
+        for (const byTarget of this.responses.values()) {
+            for (const fn of byTarget.values()) {
+                if (fn.tokenCount != null) return true;
+            }
+        }
+        return false;
     }
 
     translateRequest(from: Format, to: Format, model: string, body: unknown, stream: boolean): unknown {

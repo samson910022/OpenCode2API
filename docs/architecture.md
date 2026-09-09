@@ -32,7 +32,7 @@ Cross-cutting helpers (all routes depend on them one-way; no cycles):
 | Stream | `src/stream/collector.ts` | prompt → poll → collect-from-events SSE pipeline |
 | Errors | `src/errors/upstream.ts` | `normalizeBackendError`, `transformUpstreamError`, `isTransient*` |
 | Retry | `src/retry/policy.ts` | pure `resolveMaxRetries` / backoff+jitter / `retry-after` parsing |
-| Converters | `src/converters/` (N×N registry) | pure protocol↔protocol shapes; see §4 |
+| Converters | `src/converters/` (N×N registry) | pure protocol↔protocol shapes; see §5 |
 | Tool runtime | `src/tool-runtime/` | `contracts → registry → router → parser → validator → policy` |
 | Guards | `src/utils/guards.ts` | shared `asRecord` / `toErrorMessage` (single source) |
 
@@ -71,6 +71,9 @@ interactions-stream `interaction.completed` / `error` event without `[DONE]`).
   with `register*Pair`), wire it in `src/converters/init.ts`
   (`registerAllTranslatorPairs`), and add `tests/translator-*.test.js`.
   Keep route glue (choice mapping, id round-trip) in the route file.
+  Legacy `src/converters/anthropic.ts` stays live in `messages.ts`
+  (response rendering, SSE helpers, token estimate) alongside the N×N
+  inbound path — do not delete/retrofit it in the same change.
 - **New tool dialect:** extend `src/tool-runtime/parser.ts` (regex +
   extractor + registration in the collector) and add fixtures to
   `tests/parser-foreign-formats.test.js`. The ambiguity policy is
@@ -121,6 +124,28 @@ Rules that keep the port safe:
   intentionally unregistered — counting stays in the collector.
 - `usage.ts` maps usage legs with zero-filled unknowns; interactions
   responses never carry tokens (`grounding_tool_count` only).
+
+Wiring status (live, not tests-only):
+
+- The registry initializes once per process (idempotent across `createApp`
+  calls via the `init.ts` guard) and is exposed via `ctx.translators`
+  (optional so manual test contexts still compile). Registration is
+  explicit; duplicate `register` throws instead of silently overwriting.
+- Inbound request legs use direct `registry.translateRequest` after
+  validation (an adversarial extra `type:'error'` field must not bypass
+  conversion). Response/stream legs MUST use the `wire.ts` Safe variants
+  (`translateNonStreamSafe` / `translateStreamSafe`), which bypass error
+  envelopes first — currently exercised by tests/integration only, as
+  routes keep native response rendering. Error envelopes always bypass.
+- Stream state rides one holder per stream (`src/converters/holder.ts`
+  single source, shared by all four pair `init.ts` files).
+- `POST /v1/messages` inbound (`claude.request → chat.request`) goes
+  through the registry; adaptive/auto thinking collapses to the legacy
+  fallback (`resolveMessagesReasoningLevel`) so no new prompt line leaks.
+  All other routes keep native handling; cross-protocol translation of
+  their outputs is covered by `tests/translator-integration.test.js`.
+- TokenCount stays unregistered — use `isTokenCountRegistered(registry)`
+  (live) instead of the deprecated `TOKEN_COUNT_REGISTERED` snapshot.
 
 ## 6. Roadmap (accepted, not yet implemented)
 
