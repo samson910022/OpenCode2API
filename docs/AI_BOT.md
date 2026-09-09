@@ -82,7 +82,7 @@ Point at a local gateway (start one with `API_KEY= OPENCODE_PROXY_MANAGE_BACKEND
 or fill placeholders — never commit real values:
 
 ```bash
-export GATEWAY_BASE_URL='http://127.0.0.1:10000' GATEWAY_API_KEY='' CPA_BASE_URL='...' CPA_API_KEY='...'
+export GATEWAY_BASE_URL='http://127.0.0.1:10000' GATEWAY_API_KEY='' CPA_BASE_URL=your-cpa-url-here CPA_API_KEY=your-cpa-key-here
 export PYTHONPATH=github_bot/src
 python3 github_bot/src/github_runner.py --mode=review --dry-run
 python3 github_bot/src/github_runner.py --mode=triage --dry-run
