@@ -230,8 +230,10 @@ export function lock(task: unknown, timeout: unknown = 120000): Promise<unknown>
  * Robust Health Check Helper
  */
 export function buildBackendAuthHeaders(password: unknown = ''): Record<string, string> | undefined {
-  if (!password || typeof password !== 'string' || !password) return undefined;
-  const token = Buffer.from(`opencode:${password}`).toString('base64');
+  // NOTE: falsy check (not typeof) matches the original JS verbatim: truthy
+  // non-strings (e.g. numeric 123 from config.json) are coerced via String().
+  if (!password) return undefined;
+  const token = Buffer.from(`opencode:${String(password)}`).toString('base64');
   return { Authorization: `Basic ${token}` };
 }
 

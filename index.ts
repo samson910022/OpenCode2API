@@ -23,7 +23,10 @@ function parseBool(value: unknown, fallback: boolean): boolean {
 
 function parseToolAllowlist(value: unknown, fallback: string[] = []): string[] {
   if (Array.isArray(value)) {
-    return [...new Set((value as unknown[]).map((entry) => String(entry ?? '').trim()).filter(Boolean))];
+    // NOTE: `||` (not `??`) matches the original JS verbatim: falsy entries
+    // (0/false) stringify to '' and are filtered out instead of becoming
+    // "0"/"false" allowlist entries.
+    return [...new Set((value as unknown[]).map((entry) => String((entry as unknown) || '').trim()).filter(Boolean))];
   }
   if (typeof value === 'string') {
     return [...new Set(value.split(',').map((entry) => entry.trim()).filter(Boolean))];
@@ -96,7 +99,9 @@ function readFileString(key: string, fallback: string): string {
 
 function readFileNumber(key: string, fallback: number): number {
   const v: unknown = fileConfig[key];
-  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  // NOTE: `0` falls through to fallback to match the original
+  // `fileConfig.X || default` semantics verbatim.
+  if (typeof v === 'number' && Number.isFinite(v) && v !== 0) return v;
   if (typeof v === 'string' && v.trim() !== '') {
     const n = parseInt(v, 10);
     if (Number.isFinite(n)) return n;
