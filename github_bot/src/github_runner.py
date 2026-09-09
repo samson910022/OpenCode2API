@@ -50,13 +50,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Gateway needs only a base URL (empty key = no-auth localhost gateway,
     # e.g. spun up ephemerally in the workflow job); CPA needs key + URL.
-    has_creds = bool(
-        os.environ.get("GATEWAY_BASE_URL")
-        or os.environ.get("GATEWAY_API_KEY")
-        or os.environ.get("OPENCODE_API_KEY")
-        or (os.environ.get("CPA_API_KEY") and os.environ.get("CPA_BASE_URL"))
-    )
-    if not has_creds and not args.dry_run:
+    # A bare key without a URL is useless, so the URL is required.
+    if not _has_llm_route() and not args.dry_run:
         print("GATEWAY_BASE_URL (in-job or external gateway) or CPA_API_KEY + CPA_BASE_URL is required",
               file=sys.stderr)
         return 2
@@ -188,12 +183,39 @@ def _run_scan(orchestrator: AgentOrchestrator, *, dry_run: bool) -> int:
 
 
 def _list_open_issues() -> list[dict[str, Any]]:
+    # NOTE: the issues API also returns open PRs; fingerprint matching keeps
+    # that harmless (fingerprints only appear in scan-filed issues). Closing
+    # and reopening re-files by design (dedupeScope: open).
     try:
         data = _github_request("GET", f"/repos/{_repo()}/issues?state=open&per_page=100")
         return data if isinstance(data, list) else []
     except Exception as exc:
         print(f"scan: list issues failed: {sanitize_public_error_text(str(exc))}", file=sys.stderr)
         return []
+
+
+def _diff_paths(diff: str) -> list[str]:
+    """Parse repo-relative paths touched by a unified diff (b-side)."""
+    paths: list[str] = []
+    for line in (diff or "").splitlines():
+        m = re.match(r"^\+\+\+ b/(.+)$", line.strip())
+        if m:
+            path = m.group(1).strip()
+            if path != "/dev/null" and path not in paths:
+                paths.append(path)
+        else:
+            m2 = re.match(r"^diff --git a/.+? b/(.+)$", line.strip())
+            if m2 and m2.group(1).strip() not in paths:
+                paths.append(m2.group(1).strip())
+    # Contain to the worktree: no absolutes, no traversal, no secret files.
+    safe: list[str] = []
+    for path in paths:
+        if path.startswith("/") or ".." in Path(path).parts:
+            continue
+        if re.search(r"(^|/)(\.env(\..*)?|config\.json|opencode\.json)$", path, re.IGNORECASE):
+            continue
+        safe.append(path)
+    return safe
 
 
 # -- fix-plan (proposal + opt-in draft PR) ---------------------------------
@@ -221,8 +243,13 @@ def _run_fix_plan(orchestrator: AgentOrchestrator, *, dry_run: bool,
         print(comment)
         return 0 if dry_run else _comment_on_issue(number, comment)
     # Apply path: branch + git apply --check + commit + push + draft PR.
-    fp_short = re.sub(r"[^a-z0-9-]", "-", title.lower())[:30].strip("-") or "fix"
-    branch = f"ai-fix/issue-{number}-{fp_short}"
+    # Unique per run (GITHUB_RUN_ID) so reruns never clobber a prior draft.
+    fp_short = re.sub(r"[^a-z0-9-]", "-", title.lower())[:24].strip("-") or "fix"
+    run_suffix = re.sub(r"[^a-z0-9-]", "", str(os.environ.get("GITHUB_RUN_ID", ""))[:12])
+    if not run_suffix:
+        import hashlib
+        run_suffix = hashlib.sha256(diff.encode("utf-8")).hexdigest()[:8]
+    branch = f"ai-fix/issue-{number}-{fp_short}-{run_suffix}"
     try:
         _git(["checkout", "-B", branch])
         proc = subprocess.run(["git", "apply", "--check", "-"], input=diff,
@@ -237,7 +264,19 @@ def _run_fix_plan(orchestrator: AgentOrchestrator, *, dry_run: bool,
                 pass
             return _comment_on_issue(number, msg)
         subprocess.run(["git", "apply", "-"], input=diff, check=True, text=True, timeout=60)
-        _git(["add", "-A"])
+        # Stage only paths named by the diff — never sweep the workspace
+        # (gateway logs, prior artifacts, concurrent changes stay out).
+        touched = _diff_paths(diff)
+        if not touched:
+            msg = comment + "\nDiff named no committable paths; leaving plan only.\n"
+            print(msg)
+            _git(["checkout", "-"])
+            try:
+                _git(["branch", "-D", branch])
+            except Exception:
+                pass
+            return _comment_on_issue(number, msg)
+        _git(["add", "--"] + touched)
         _git(["commit", "-m", f"fix(issue-{number}): AI-proposed draft fix (human review required)"])
         _git(["push", "-u", "origin", branch])
         pr = _github_request("POST", f"/repos/{_repo()}/pulls", {
@@ -355,14 +394,37 @@ def _maybe_apply_suggested_labels(report: str, *, dry_run: bool) -> None:
 
 
 def _comment_on_issue(number: int, body: str) -> int:
-    if not os.environ.get("GITHUB_TOKEN"):
+    """Upsert the fix-plan command report: update the sticky comment when one
+    exists so repeated `/fix` runs don't spam the thread."""
+    if not os.environ.get("GITHUB_TOKEN") or not _repo():
         print(body)
         return 0
+    marker = CONFIG.get("commandMarker", "")
+    try:
+        comments = _github_request(
+            "GET", f"/repos/{_repo()}/issues/{number}/comments?per_page=100")
+        for comment in comments if isinstance(comments, list) else []:
+            if marker and marker in str(comment.get("body", "")) and comment.get("id"):
+                _github_request(
+                    "PATCH", f"/repos/{_repo()}/issues/comments/{comment['id']}",
+                    {"body": body[:60000]})
+                print(f"Updated fix-plan comment {comment['id']} on #{number}")
+                return 0
+    except Exception as exc:
+        print(f"fix-plan comment lookup failed, posting new: "
+              f"{sanitize_public_error_text(str(exc))}", file=sys.stderr)
     _github_request("POST", f"/repos/{_repo()}/issues/{number}/comments", {"body": body[:60000]})
     return 0
 
 
 # -- github plumbing ---------------------------------------------------------
+def _has_llm_route() -> bool:
+    """True when at least one usable LLM channel exists (URL required)."""
+    if os.environ.get("GATEWAY_BASE_URL"):
+        return True
+    return bool(os.environ.get("CPA_API_KEY") and os.environ.get("CPA_BASE_URL"))
+
+
 def _repo() -> str:
     return os.environ.get("GITHUB_REPOSITORY", "")
 
@@ -473,7 +535,9 @@ def _fetch_issue_comments() -> list[dict[str, Any]]:
                         "author": str(item.get("author", "unknown")),
                         "body": _redact_secrets(str(item.get("body", ""))),
                     })
-            return normalized
+            # Same newest-first tail cap as the live path.
+            max_comments = int(CONFIG.get("triage", {}).get("thread", {}).get("maxComments", 30))
+            return normalized[-max_comments:] if max_comments > 0 else []
         except Exception:
             return []
     if not os.environ.get("GITHUB_TOKEN"):
@@ -499,7 +563,9 @@ def _fetch_issue_comments() -> list[dict[str, Any]]:
             break
     comments: list[dict[str, Any]] = []
     total = 0
-    for item in items[:max_comments]:
+    # Newest-first: the tail holds the latest questions/answers, which is what
+    # thread-aware triage needs to avoid re-asking resolved items.
+    for item in items[-max_comments:] if max_comments > 0 else []:
         body = _redact_secrets(str(item.get("body", "")))
         if cfg.get("excludeBotMarkers") and "<!-- OPENCODE2API_AI_" in body:
             author = "bot(sticky)"

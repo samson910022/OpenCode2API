@@ -31,13 +31,15 @@ concurrency:
 jobs:
   ai-review:
     name: OpenCode2API AI review (gateway + CPA)
+    # Slash commands only run for collaborators (budget/abuse gate); automatic
+    # PR/issue events are unaffected.
     if: >
       github.event_name != 'issue_comment' ||
-      (
+      ((
         contains(github.event.comment.body, '/review') ||
         contains(github.event.comment.body, '/triage') ||
         contains(github.event.comment.body, '/explain')
-      )
+      ) && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -114,7 +116,8 @@ jobs:
           set -euo pipefail
           npm ci
           npm run build
-          npm i -g opencode-ai
+          # Pinned to track @opencode-ai/sdk ^1.18.29 used by this repo.
+          npm i -g opencode-ai@1.18.30
           # No-auth localhost gateway: empty API_KEY = no auth; the gateway
           # spawns its own backend (anonymous out-of-box free quota).
           API_KEY= OPENCODE_PROXY_MANAGE_BACKEND=true OPENCODE_SERVER_PASSWORD=ci-local-only \

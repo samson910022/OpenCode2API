@@ -148,6 +148,50 @@ class TestLLMClient(unittest.TestCase):
         self.assertEqual(prepared[0]["signature"], "sig123")
         self.assertEqual(prepared[0]["encrypted_content"], "enc456")
 
+    def test_gateway_base_normalized_to_v1(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ,
+                             {"CI": "true", "GATEWAY_BASE_URL": "http://127.0.0.1:10000"},
+                             clear=False):
+            for k in ("GATEWAY_API_KEY", "OPENCODE_API_KEY", "CPA_API_KEY", "CPA_BASE_URL"):
+                os.environ.pop(k, None)
+            client = LLMClient()
+            self.assertEqual(client.providers["gateway"]["baseUrl"],
+                             "http://127.0.0.1:10000/v1/")
+            captured = {}
+
+            def fake_post(endpoint, body, headers, timeout, api_type,
+                          min_chars, required_markers, **kwargs):
+                captured["endpoint"] = endpoint
+                return ("hi", {})
+
+            client._post_and_parse = fake_post
+            client.chat_completion_with_meta(
+                "big-pickle", [{"role": "user", "content": "hi"}], allow_fallback=False)
+            self.assertEqual(captured["endpoint"],
+                             "http://127.0.0.1:10000/v1/chat/completions")
+
+    def test_gateway_base_with_v1_untouched(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ,
+                             {"CI": "true",
+                              "GATEWAY_BASE_URL": "http://127.0.0.1:10000/v1/"},
+                             clear=False):
+            for k in ("GATEWAY_API_KEY", "OPENCODE_API_KEY", "CPA_API_KEY", "CPA_BASE_URL"):
+                os.environ.pop(k, None)
+            client = LLMClient()
+            self.assertEqual(client.providers["gateway"]["baseUrl"],
+                             "http://127.0.0.1:10000/v1/")
+
+    def test_model_allowlist_slash_form(self):
+        from llm_client import MODEL_ID_ALLOWLIST
+        self.assertTrue(MODEL_ID_ALLOWLIST.fullmatch("opencode/big-pickle"))
+        self.assertTrue(MODEL_ID_ALLOWLIST.fullmatch("big-pickle"))
+        self.assertFalse(MODEL_ID_ALLOWLIST.fullmatch("a/b/c"))
+        self.assertFalse(MODEL_ID_ALLOWLIST.fullmatch("../x"))
+
     def test_noauth_gateway_usable_without_any_key(self):
         import os
         from unittest import mock
@@ -236,6 +280,32 @@ class TestOrchestrator(unittest.TestCase):
         for section in load_json(BOT_DIR / "config" / "bot_config.json")["triage"]["requiredSections"]:
             self.assertIn(section, stub)
 
+    def test_verdict_aggregation_verdict_line_only(self):
+        orch = AgentOrchestrator.__new__(AgentOrchestrator)
+        orch.config = load_json(BOT_DIR / "config" / "bot_config.json")
+        ctx = AgentOrchestrator.__new__(AgentOrchestrator)
+        import agent_orchestrator as ao
+        review_ctx = ao.ReviewContext(title="t", body="b")
+        # Prose mention of NEEDS_CHANGES must not flip an APPROVE verdict.
+        orch._run_role = lambda role, prompt, **kw: (
+            "VERDICT: APPROVE\nAll good, no NEEDS_CHANGES here.", {"response_id": "r1"})
+        report = AgentOrchestrator.run_multi_agent_review(orch, review_ctx)
+        self.assertIn("FINAL_VERDICT: APPROVE", report)
+        # Missing VERDICT line degrades to COMMENT, not NEEDS_CHANGES.
+        orch._run_role = lambda role, prompt, **kw: (
+            "Some rambling review without a verdict line.", {"response_id": "r2"})
+        report2 = AgentOrchestrator.run_multi_agent_review(orch, review_ctx)
+        self.assertIn("FINAL_VERDICT: COMMENT", report2)
+        self.assertNotIn("FINAL_VERDICT: NEEDS_CHANGES", report2)
+        # A real NEEDS_CHANGES verdict still wins.
+        def mixed(role, prompt, **kw):
+            if role == "api_compat":
+                return ("VERDICT: NEEDS_CHANGES\nBLOCKING:\n- x", {"response_id": "r3"})
+            return ("VERDICT: APPROVE\nFine.", {"response_id": "r4"})
+        orch._run_role = mixed
+        report3 = AgentOrchestrator.run_multi_agent_review(orch, review_ctx)
+        self.assertIn("FINAL_VERDICT: NEEDS_CHANGES", report3)
+
 
 class TestScanAndRunner(unittest.TestCase):
     def test_fingerprint_stable(self):
@@ -249,6 +319,38 @@ class TestScanAndRunner(unittest.TestCase):
 
     def test_runner_redact(self):
         self.assertNotIn("supersecret", github_runner._redact_secrets("token=supersecret"))
+
+    def test_thread_keeps_newest_comments(self):
+        import os
+        from unittest import mock
+        comments = [{"author": f"u{i}", "body": f"question {i}?"} for i in range(35)]
+        with mock.patch.dict(os.environ, {"ISSUE_COMMENTS_JSON": json.dumps(comments)},
+                             clear=False):
+            kept = github_runner._fetch_issue_comments()
+        self.assertEqual(len(kept), 30)
+        self.assertEqual(kept[0]["body"], "question 5?")
+        self.assertEqual(kept[-1]["body"], "question 34?")
+
+    def test_has_llm_route_requires_url(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for k in ("GATEWAY_BASE_URL", "GATEWAY_API_KEY", "OPENCODE_API_KEY",
+                      "CPA_API_KEY", "CPA_BASE_URL"):
+                os.environ.pop(k, None)
+            self.assertFalse(github_runner._has_llm_route())
+            # A bare key without a URL is useless: still no route.
+            os.environ["GATEWAY_API_KEY"] = "placeholder"
+            self.assertFalse(github_runner._has_llm_route())
+            os.environ["GATEWAY_BASE_URL"] = "http://127.0.0.1:10000"
+            self.assertTrue(github_runner._has_llm_route())
+
+    def test_diff_paths_parsing_and_containment(self):
+        diff = ("diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n"
+                "diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n"
+                "diff --git a/x b/../escape\n--- a/x\n+++ b/../escape\n")
+        paths = github_runner._diff_paths(diff)
+        self.assertEqual(paths, ["src/a.ts"])
 
 
 if __name__ == "__main__":

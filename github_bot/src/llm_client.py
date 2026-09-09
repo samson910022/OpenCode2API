@@ -42,7 +42,9 @@ DEFAULT_REJECT_FINISH_REASONS = ("length", "max_tokens", "content_filter")
 # Gateway accepts xhigh (normalized to high server-side); CPA accepts high/max.
 # xhigh is therefore valid in config, but normalized to high before CPA send.
 VALID_REASONING_EFFORTS = {"low", "medium", "high", "max", "xhigh"}
-MODEL_ID_ALLOWLIST = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+# Model ids may carry one `provider/model` segment (e.g. opencode/big-pickle
+# as served by GET /v1/models); nothing deeper.
+MODEL_ID_ALLOWLIST = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}(/[a-z0-9][a-z0-9._-]{0,63})?$")
 USER_AGENT = "opencode2api-ai-bot/1.0"
 
 # Canonical internal model ids (gateway + CPA catalogs). Public comments must
@@ -302,6 +304,13 @@ class LLMClient:
                     base_url = os.environ.get("OPENCODE_SERVER_URL", "")
             if base_url and not base_url.endswith("/"):
                 base_url += "/"
+            if provider_name == "gateway" and base_url:
+                # The gateway serves versioned routes (/v1/models,
+                # /v1/chat/completions). Accept a bare origin and normalize
+                # it to .../v1/ so `http://127.0.0.1:10000` just works.
+                stripped = base_url.rstrip("/")
+                if not stripped.endswith("/v1"):
+                    base_url = stripped + "/v1/"
 
             api_key = pdata.get("apikey") or ""
             if not api_key:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,10 @@ def scan_worktree(max_files: int = 400) -> list[dict[str, str]]:
         except Exception:
             continue
         if checked >= max_files:
+            sys.stderr.write(
+                f"[scan] file budget exhausted ({max_files}); "
+                "remaining tracked files skipped\n"
+            )
             break
         checked += 1
         # One finding per (rule, file): fingerprints differ by slug so coexisting
@@ -124,11 +129,13 @@ def scan_config_matrix() -> list[dict[str, str]]:
             continue
         missing = [n for n in sorted(names) if n not in text and n not in {"API_KEY", "PORT", "BIND_HOST"}]
         # Only flag when the file should mention the matrix (docker/index/docs).
+        # Any missing set is reported so drift cannot accumulate invisibly;
+        # severity scales with the size of the gap.
         if rel in {"Dockerfile", "docker-compose.yml", "index.ts", "docs/configuration.md"} and missing:
             sample = ",".join(missing[:3])
-            if len(missing) >= 5:
-                findings.append(_finding("config-matrix-drift", rel, "should-fix",
-                                         f"{len(missing)} canonical names absent, e.g. {sample}"))
+            severity = "should-fix" if len(missing) >= 5 else "nit"
+            findings.append(_finding("config-matrix-drift", rel, severity,
+                                     f"{len(missing)} canonical names absent, e.g. {sample}"))
     return findings
 
 

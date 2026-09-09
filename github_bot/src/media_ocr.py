@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import base64
 import os
+import re
+import urllib.request
 from pathlib import Path
 from typing import Any
-
-import re
 
 DEFAULT_EXTENSIONS = (
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
@@ -20,7 +20,16 @@ DEFAULT_EXTENSIONS = (
     ".log", ".txt",
 )
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+# Text attachments are fetched inline (bounded); other media stays URL-only.
+FETCHABLE_TEXT_EXTENSIONS = (".log", ".txt")
+FETCH_MAX_BYTES = 200_000
+FETCH_TIMEOUT_SECONDS = 15
 URL_RE = re.compile(r"https?://[^\s)>\]]+")
+# Local reads are confined to the repo worktree and never touch secret files.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SECRET_NAME_RE = re.compile(
+    r"(^|/)(\.env(\..*)?|config\.json|opencode\.json|.*\.(pem|key|p12|pfx|jks|keystore))$", re.IGNORECASE
+)
 
 
 def discover_media_refs(
@@ -80,8 +89,50 @@ def summarize_media_with_llm(
     return joined[:max_summary_chars] if len(joined) > max_summary_chars else joined
 
 
+def _fetch_text_attachment(url: str, max_bytes: int = FETCH_MAX_BYTES) -> str | None:
+    """Fetch a bounded text attachment (.log/.txt). None when unusable."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "opencode2api-ai-bot/1.0"},
+                                     method="GET")
+        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_SECONDS) as resp:
+            raw = resp.read(max_bytes + 1)
+    except Exception:
+        return None
+    if len(raw) > max_bytes:
+        raw = raw[:max_bytes]
+    try:
+        return raw.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _redact_text(text: str) -> str:
+    """Redact key material from fetched text before it reaches the model."""
+    redacted = re.sub(
+        r"(?i)(api[_-]?key|apikey|token|password|secret)\s*([:=]\s*)(['\"]?)[^'\"\s,}]+(['\"]?)",
+        r"\1\2\3[REDACTED]\4", text)
+    redacted = re.sub(r"Bearer\s+[A-Za-z0-9._~+/-]+=*", "Bearer [REDACTED]", redacted)
+    return redacted
+
+
+def _contained_repo_path(ref: str) -> Path | None:
+    """Resolve a repo-relative ref inside REPO_ROOT; None when unsafe."""
+    if SECRET_NAME_RE.search(ref):
+        return None
+    try:
+        resolved = (REPO_ROOT / ref).resolve()
+    except Exception:
+        return None
+    if REPO_ROOT not in resolved.parents and resolved != REPO_ROOT:
+        return None
+    name = resolved.name
+    if name.startswith(".") or not resolved.is_file():
+        return None
+    return resolved
+
+
 def _build_content(ref: str, max_bytes: int) -> Any:
-    """Build multimodal content parts for one ref (URL passthrough or data URL)."""
+    """Build multimodal content for one ref (images as parts, text inline)."""
     clean = ref.rstrip(".,;:)]}")
     low = clean.lower().split("?")[0]
     if clean.startswith("http"):
@@ -90,10 +141,18 @@ def _build_content(ref: str, max_bytes: int) -> Any:
                 {"type": "text", "text": f"SOURCE: {clean}\nDescribe what is visible (under 2000 chars)."},
                 {"type": "image_url", "image_url": {"url": clean}},
             ]
-        return (f"SOURCE: {clean}\nDescribe what is relevant in under 2000 chars. "
-                "If unreachable, write OCR_TEXT: NOT_ENOUGH_INFO.")
-    candidate = Path(clean)
-    if candidate.is_file():
+        if any(low.endswith(ext) for ext in FETCHABLE_TEXT_EXTENSIONS):
+            fetched = _fetch_text_attachment(clean)
+            if fetched is not None:
+                return (f"SOURCE: {clean}\nATTACHMENT_CONTENT:\n{_redact_text(fetched)}\n"
+                        "Summarize what is relevant in under 2000 chars.")
+            return (f"SOURCE: {clean}\n(fetch failed; describe relevance from context or write "
+                    "OCR_TEXT: NOT_ENOUGH_INFO)")
+        # Audio/video containers are not fetched; the model works from context.
+        return (f"SOURCE: {clean}\n(content not fetched for this media type; describe likely "
+                "relevance from surrounding context or write OCR_TEXT: NOT_ENOUGH_INFO)")
+    candidate = _contained_repo_path(clean)
+    if candidate is not None:
         try:
             if candidate.stat().st_size <= max_bytes and any(
                     low.endswith(ext) for ext in IMAGE_EXTENSIONS):
@@ -102,8 +161,13 @@ def _build_content(ref: str, max_bytes: int) -> Any:
                     {"type": "text", "text": f"SOURCE: {clean}\nDescribe what is visible."},
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}},
                 ]
+            if candidate.stat().st_size <= FETCH_MAX_BYTES and any(
+                    low.endswith(ext) for ext in FETCHABLE_TEXT_EXTENSIONS):
+                return (f"SOURCE: {clean}\nATTACHMENT_CONTENT:\n"
+                        f"{_redact_text(candidate.read_text(encoding='utf-8', errors='replace')[:FETCH_MAX_BYTES])}\n"
+                        "Summarize what is relevant in under 2000 chars.")
         except Exception:
             pass
         return f"SOURCE: {clean}\n(local file, describe relevance or NOT_ENOUGH_INFO)"
-    return (f"SOURCE: {clean}\nDescribe what is relevant in under 2000 chars. "
-            "If unreachable, write OCR_TEXT: NOT_ENOUGH_INFO.")
+    return (f"SOURCE: {clean}\n(unreadable or outside repo; describe relevance from context "
+            "or write OCR_TEXT: NOT_ENOUGH_INFO)")

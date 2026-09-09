@@ -31,9 +31,14 @@ concurrency:
 jobs:
   ai-fix:
     name: Fix plan (+ opt-in draft PR)
+    # /fix pushes branches and opens PRs: collaborators only (abuse gate).
+    # Word-boundary matching mirrors the runner's /fix\b parse.
     if: >
       github.event_name == 'workflow_dispatch' ||
-      contains(github.event.comment.body, '/fix')
+      ((contains(github.event.comment.body, '/fix ') ||
+        endsWith(github.event.comment.body, '/fix') ||
+        contains(github.event.comment.body, '/fix\n')) &&
+       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -77,7 +82,8 @@ jobs:
           set -euo pipefail
           npm ci
           npm run build
-          npm i -g opencode-ai
+          # Pinned to track @opencode-ai/sdk ^1.18.29 used by this repo.
+          npm i -g opencode-ai@1.18.30
           # No-auth localhost gateway: empty API_KEY = no auth; the gateway
           # spawns its own backend (anonymous out-of-box free quota).
           API_KEY= OPENCODE_PROXY_MANAGE_BACKEND=true OPENCODE_SERVER_PASSWORD=ci-local-only \

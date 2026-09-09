@@ -23,7 +23,7 @@ response IDs are always echoed for `previous_response_id` chaining.
 | `config/bot_config.json` | Roles, models, triage sections, scan policy, session contract |
 | `config/LLM_config.example.json` | Dual-channel template (`${VAR}` only — never commit filled values) |
 | `prompts/` | Soul + role prompts |
-| `../tests/test_ai_bot.py` | Unit tests (27 tests) |
+| `../tests/test_ai_bot.py` | Unit tests (34 tests) |
 | `../docs/AI_BOT.md` | Maintainer documentation |
 | `../.github/workflows/ai-review.yml` | Review/triage/explain triggers |
 | `../.github/workflows/ai-scan.yml` | Weekly scan + auto-issue |
@@ -53,13 +53,16 @@ Do not commit real keys or a `config/LLM_config.json` that embeds secrets
 
 ## Slash commands (GitHub comments)
 
+Slash commands run for collaborators only (`OWNER`/`MEMBER`/`COLLABORATOR`;
+abuse/budget gate). Automatic PR/issue events are unaffected.
+
 | Context | Command | Result |
 | --- | --- | --- |
 | Pull request | `/review` | Multi-agent PR code review |
 | Pull request | `/explain` | PR explanation |
 | Issue | `/triage` or `/review` | Issue investigation (not PR review) |
 | Issue | `/explain` | Routed to issue investigation |
-| Issue | `/fix` | Fix plan comment; draft PR only with workflow opt-in |
+| Issue | `/fix` | Fix plan comment (sticky, updated on rerun); draft PR only with workflow opt-in (write standalone `/fix` — comma-attached forms don't trigger the workflow) |
 
 ## Quality posture
 
@@ -68,7 +71,7 @@ Do not commit real keys or a `config/LLM_config.json` that embeds secrets
 - Thread-aware triage suppresses questions already asked in the issue thread
 - Incomplete or truncated drafts fail closed into a structured stub
 - Scan findings carry stable `opencode2api-scan:<slug>:<hash>` fingerprints; reruns update instead of duplicating
-- Fix proposals never auto-merge; draft PRs require human review
+- Fix proposals never auto-merge; draft PRs require human review; apply stages only diff-named paths on a unique per-run branch
 
 ## Model routing (internal maintainer config only)
 

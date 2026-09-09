@@ -90,7 +90,7 @@ def scrub_internal_names(text: str, extra_names: list[str] | None = None) -> str
     out = text
     for name in names:
         out = re.sub(re.escape(name), "[model]", out, flags=re.IGNORECASE)
-    out = re.sub(r"(?i)\b(gateway|cpa)\b", "[provider]", out)
+    out = re.sub(r"(?i)\b(gateway|cpa|opencode)\b", "[provider]", out)
     return out
 
 
@@ -414,18 +414,17 @@ class AgentOrchestrator:
             "response_ids": [metas[r].get("response_id", "n/a") for r in pipeline if r in metas],
             "roles": {r: metas.get(r, {}) for r in pipeline},
         }
+        # Only the VERDICT: line counts. Prose mentions of NEEDS_CHANGES must
+        # not flip the outcome; unparseable outputs degrade to COMMENT.
         verdict = "APPROVE"
         for text in results.values():
             m = re.search(r"(?m)^\s*VERDICT\s*:\s*(APPROVE|NEEDS_CHANGES|COMMENT)", text.upper())
-            verdicts = m.group(1) if m else ("NEEDS_CHANGES" if "NEEDS_CHANGES" in text.upper() else "")
-            if verdicts == "NEEDS_CHANGES" or "NEEDS_CHANGES" in text.upper():
+            parsed = m.group(1) if m else "COMMENT"
+            if parsed == "NEEDS_CHANGES":
                 verdict = "NEEDS_CHANGES"
                 break
-        if verdict != "NEEDS_CHANGES" and any(
-            re.search(r"(?m)^\s*VERDICT\s*:\s*COMMENT", t.upper()) or "COMMENT" in t.upper()
-            for t in results.values()
-        ):
-            verdict = "COMMENT"
+            if parsed == "COMMENT":
+                verdict = "COMMENT"
         sections = [f"## {role}\n{results.get(role, '(missing)')}" for role in pipeline]
         sensitive = "\n".join(f"- {p}" for p in ctx.sensitive_files) or "- (none)"
         det = self.deterministic_findings(ctx.git_diff, ctx.changed_files)

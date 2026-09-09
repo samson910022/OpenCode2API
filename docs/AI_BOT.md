@@ -13,7 +13,7 @@ always echo session/response IDs so runs can chain via `previous_response_id`.
 | --- | --- | --- | --- |
 | `ai-review.yml` | PR opened/reopened/synchronize/ready_for_review, issues opened, `/review` `/triage` `/explain` comments, manual dispatch | `contents:read`, `pull-requests:write`, `issues:write` | Sticky-marker review/triage/explain; automatic triggers skip draft PRs (an explicit `/review` comment still runs) |
 | `ai-scan.yml` | Weekly cron (Mon 02:00 UTC), manual dispatch | `contents:read`, `issues:write` | Deterministic pre-scan + LLM re-check; fingerprint dedupe; max 3 new issues/run (manual `max_issues` is clamped to the same cap) |
-| `ai-fix.yml` | `/fix` comments, manual dispatch | `contents:write`, `pull-requests:write`, `issues:write` | Fix plan comment always; draft PR only with opt-in AND a clean `git apply --check`. `maxPrsPerRun: 1` is enforced by single-issue runs + the workflow concurrency group (one active fix run per issue), not by a PR counter. |
+| `ai-fix.yml` | `/fix` comments (collaborators only), manual dispatch | `contents:write`, `pull-requests:write`, `issues:write` | Fix plan comment always (sticky, updated on rerun); draft PR only with opt-in AND a clean `git apply --check`, staging only diff-named paths on a unique per-run branch. `maxPrsPerRun: 1` is enforced by single-issue runs + the workflow concurrency group (one active fix run per issue), not by a PR counter. |
 
 ## Secrets (names only — never commit values)
 
