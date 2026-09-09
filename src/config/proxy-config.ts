@@ -112,11 +112,15 @@ export function buildProxyConfig(options: unknown = {}): ProxyConfig {
     readStringOption(opts, ['EXTERNAL_TOOLS_CONFLICT_POLICY', 'externalToolsConflictPolicy']) ||
     process.env['OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY'] ||
     'namespace';
+  // NOTE: `||` (not `??`) is intentional here to match the original JS merge
+  // semantics verbatim: falsy values ('', 0) fall through to the next source
+  // instead of becoming Number('')=0. The finite/positive guard below then
+  // clamps anything non-sane back to the hardcoded default.
   const cleanupIntervalMs = Number(
-    opts['CLEANUP_INTERVAL_MS'] ?? process.env['OPENCODE_PROXY_CLEANUP_INTERVAL_MS'] ?? 12 * 60 * 60 * 1000,
+    opts['CLEANUP_INTERVAL_MS'] || process.env['OPENCODE_PROXY_CLEANUP_INTERVAL_MS'] || 12 * 60 * 60 * 1000,
   );
   const cleanupMaxAgeMs = Number(
-    opts['CLEANUP_MAX_AGE_MS'] ?? process.env['OPENCODE_PROXY_CLEANUP_MAX_AGE_MS'] ?? 24 * 60 * 60 * 1000,
+    opts['CLEANUP_MAX_AGE_MS'] || process.env['OPENCODE_PROXY_CLEANUP_MAX_AGE_MS'] || 24 * 60 * 60 * 1000,
   );
 
   if (externalToolsMode !== 'proxy-bridge') {
@@ -149,7 +153,7 @@ export function buildProxyConfig(options: unknown = {}): ProxyConfig {
           String(process.env['OPENCODE_USE_ISOLATED_HOME'] ?? '').toLowerCase() === 'true' ||
           process.env['OPENCODE_USE_ISOLATED_HOME'] === '1',
     REQUEST_TIMEOUT_MS: Number(
-      opts['REQUEST_TIMEOUT_MS'] ?? process.env['OPENCODE_PROXY_REQUEST_TIMEOUT_MS'] ?? DEFAULT_REQUEST_TIMEOUT_MS,
+      opts['REQUEST_TIMEOUT_MS'] || process.env['OPENCODE_PROXY_REQUEST_TIMEOUT_MS'] || DEFAULT_REQUEST_TIMEOUT_MS,
     ),
     MANAGE_BACKEND:
       normalizeBool(opts['MANAGE_BACKEND']) ?? normalizeBool(process.env['OPENCODE_PROXY_MANAGE_BACKEND']) ?? true,

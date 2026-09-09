@@ -7,30 +7,12 @@ import path from 'path';
 import { createOpencodeClient } from '@opencode-ai/sdk';
 import type { OpencodeClient } from '@opencode-ai/sdk';
 import type { Application, Request, Response, NextFunction } from 'express';
-import { buildExternalToolRegistry, findExternalToolByName } from './tool-runtime/registry.js';
-import { EXTERNAL_TOOL_PREFIX } from './tool-runtime/contracts.js';
-import { resolveMaxRetries, computeRetryDelay } from './retry/policy.js';
-import {
-  validateMessagesRequest,
-  extractSystemText,
-  anthropicMessagesToChatMessages,
-  anthropicToolsToChatTools,
-  anthropicToolChoiceToChat,
-  anthropicThinkingToReasoningEffort,
-  mapFinishToStopReason,
-  buildAnthropicMessage,
-  sseEvent,
-  estimateTokens,
-} from './converters/anthropic.js';
+import { buildExternalToolRegistry } from './tool-runtime/registry.js';
+import { resolveMaxRetries } from './retry/policy.js';
 import { buildToolExposure } from './tool-runtime/router.js';
 import { evaluateToolPolicy } from './tool-runtime/policy.js';
 import { validateToolCalls } from './tool-runtime/validator.js';
-import {
-  stripFunctionCallMarkup,
-  parseExternalToolCallsFromText,
-  createToolCallFilter,
-  createExternalToolCallStreamParser,
-} from './tool-runtime/parser.js';
+import { stripFunctionCallMarkup } from './tool-runtime/parser.js';
 import type { ExternalToolEntry } from './tool-runtime/registry.js';
 import type { ValidatedToolCall } from './tool-runtime/validator.js';
 import type { FinalToolCall } from './tool-runtime/parser.js';
@@ -119,17 +101,6 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   const clientHeaders = buildBackendAuthHeaders(OPENCODE_SERVER_PASSWORD);
   const rawClient: OpencodeClient = createOpencodeClient({ baseUrl: OPENCODE_SERVER_URL, headers: clientHeaders });
   const client = rawClient as unknown as ProxyClient;
-
-  const isOperationalEndpointBypassed = (req: Request): boolean => {
-    if (req.path === '/health/details') {
-      return Boolean(HEALTH_DETAILS_ENABLED) && !HEALTH_DETAILS_REQUIRE_AUTH;
-    }
-    if (req.path === '/metrics') {
-      return Boolean(METRICS_ENABLED) && !METRICS_REQUIRE_AUTH;
-    }
-    return false;
-  };
-  void isOperationalEndpointBypassed;
 
   // Auth middleware (accepts Authorization: Bearer and x-api-key for Anthropic SDK compat)
   app.use((req: Request, res: Response, next: NextFunction): void => {
@@ -891,31 +862,6 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   registerResponsesRoutes(app, ctx);
   registerMessagesRoutes(app, ctx);
   registerNotFoundRoute(app);
-
-  // Reference retained converter/tool-runtime helpers to preserve original module
-  // wiring (no behavior change; prevents unused-import churn across P3 splits).
-  void [
-    findExternalToolByName,
-    EXTERNAL_TOOL_PREFIX,
-    computeRetryDelay,
-    validateMessagesRequest,
-    extractSystemText,
-    anthropicMessagesToChatMessages,
-    anthropicToolsToChatTools,
-    anthropicToolChoiceToChat,
-    anthropicThinkingToReasoningEffort,
-    mapFinishToStopReason,
-    buildAnthropicMessage,
-    sseEvent,
-    estimateTokens,
-    buildToolExposure,
-    evaluateToolPolicy,
-    validateToolCalls,
-    stripFunctionCallMarkup,
-    parseExternalToolCallsFromText,
-    createToolCallFilter,
-    createExternalToolCallStreamParser,
-  ];
 
   return { app, client };
 }

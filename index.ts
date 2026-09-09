@@ -64,18 +64,28 @@ const defaultConfig = {
   CLEANUP_MAX_AGE_MS: parsePort(process.env['OPENCODE_PROXY_CLEANUP_MAX_AGE_MS'], 86400000),
 };
 
-// Load config from file
-const configPath = path.join(__dirname, 'config.json');
+// Load config from file.
+// NOTE: the lookup covers both layouts because the compiled entry moves:
+//   - dev (`tsx index.ts` / repo root): <root>/config.json
+//   - prod (`node dist/index.js`): <root>/dist/config.json (sibling) and
+//     <root>/config.json (parent) — Docker mounts config at WORKDIR root,
+//     and .dockerignore keeps local dist/ out of the image.
+const configCandidates = [
+  path.join(__dirname, 'config.json'),
+  path.join(__dirname, '..', 'config.json'),
+  path.join(process.cwd(), 'config.json'),
+];
+const configPath = configCandidates.find((p) => fs.existsSync(p));
 let fileConfig: Record<string, unknown> = {};
 
-if (fs.existsSync(configPath)) {
+if (configPath) {
   try {
     const content = fs.readFileSync(configPath, 'utf8');
     fileConfig = JSON.parse(content) as Record<string, unknown>;
-    console.log('[Config] Loaded from config.json');
+    console.log(`[Config] Loaded from ${configPath}`);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error('[Config] Error parsing config.json:', msg);
+    console.error(`[Config] Error parsing ${configPath}:`, msg);
   }
 }
 
