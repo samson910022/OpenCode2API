@@ -1,6 +1,7 @@
 import { TranslatorRegistry } from '../src/converters/registry.js';
 import { registerAllTranslatorPairs } from '../src/converters/init.js';
 import { STREAM_FIDELITY, TOKEN_COUNT_REGISTERED, streamFidelityOf } from '../src/converters/fidelity.js';
+import { targetId } from '../src/converters/json.js';
 import {
     usageToChat,
     usageToInteractions,
@@ -73,6 +74,11 @@ describe('P4 stream matrix has no missing directed edge', () => {
         const msgToChat = createMessagesToChatStreamTranslator('m', 'c2');
         expect(msgToChat({ event: 'content_block_delta', data: { delta: { type: 'text_delta', text: 'yo' } } })[0].choices[0].delta).toEqual({ content: 'yo' });
 
+        const msgToChat2 = createMessagesToChatStreamTranslator('m', 'c2b');
+        msgToChat2({ event: 'message_start', data: { message: { usage: { input_tokens: 11 } } } });
+        const msgDone = msgToChat2({ event: 'message_delta', data: { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2 } } });
+        expect(msgDone[0].usage).toEqual({ prompt_tokens: 11, completion_tokens: 2, total_tokens: 13 });
+
         const respToMsg = createResponsesToMessagesStreamTranslator('m', 'msg_9');
         const e1 = respToMsg({ type: 'response.output_text.delta', delta: 'a' });
         expect(e1[0]).toMatchObject({ event: 'message_start' });
@@ -125,5 +131,16 @@ describe('P4 error wire contracts untouched (registry never sees errors)', () =>
         expect(r.hasRequestTransformer('openai', 'claude')).toBe(true);
         const valid = r.translateRequest('openai', 'claude', 'm', { model: 'm', messages: [{ role: 'user', content: 'hi' }] }, false);
         expect(valid).toMatchObject({ model: 'm' });
+    });
+});
+
+describe('targetId boundaries', () => {
+    test('empty/short/foreign ids regenerate; exact prefix preserved', () => {
+        const gen = () => 'resp_new';
+        expect(targetId('', 'resp_', gen)).toBe('resp_new');
+        expect(targetId('resp_', 'resp_', gen)).toBe('resp_new');
+        expect(targetId('chatcmpl-x', 'resp_', gen)).toBe('resp_new');
+        expect(targetId('resp_keep', 'resp_', gen)).toBe('resp_keep');
+        expect(targetId(42, 'resp_', gen)).toBe('resp_new');
     });
 });

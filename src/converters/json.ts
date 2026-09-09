@@ -25,3 +25,13 @@ export function normalizeArgs(args: unknown): string {
         return '{}';
     }
 }
+
+/**
+ * Keep a response id only when it already carries the target protocol prefix
+ * (clients branch on resp_/chatcmpl-/msg_/intr_); otherwise generate a fresh
+ * one so translated bodies never leak a foreign prefix downstream.
+ */
+export function targetId(id: unknown, prefix: string, generate: () => string): string {
+    if (typeof id === 'string' && id.startsWith(prefix) && id.length > prefix.length) return id;
+    return generate();
+}

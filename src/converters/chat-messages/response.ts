@@ -13,7 +13,7 @@
 
 import { buildAnthropicMessage, mapFinishToStopReason, sanitizeClaudeToolId } from '../anthropic.js';
 import { asRecord } from '../../utils/guards.js';
-import { num, str } from '../json.js';
+import { num, str, targetId } from '../json.js';
 
 function newMessageId(): string {
     try {
@@ -53,7 +53,7 @@ export function convertChatResponseToMessagesNonStream(
             ? rawContent.map((p) => str(asRecord(p)['text'])).filter(Boolean).join('')
             : '';
     return buildAnthropicMessage({
-        messageId: str(root['id']) || newMessageId(),
+        messageId: targetId(root['id'], 'msg_', newMessageId),
         model,
         text: text || undefined,
         reasoning: str(message['reasoning_content']) || undefined,
@@ -96,7 +96,7 @@ export function convertMessagesResponseToChatNonStream(
     const stop = str(root['stop_reason']);
     const finish = stop === 'tool_use' ? 'tool_calls' : stop === 'max_tokens' ? 'length' : 'stop';
     return {
-        id: str(root['id']) || `chatcmpl-${Date.now().toString(36)}`,
+        id: targetId(root['id'], 'chatcmpl-', () => `chatcmpl-${Date.now().toString(36)}`),
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model,
@@ -265,6 +265,7 @@ export function createMessagesToChatStreamTranslator(model: string, completionId
     let done = false;
     const blockOrder = new Map<number, number>();
     let nextToolIndex = 0;
+    let inputTokens = 0;
 
     return (event: unknown): Record<string, unknown>[] => {
         if (done) return [];
@@ -272,6 +273,11 @@ export function createMessagesToChatStreamTranslator(model: string, completionId
         const eventName = str(ev['event']);
         const data = asRecord(ev['data']);
         const created = Math.floor(Date.now() / 1000);
+        if (eventName === 'message_start') {
+            // Anthropic carries input tokens on start (delta only has output).
+            inputTokens = num(asRecord(asRecord(data['message'])['usage'])['input_tokens']);
+            return [];
+        }
         if (eventName === 'content_block_delta') {
             const delta = asRecord(data['delta']);
             const dtype = str(delta['type']);
@@ -313,8 +319,7 @@ export function createMessagesToChatStreamTranslator(model: string, completionId
             const outUsage = asRecord(data['usage']);
             const outputTokens = num(outUsage['output_tokens']);
             const chunk: Record<string, unknown> = { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: finish }] };
-            // Zero-filled usage leg (consistent with usageToChat convention).
-            chunk['usage'] = { prompt_tokens: 0, completion_tokens: outputTokens, total_tokens: outputTokens };
+            chunk['usage'] = { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens };
             return [chunk];
         }
         return [];

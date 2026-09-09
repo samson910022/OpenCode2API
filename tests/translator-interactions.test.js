@@ -111,6 +111,18 @@ describe('P3 interactions stream (route wire: created->step.delta->completed, no
         const fromChat = convertChatRequestToInteractions('m', { messages: [{ role: 'tool', tool_call_id: 'c1', content: 'res' }] }, false);
         expect(fromChat.input).toEqual([{ role: 'tool', content: 'res' }]);
     });
+
+    test('interactions tool role folds to chat user (tool_call_id unavailable)', () => {
+        const toChat = convertInteractionsRequestToChat('m', { input: [{ role: 'tool', content: 'res' }] }, false);
+        expect(toChat.messages).toEqual([{ role: 'user', content: 'res' }]);
+    });
+
+    test('messages thinking blocks never leak into interaction output', () => {
+        const out = convertMessagesResponseToInteractionsNonStream('m', {}, {}, {
+            content: [{ type: 'thinking', thinking: 'secret' }, { type: 'text', text: 'hi' }],
+        });
+        expect(out.output_text).toBe('hi');
+    });
 });
 
 describe('P3 registry wiring', () => {

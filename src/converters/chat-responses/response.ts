@@ -11,7 +11,7 @@
  */
 
 import { asRecord } from '../../utils/guards.js';
-import { num, str } from '../json.js';
+import { num, str, targetId } from '../json.js';
 import { usageToChat } from '../usage.js';
 
 function newResponseId(): string {
@@ -70,7 +70,7 @@ export function convertChatResponseToResponsesNonStream(
     else if (finish === 'content_filter') incomplete = { reason: 'content_filter' };
 
     return {
-        id: str(root['id']) || newResponseId(),
+        id: targetId(root['id'], 'resp_', newResponseId),
         object: 'response',
         created_at: Math.floor(Date.now() / 1000),
         model,
@@ -118,7 +118,7 @@ export function convertResponsesResponseToChatNonStream(
     const usage = asRecord(root['usage']);
     const finish = toolCalls.length ? 'tool_calls' : 'stop';
     return {
-        id: str(root['id']) || `chatcmpl-${Date.now().toString(36)}`,
+        id: targetId(root['id'], 'chatcmpl-', () => `chatcmpl-${Date.now().toString(36)}`),
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model,
@@ -219,7 +219,7 @@ export function createChatToResponsesStreamTranslator(model: string, responseId?
                     key = indexKey.get(idx) ?? `${idx}:call_${idx}`;
                     indexKey.set(idx, key);
                 }
-                const callId = key.split(':')[1] ?? key;
+                const callId = key.slice(key.indexOf(':') + 1);
                 if (!funcAdded.has(key)) {
                     funcAdded.add(key);
                     funcArgs.set(key, '');
@@ -251,7 +251,7 @@ export function createChatToResponsesStreamTranslator(model: string, responseId?
             for (const key of funcAdded) {
                 if (!funcDone.has(key)) {
                     funcDone.add(key);
-                    const callId = key.split(':')[1] ?? key;
+                    const callId = key.slice(key.indexOf(':') + 1);
                     const outIx = funcOutIx.get(key) ?? 0;
                     events.push({ type: 'response.function_call_arguments.done', sequence_number: seq++, item_id: callId, output_index: outIx, arguments: funcArgs.get(key) ?? '' });
                     events.push({ type: 'response.output_item.done', sequence_number: seq++, output_index: outIx, item: { type: 'function_call', id: callId, call_id: callId, name: funcNameOf.get(key) ?? '', arguments: funcArgs.get(key) ?? '' } });
@@ -290,14 +290,18 @@ export function createChatToResponsesStreamTranslator(model: string, responseId?
  * Stateful responses-events -> chat-chunks translator (one instance per stream).
  * Text-core inverse of createChatToResponsesStreamTranslator: output_text
  * deltas become content deltas, function_call_arguments deltas become
- * tool_calls[0] fragments, response.completed becomes the terminal finish
- * chunk (late usage mapped via usageToChat).
- * TODO(P4+): multi-tool index allocation + custom_tool_call branches.
+ * tool_calls fragments (index = call order), response.completed becomes the
+ * terminal finish chunk (late usage mapped via usageToChat).
+ * Tool names ride response.output_item.added items and are attached to
+ * fragments by item_id (mirrors the forward late-name buffering).
+ * TODO(P4+): custom_tool_call branches.
  */
 export function createResponsesToChatStreamTranslator(model: string, completionId?: string) {
     const id = completionId || `chatcmpl-${Date.now().toString(36)}`;
     let done = false;
     let sawTools = false;
+    const nameOf = new Map<string, string>();
+    const indexOf = new Map<string, number>();
 
     return (event: unknown): Record<string, unknown>[] => {
         if (done) return [];
@@ -308,14 +312,28 @@ export function createResponsesToChatStreamTranslator(model: string, completionI
             if (!delta) return [];
             return [{ id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] }];
         }
+        if (type === 'response.output_item.added') {
+            const item = asRecord(ev['item']);
+            if (str(item['type']) === 'function_call') {
+                const callId = str(item['call_id'] ?? item['id']);
+                if (callId && !indexOf.has(callId)) {
+                    indexOf.set(callId, indexOf.size);
+                    nameOf.set(callId, str(item['name']));
+                }
+            }
+            return [];
+        }
         if (type === 'response.function_call_arguments.delta') {
             sawTools = true;
             const frag = str(ev['delta']);
             const itemId = str(ev['item_id']);
             if (!frag) return [];
+            if (itemId && !indexOf.has(itemId)) indexOf.set(itemId, indexOf.size);
+            const toolIx = itemId ? (indexOf.get(itemId) ?? 0) : 0;
+            const name = itemId ? (nameOf.get(itemId) ?? '') : '';
             return [{
                 id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model,
-                choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: itemId || undefined, type: 'function', function: { arguments: frag } }] }, finish_reason: null }],
+                choices: [{ index: 0, delta: { tool_calls: [{ index: toolIx, id: itemId || undefined, type: 'function', function: { ...(name ? { name } : {}), arguments: frag } }] }, finish_reason: null }],
             }];
         }
         if (type === 'response.completed') {

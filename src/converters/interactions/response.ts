@@ -24,7 +24,7 @@
  */
 
 import { asRecord } from '../../utils/guards.js';
-import { str } from '../json.js';
+import { str, targetId } from '../json.js';
 
 function newInteractionId(): string {
     try {
@@ -57,7 +57,7 @@ export function convertChatResponseToInteractionsNonStream(
     body: unknown,
 ): unknown {
     return {
-        id: newInteractionId(),
+        id: targetId(asRecord(body)['id'], 'intr_', newInteractionId),
         status: 'completed',
         model,
         output_text: chatTextOf(body),
@@ -75,7 +75,7 @@ export function convertInteractionsResponseToChatNonStream(
 ): unknown {
     const root = asRecord(body);
     return {
-        id: `chatcmpl-${Date.now().toString(36)}`,
+        id: targetId(root['id'], 'chatcmpl-', () => `chatcmpl-${Date.now().toString(36)}`),
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model,
@@ -106,7 +106,7 @@ export function convertResponsesResponseToInteractionsNonStream(
     body: unknown,
 ): unknown {
     return {
-        id: newInteractionId(),
+        id: targetId(asRecord(body)['id'], 'intr_', newInteractionId),
         status: 'completed',
         model,
         output_text: responsesTextOf(body),
@@ -125,7 +125,7 @@ export function convertInteractionsResponseToResponsesNonStream(
     const root = asRecord(body);
     const text = str(root['output_text']);
     return {
-        id: `resp_${Date.now().toString(36)}`,
+        id: targetId(root['id'], 'resp_', () => `resp_${Date.now().toString(36)}`),
         object: 'response',
         created_at: Math.floor(Date.now() / 1000),
         model,
@@ -138,10 +138,13 @@ export function convertInteractionsResponseToResponsesNonStream(
 function messagesTextOf(body: unknown): string {
     const root = asRecord(body);
     const content = Array.isArray(root['content']) ? (root['content'] as unknown[]) : [];
+    // Text-only contract: thinking blocks are reasoning traces, never
+    // user-visible output — drop them instead of concatenating.
     return content
         .map((c) => {
             const b = asRecord(c);
-            return str(b['text'] ?? b['thinking']);
+            if (str(b['type']) !== 'text') return '';
+            return str(b['text']);
         })
         .filter(Boolean)
         .join('');
@@ -155,7 +158,7 @@ export function convertMessagesResponseToInteractionsNonStream(
     body: unknown,
 ): unknown {
     return {
-        id: newInteractionId(),
+        id: targetId(asRecord(body)['id'], 'intr_', newInteractionId),
         status: 'completed',
         model,
         output_text: messagesTextOf(body),
@@ -174,7 +177,7 @@ export function convertInteractionsResponseToMessagesNonStream(
     const root = asRecord(body);
     const text = str(root['output_text']);
     return {
-        id: `msg_${Date.now().toString(36)}`,
+        id: targetId(root['id'], 'msg_', () => `msg_${Date.now().toString(36)}`),
         type: 'message',
         role: 'assistant',
         model,

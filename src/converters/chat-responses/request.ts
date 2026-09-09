@@ -68,6 +68,8 @@ function responsesToolToChatTool(tool: unknown): Record<string, unknown> | null 
     const t = asRecord(tool);
     const type = str(t['type']);
     if (type === 'function') {
+        // Drop unnamed declarations: downstream validators reject empty names.
+        if (!str(t['name'])) return null;
         return {
             type: 'function',
             function: {
@@ -80,10 +82,17 @@ function responsesToolToChatTool(tool: unknown): Record<string, unknown> | null 
     if (type === 'custom') {
         // Codex freeform custom tools ride as function tools with a wrapped
         // {"input": string} schema; see Go mergeResponsesRequestChatTools.
+        // `custom` may be a name string or a descriptor object. Unlike
+        // function tools (dropped when unnamed — validators reject empty
+        // names), custom tools always fall back to 'custom_tool' because the
+        // shape itself implies a callable.
+        const custom = t['custom'];
+        const customName = typeof custom === 'object' && custom !== null ? str(asRecord(custom)['name']) : str(custom);
+        const name = str(t['name']) || customName || 'custom_tool';
         return {
             type: 'function',
             function: {
-                name: str(t['name'] ?? t['custom'] ?? 'custom_tool'),
+                name,
                 description: str(t['description'] ?? ''),
                 parameters: { type: 'object', properties: { input: { type: 'string' } } },
             },
@@ -97,6 +106,7 @@ function chatToolToResponsesTool(tool: unknown): Record<string, unknown> | null 
     const t = asRecord(tool);
     if (str(t['type']) !== 'function') return null;
     const fn = asRecord(t['function']);
+    if (!str(fn['name'])) return null;
     return {
         type: 'function',
         name: str(fn['name']),

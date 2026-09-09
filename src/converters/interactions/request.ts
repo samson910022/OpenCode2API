@@ -121,7 +121,10 @@ export function convertInteractionsRequestToChat(model: string, body: unknown, s
     const instructions = interactionsInstructionsOf(root);
     if (instructions) messages.push({ role: 'system', content: instructions });
     for (const item of normalizeInput(root['input'])) {
-        messages.push({ role: item.role || 'user', content: item.content });
+        // OpenAI chat tool messages require tool_call_id, which interactions
+        // inputs never carry: fold them to user (matches
+        // convertInteractionsRequestToMessages).
+        messages.push({ role: item.role === 'tool' ? 'user' : item.role || 'user', content: item.content });
     }
     out['messages'] = messages;
     return out;

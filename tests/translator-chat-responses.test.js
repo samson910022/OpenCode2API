@@ -8,6 +8,7 @@ import {
     convertChatResponseToResponsesNonStream,
     convertResponsesResponseToChatNonStream,
     createChatToResponsesStreamTranslator,
+    createResponsesToChatStreamTranslator,
 } from '../src/converters/chat-responses/response.js';
 
 function freshRegistry() {
@@ -155,6 +156,49 @@ describe('P1 chat-stream -> responses-events (Go response.go state machine core)
             messages: [{ role: 'system', content: [{ type: 'text', text: 'sys-arr' }] }],
         }, false);
         expect(out.instructions).toBe('sys-arr');
+    });
+
+    test('reverse tool stream carries names from output_item.added', () => {
+        const next = createResponsesToChatStreamTranslator('m', 'c_rev');
+        expect(next({ type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_1', name: 'get_time' } })).toEqual([]);
+        const chunks = next({ type: 'response.function_call_arguments.delta', item_id: 'call_1', delta: '{"a":1}' });
+        expect(chunks[0].choices[0].delta.tool_calls[0]).toMatchObject({ id: 'call_1', function: { name: 'get_time', arguments: '{"a":1}' } });
+    });
+
+    test('reverse tool stream omits name key when added never arrived', () => {
+        const next = createResponsesToChatStreamTranslator('m', 'c_rev2');
+        const chunks = next({ type: 'response.function_call_arguments.delta', item_id: 'call_9', delta: '{}' });
+        expect(chunks[0].choices[0].delta.tool_calls[0].function).toEqual({ arguments: '{}' });
+    });
+
+    test('colon-bearing call ids survive forward translation', () => {
+        const next = createChatToResponsesStreamTranslator('m', 'resp_colon');
+        next({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call:1:2', function: { name: 'f', arguments: '{}' } }] } }] });
+        const done = next({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] });
+        const itemDone = done.find((e) => e.type === 'response.output_item.done' && e.item?.type === 'function_call');
+        expect(itemDone.item.call_id).toBe('call:1:2');
+    });
+
+    test('cross-protocol ids are regenerated with target prefix', () => {
+        const toResp = convertChatResponseToResponsesNonStream('m', {}, {}, {
+            id: 'chatcmpl-foreign',
+            choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }],
+            usage: {},
+        });
+        expect(toResp.id).toMatch(/^resp_/);
+        const toChat = convertResponsesResponseToChatNonStream('m', {}, {}, { id: 'resp_foreign', output: [], usage: {} });
+        expect(toChat.id).toMatch(/^chatcmpl-/);
+    });
+
+    test('custom object shapes resolve names; unnamed function tools dropped', () => {
+        const out = convertResponsesRequestToChat('m', {
+            tools: [
+                { type: 'custom', custom: { name: 'exec' } },
+                { type: 'function', description: 'nameless' },
+            ],
+            input: 'hi',
+        }, false);
+        expect(out.tools).toEqual([expect.objectContaining({ function: expect.objectContaining({ name: 'exec' }) })]);
     });
 });
 

@@ -8,7 +8,7 @@
  */
 
 import { asRecord } from '../../utils/guards.js';
-import { num, str } from '../json.js';
+import { num, str, targetId } from '../json.js';
 
 function newId(prefix: string): string {
     try {
@@ -55,7 +55,7 @@ export function convertResponsesResponseToMessagesNonStream(
     }
     const usage = asRecord(root['usage']);
     return {
-        id: str(root['id']) || newId('msg_'),
+        id: targetId(root['id'], 'msg_', () => newId('msg_')),
         type: 'message',
         role: 'assistant',
         model,
@@ -91,7 +91,7 @@ export function convertMessagesResponseToResponsesNonStream(
     }
     const usage = asRecord(root['usage']);
     return {
-        id: str(root['id']) || newId('resp_'),
+        id: targetId(root['id'], 'resp_', () => newId('resp_')),
         object: 'response',
         created_at: Math.floor(Date.now() / 1000),
         model,

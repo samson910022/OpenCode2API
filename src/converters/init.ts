@@ -4,6 +4,12 @@
  * Mirrors CLIProxyAPI `internal/translator/init.go` (blank imports triggering
  * per-pair `init()`). Here registration is explicit (no side-effect imports)
  * so Jest ESM ordering stays deterministic.
+ *
+ * NOTE: production routes do not consume the registry yet — it is exercised
+ * by tests only, so behavior today is unchanged. When wiring routes, the
+ * caller MUST invoke registerAllTranslatorPairs (or the per-pair register
+ * functions) first: an unregistered direction silently falls back to
+ * passthrough-with-model-normalization, never to an error.
  */
 
 import type { TranslatorRegistry } from './registry.js';
