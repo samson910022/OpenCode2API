@@ -327,6 +327,50 @@ class TestScanAndRunner(unittest.TestCase):
         self.assertEqual(fingerprint("slug", "a/b.ts"), fingerprint("slug", "a/b.ts"))
         self.assertTrue(fingerprint("slug", "a/b.ts").startswith("opencode2api-scan:"))
 
+    def test_secret_patterns_require_quotes(self):
+        import re
+        from repo_scan import SECRET_PATTERNS
+        by_rule = {rule: pattern for pattern, rule in SECRET_PATTERNS}
+        # Real pasted secrets (quoted) still match.
+        self.assertTrue(re.search(by_rule["possible-api-key"], 'api_key = "sk-live-abc123"'))
+        self.assertTrue(re.search(by_rule["possible-password"], "password: 'hunter2-hunter2'"))
+        self.assertTrue(re.search(by_rule["private-key-material"],
+                                  "-----BEGIN PRIVATE KEY-----"))
+        # Bare code and unquoted env lines are noise, not findings.
+        self.assertFalse(re.search(
+            by_rule["possible-api-key"], 'self.api_key = default_pdata.get("apikey", "")'))
+        self.assertFalse(re.search(
+            by_rule["possible-api-key"], "API_KEY= OPENCODE_PROXY_MANAGE_BACKEND=true"))
+        self.assertFalse(re.search(
+            by_rule["possible-password"], "password = get_password()"))
+
+    def test_low_risk_path_downgrade(self):
+        from repo_scan import is_low_risk_path
+        self.assertTrue(is_low_risk_path("tests/auth-multikey.test.js"))
+        self.assertTrue(is_low_risk_path("docs/docker.md"))
+        self.assertTrue(is_low_risk_path(".github/workflows/ai-review.yml"))
+        self.assertFalse(is_low_risk_path("src/proxy.ts"))
+        self.assertFalse(is_low_risk_path("github_bot/src/llm_client.py"))
+
+    def test_prior_dry_run_fps_resolved(self):
+        # The three dry-run false positives from the first live scan:
+        # bare-code hit, unquoted yml env hit gone; quoted fixture hit is nit.
+        from repo_scan import collect_findings, is_low_risk_path
+        by_loc = {}
+        for item in collect_findings():
+            by_loc.setdefault(item["location"].split(":")[0], []).append(item)
+        llm_hits = [i for i in by_loc.get("github_bot/src/llm_client.py", [])
+                    if "possible-api-key" in i["fingerprint"]]
+        self.assertEqual(llm_hits, [])
+        yml_hits = [i for i in by_loc.get(".github/workflows/ai-review.yml", [])
+                    if "possible-api-key" in i["fingerprint"]]
+        self.assertEqual(yml_hits, [])
+        for path, items in by_loc.items():
+            for item in items:
+                slug = item["fingerprint"].split(":")[1]
+                if slug in ("possible-api-key", "possible-password") and is_low_risk_path(path):
+                    self.assertEqual(item["severity"], "nit", item["location"])
+
     def test_comment_modes(self):
         self.assertEqual(github_runner._resolve_comment_mode("/review please"), "review")
         self.assertEqual(github_runner._resolve_comment_mode("/fix this"), "fix-plan")

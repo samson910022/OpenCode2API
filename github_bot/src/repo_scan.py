@@ -19,10 +19,25 @@ PREFIX = "opencode2api-scan:"
 
 SECRET_PATTERNS = [
     (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "private-key-material"),
-    (r"(?i)(api[_-]?key|apikey)\s*[:=]\s*['\"]?[A-Za-z0-9._~+/-]{8,}", "possible-api-key"),
-    (r"(?i)(password|passwd)\s*[:=]\s*['\"]?[^'\"\s]+", "possible-password"),
+    # Quoted assignments only. Bare code (`self.api_key = lookup(...)`) and
+    # unquoted env lines (`API_KEY= SOME_VAR`) are noise; pasted secrets are
+    # almost always quoted. Committed `.env` files are caught separately by
+    # is_forbidden_tracked, so recall on real leaks is preserved.
+    (r"(?i)(api[_-]?key|apikey)\s*[:=]\s*['\"][^'\"]{3,}['\"]", "possible-api-key"),
+    (r"(?i)(password|passwd)\s*[:=]\s*['\"][^'\"]{3,}['\"]", "possible-password"),
 ]
 SEVERITY_RANK = {"blocking": 0, "should-fix": 1, "nit": 2}
+
+# Secret-pattern hits under these paths are overwhelmingly fixtures/docs, not
+# leaks. Downgraded to nit so real findings sort first; fingerprints stay
+# stable so reruns still dedupe.
+LOW_RISK_DIRS = ("tests/", "docs/")
+LOW_RISK_SUFFIXES = (".yml", ".yaml", ".md")
+
+
+def is_low_risk_path(rel: str) -> bool:
+    """True for fixture/doc/config paths where quoted hits are usually noise."""
+    return rel.startswith(LOW_RISK_DIRS) or rel.endswith(LOW_RISK_SUFFIXES)
 
 # Exact tracked paths that must never be committed (values, not templates).
 # Note: `.env.example` is an intentionally tracked template and must NOT match.
@@ -105,10 +120,12 @@ def scan_worktree(max_files: int = 400) -> list[dict[str, str]]:
         # One finding per (rule, file): fingerprints differ by slug so coexisting
         # rules on the same file each get their own stable id.
         reported_rules: set[str] = set()
+        low_risk = is_low_risk_path(rel)
         for i, line in enumerate(text.splitlines(), 1):
             for pattern, rule in SECRET_PATTERNS:
                 if rule not in reported_rules and re.search(pattern, line):
-                    findings.append(_finding(rule, rel, "blocking", "[REDACTED line]", i))
+                    severity = "nit" if low_risk else "blocking"
+                    findings.append(_finding(rule, rel, severity, "[REDACTED line]", i))
                     reported_rules.add(rule)
     findings.sort(key=lambda d: (SEVERITY_RANK.get(d["severity"], 9), d["fingerprint"]))
     return findings
