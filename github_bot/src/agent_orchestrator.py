@@ -419,7 +419,7 @@ class AgentOrchestrator:
         # the outcome; unparseable outputs degrade to COMMENT.
         verdict = "APPROVE"
         for text in results.values():
-            m = re.search(r"(?m)^\s*\*{0,2}\s*VERDICT\s*:\s*(APPROVE|NEEDS_CHANGES|COMMENT)\b",
+            m = re.search(r"(?m)^\s*\*{0,3}\s*VERDICT\s*:\s*(APPROVE|NEEDS_CHANGES|COMMENT)\b",
                           text.upper())
             parsed = m.group(1) if m else "COMMENT"
             if parsed == "NEEDS_CHANGES":

@@ -14,6 +14,7 @@ sys.path.insert(0, str(BOT_DIR / "src"))
 
 from agent_orchestrator import (  # noqa: E402
     AgentOrchestrator,
+    ReviewContext,
     is_triage_report_publishable,
     scrub_internal_names,
     validate_triage_report,
@@ -284,8 +285,7 @@ class TestOrchestrator(unittest.TestCase):
         orch = AgentOrchestrator.__new__(AgentOrchestrator)
         orch.config = load_json(BOT_DIR / "config" / "bot_config.json")
         ctx = AgentOrchestrator.__new__(AgentOrchestrator)
-        import agent_orchestrator as ao
-        review_ctx = ao.ReviewContext(title="t", body="b")
+        review_ctx = ReviewContext(title="t", body="b")
         # Prose mention of NEEDS_CHANGES must not flip an APPROVE verdict.
         orch._run_role = lambda role, prompt, **kw: (
             "VERDICT: APPROVE\nAll good, no NEEDS_CHANGES here.", {"response_id": "r1"})
@@ -308,14 +308,18 @@ class TestOrchestrator(unittest.TestCase):
 
     def test_verdict_aggregation_bold_markdown(self):
         # Live models wrap the verdict in bold: **VERDICT: APPROVE**.
+        # Bold-italic (***) is tolerated too.
         orch = AgentOrchestrator.__new__(AgentOrchestrator)
         orch.config = load_json(BOT_DIR / "config" / "bot_config.json")
-        import agent_orchestrator as ao
-        review_ctx = ao.ReviewContext(title="t", body="b")
+        review_ctx = ReviewContext(title="t", body="b")
         orch._run_role = lambda role, prompt, **kw: (
             "**VERDICT: APPROVE**\n\nAll good.", {"response_id": "r1"})
         report = AgentOrchestrator.run_multi_agent_review(orch, review_ctx)
         self.assertIn("FINAL_VERDICT: APPROVE", report)
+        orch._run_role = lambda role, prompt, **kw: (
+            "***VERDICT: APPROVE***\n\nAll good.", {"response_id": "r2"})
+        report2 = AgentOrchestrator.run_multi_agent_review(orch, review_ctx)
+        self.assertIn("FINAL_VERDICT: APPROVE", report2)
 
 
 class TestScanAndRunner(unittest.TestCase):
