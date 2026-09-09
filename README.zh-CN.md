@@ -10,7 +10,7 @@
 >
 > 📖 [文档](./docs/README.zh-CN.md)（[English index](./docs/README.md)） | 🚀 [快速开始](#-快速开始) | 🐛 [Issues](https://github.com/samson910022/OpenCode2API/issues)
 
-将本地 [OpenCode](https://opencode.ai) 运行时转换为 OpenAI 与 Anthropic 兼容 API 网关。在任何 OpenAI 或 Anthropic 客户端中使用免费模型（GLM、Kimi、MiniMax、Muse Spark、Nemotron、Qwen 等）——免费阵容会轮换，以 `/v1/models` 实时列表为准。
+将本地 [OpenCode](https://opencode.ai) 运行时转换为 OpenAI 与 Anthropic 兼容 API 网关。在任何 OpenAI 或 Anthropic 客户端中使用免费模型（Big Pickle、Ling、MiMo、Muse Spark、Nemotron）——免费阵容会轮换，以 `/v1/models` 实时列表为准。
 
 ---
 

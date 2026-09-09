@@ -1,7 +1,7 @@
 {
   "name": "opencode2api",
   "version": "1.6.0",
-  "description": "An OpenAI- and Anthropic-compatible API gateway for the OpenCode CLI, enabling the use of free models (GLM, Kimi, MiniMax, Nemotron, Qwen and more) in standard AI clients.",
+  "description": "An OpenAI- and Anthropic-compatible API gateway for the OpenCode CLI, enabling the use of free models (Big Pickle, Ling, MiMo, Muse Spark, Nemotron) in standard AI clients.",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
