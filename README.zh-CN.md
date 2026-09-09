@@ -24,7 +24,7 @@
 | 🌐 **服务端联网搜索** | `/v1/responses` 的 `tools: [{type: "web_search"}]` 驱动 opencode websearch，返回 `web_search_call` + 诚实 `url_citation` |
 | 🔑 **多 Key 认证** | `API_KEY` 与 `OPENCODE_API_KEYS` / `API_KEYS` 合并；`Bearer` 或 `x-api-key` 任一通过；为空回退免认证 |
 | 🔀 **免费限流 fallback 代理** | 默认直连，仅 429 免费限流错误时启用 `OPENCODE_UPSTREAM_PROXIES`（`failover-rr`、cooldown、回环 bypass） |
-| 📡 **流式输出** | Chat Completions、Responses 与 Messages API 的完整 SSE 流式支持 |
+| 📡 **流式输出** | Chat Completions、Responses、Messages 与 Interactions API 的完整 SSE 流式支持 |
 | 🧠 **推理控制** | 支持 `reasoning_effort` 和 `reasoning: { "effort": "high" }` |
 | 🐳 **Docker 部署** | 一键部署，自动启动 OpenCode 后端 |
 | 🛡️ **工具安全** | 默认禁用工具调用 |

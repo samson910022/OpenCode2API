@@ -24,7 +24,7 @@ Turn a local [OpenCode](https://opencode.ai) runtime into an OpenAI-, Anthropic-
 | 🌐 **Server-side web search** | `/v1/responses` `tools: [{type: "web_search"}]` drives opencode websearch, returns `web_search_call` + honest `url_citation` |
 | 🔑 **Multi-key auth** | `API_KEY` + `OPENCODE_API_KEYS` / `API_KEYS` merge; `Bearer` or `x-api-key`, any match passes; empty means no auth |
 | 🔀 **Free-limit fallback proxy** | Direct-only until a 429 free-limit error engages `OPENCODE_UPSTREAM_PROXIES` (`failover-rr`, cooldown, loopback bypass) |
-| 📡 **Streaming** | Full SSE streaming for Chat Completions, Responses, and Messages APIs |
+| 📡 **Streaming** | Full SSE streaming for Chat Completions, Responses, Messages, and Interactions APIs |
 | 🧠 **Reasoning control** | Supports `reasoning_effort` and `reasoning: { "effort": "high" }` |
 | 🐳 **Docker deploy** | One-command deploy, auto-starts the OpenCode backend |
 | 🛡️ **Tool safety** | Tool calling disabled by default |

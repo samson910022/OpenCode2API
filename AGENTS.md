@@ -31,7 +31,7 @@
 index.ts                 # prod bootstrap + config merge (300 lines)
 src/proxy.ts             # createApp/startProxy (894 lines; god file, see §9)
 src/config/proxy-config.ts # buildProxyConfig, normalizeBool, resolveDisableTools
-src/routes/              # chat.ts (872) / responses.ts (938) / messages.ts (563) / interactions.ts (439) / system.ts
+src/routes/              # chat.ts (953) / responses.ts (1144) / messages.ts (635) / interactions.ts (439) / system.ts
 src/tool-runtime/        # contracts / registry / router / parser (945) / validator / policy
 src/backend/manager.ts   # backend lifecycle + request lock/queue
 src/stream/collector.ts  # prompt/poll/collect SSE pipeline
@@ -108,7 +108,7 @@ config.json.example / .env.example   # examples only, never real secrets
 
 ## 9. Architecture notes (maintainability / extensibility)
 
-- `src/proxy.ts:createApp` is a god closure (~800 lines) assembling `AppContext` (50+ fields, `src/types/context.ts`); the four routes (`chat`/`responses`/`messages`/`interactions`, ~2800 lines combined) duplicate the preflight → stream/non-stream → retry → usage/cleanup template. Prefer **pure moves + thin wrappers** over behavior changes.
+- `src/proxy.ts:createApp` is a god closure (~800 lines) assembling `AppContext` (50+ fields, `src/types/context.ts`); the four routes (`chat`/`responses`/`messages`/`interactions`, ~3200 lines combined) duplicate the preflight → stream/non-stream → retry → usage/cleanup template. Prefer **pure moves + thin wrappers** over behavior changes.
 - Shared unknown-guards (`asRecord`, `toErrorMessage`) live in `src/utils/guards.ts` — import from there, do not add new copies. Exception: `src/routes/system.ts` and `src/stream/collector.ts` keep their own narrower `toErrorMessage` variant (see `guards.ts` header); do not "unify" it.
 - Pure layers to preserve: `src/retry/policy.ts`, `src/converters/anthropic.ts`, `src/errors/upstream.ts` (no Express/SDK deps). Route error exits must keep their wire shapes: chat non-stream JSON, responses-stream `response.failed` SSE + `[DONE]`, messages-stream `error` event without `[DONE]`, interactions-stream `interaction.completed` / `error` event without `[DONE]`.
 - High-risk no-touch list without explicit approval + regression tests: timeout/retry constants, `transformUpstreamError` mappings, `isTransientUpstreamError` matchers, parser ambiguity policy, prompt guard text/order, model alias rules, policy evaluation order, backend spawn/jail/HOME isolation, collector `finish==='tool'`/idle-exemption logic, bool-fallthrough semantics.
