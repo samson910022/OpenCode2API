@@ -40,12 +40,11 @@ import type {
 } from './types/context.js';
 import type { ProxyClient, ProviderInfo, ModelInfo, ResolvedModel } from './types/client.js';
 import type { ResponseStateEntry } from './types/backend.js';
+import { asRecord, toErrorMessage } from './utils/guards.js';
 
 // P4: thin re-exports to preserve original import paths
 // (tests/env-alias.test.js, stream-hardening.test.js import these from '../src/proxy.js').
 export { normalizeBool, resolveDisableTools, withTimeout };
-
-import { asRecord, toErrorMessage } from './utils/guards.js';
 
 export function createApp(config: ProxyConfig): CreateAppResult {
   const {
