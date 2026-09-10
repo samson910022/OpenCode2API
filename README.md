@@ -23,7 +23,7 @@ Turn a local [OpenCode](https://opencode.ai) runtime into an OpenAI-, Anthropic-
 | 🔁 **Gemini compatible (thin)** | `POST /v1beta/interactions` (alias `POST /v1/interactions`) |
 | 🌐 **Server-side web search** | `web_search` with `web_search_call` + `url_citation` |
 | 🔑 **Multi-key auth** | `API_KEY` + `OPENCODE_API_KEYS` merge; `Bearer` or `x-api-key`; empty skips auth |
-| 🔀 **Fallback proxy** | 429-only `OPENCODE_UPSTREAM_PROXIES` rotation |
+| 🔀 **Fallback proxy** | free-limit 429-only `OPENCODE_UPSTREAM_PROXIES` rotation |
 | 📡 **Streaming** | SSE for Chat, Responses, Messages, Interactions |
 | 🧠 **Reasoning control** | `reasoning_effort` / `reasoning: {"effort": "high"}` |
 | 🐳 **Docker deploy** | One-command with auto backend |
@@ -71,7 +71,7 @@ npm run build
 npm start
 ```
 
-> 📖 Full guide: [Docker Deployment](./docs/docker.md)
+> 📖 Full guide: [Development](./docs/development.md) · 🚀 [Getting Started](./docs/getting-started.md)
 
 ---
 
@@ -113,7 +113,7 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
 - Base: `API_KEY`, `OPENCODE_SERVER_PASSWORD`, `OPENCODE_SERVER_URL`, `OPENCODE_PROXY_PORT` (`PORT`).
 - Tool safety: `DISABLE_TOOLS=true` default; external `tools` bridged/isolated, built-ins disabled unless allowlisted.
 - Observability: `/health/details` and `/metrics` with configurable exposure/auth.
-- Timeout & retry: `OPENCODE_PROXY_REQUEST_TIMEOUT_MS`, `OPENCODE_PROXY_RETRY_MAX_RETRIES`; `OPENCODE_UPSTREAM_PROXIES` only on 429.
+- Timeout & retry: `OPENCODE_PROXY_REQUEST_TIMEOUT_MS`, `OPENCODE_PROXY_RETRY_MAX_RETRIES`; `OPENCODE_UPSTREAM_PROXIES` only on free-limit 429.
 
 > 📄 Full reference: [Configuration](./docs/configuration.md)
 
@@ -147,7 +147,7 @@ Formats: `opencode/big-pickle`, `gpt5-nano` (auto-resolved) and `opencode/gpt5-n
 
 ## 🔧 Troubleshooting
 
-Hangs: try `OPENCODE_USE_ISOLATED_HOME=false`. Missing model: check `/v1/models`. No reasoning: use Responses API with `stream: true`.
+Hangs: try `OPENCODE_USE_ISOLATED_HOME=false`. Missing model: check `/v1/models`. No reasoning: use Responses API with `stream: true` + `reasoning.effort`.
 
 > 📖 Full guide: [Troubleshooting](./docs/troubleshooting.md)
 

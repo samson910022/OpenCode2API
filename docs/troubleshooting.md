@@ -157,4 +157,5 @@ OPENCODE_PROXY_DEBUG=true
 ## 🆘 获取帮助
 
 - 🐛 [GitHub Issues](https://github.com/samson910022/OpenCode2API/issues)
-- 📖 [Docs Index](./README.md) | 🏠 [Main README](../README.md)
+
+> 📖 [Docs Index](./README.md) | 🏠 [Main README](../README.md)

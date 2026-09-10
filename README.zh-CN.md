@@ -23,7 +23,7 @@
 | 🔁 **Gemini 兼容（薄层）** | `POST /v1beta/interactions`（别名 `POST /v1/interactions`） |
 | 🌐 **服务端联网搜索** | `web_search`，返回 `web_search_call` + `url_citation` |
 | 🔑 **多 Key 认证** | `API_KEY` 与 `OPENCODE_API_KEYS` 合并；`Bearer` 或 `x-api-key`；为空免认证 |
-| 🔀 **免费限流 fallback 代理** | 仅 429 时轮换 `OPENCODE_UPSTREAM_PROXIES` |
+| 🔀 **免费限流 fallback 代理** | 仅免费限流 429 时轮换 `OPENCODE_UPSTREAM_PROXIES` |
 | 📡 **流式输出** | Chat、Responses、Messages、Interactions 全支持 SSE |
 | 🧠 **推理控制** | `reasoning_effort` / `reasoning: {"effort": "high"}` |
 | 🐳 **Docker 部署** | 一键部署，自动启动后端 |
@@ -71,7 +71,7 @@ npm run build
 npm start
 ```
 
-> 📖 完整指南：[Docker 部署](./docs/docker.md)
+> 📖 完整指南：[开发指南](./docs/development.md) · 🚀 [快速开始](./docs/getting-started.md)
 
 ---
 
@@ -113,7 +113,7 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
 - 基础：`API_KEY`、`OPENCODE_SERVER_PASSWORD`、`OPENCODE_SERVER_URL`、`OPENCODE_PROXY_PORT`（`PORT`）。
 - 工具安全：默认 `DISABLE_TOOLS=true`；外部 `tools` 经桥接隔离，内置工具默认禁用，按需 allowlist 放行。
 - 可观测性：`/health/details` 与 `/metrics` 均可配置开关与鉴权。
-- 超时与重试：`OPENCODE_PROXY_REQUEST_TIMEOUT_MS`、`OPENCODE_PROXY_RETRY_MAX_RETRIES`；仅 429 时启用 `OPENCODE_UPSTREAM_PROXIES`。
+- 超时与重试：`OPENCODE_PROXY_REQUEST_TIMEOUT_MS`、`OPENCODE_PROXY_RETRY_MAX_RETRIES`；仅免费限流 429 时启用 `OPENCODE_UPSTREAM_PROXIES`。
 
 > 📄 完整配置参考：[配置详解](./docs/configuration.md)
 
@@ -147,7 +147,7 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
 
 ## 🔧 故障排查
 
-卡住：试 `OPENCODE_USE_ISOLATED_HOME=false`。模型缺失：检查 `/v1/models`。无推理：用 `stream: true` 的 Responses API。
+卡住：试 `OPENCODE_USE_ISOLATED_HOME=false`。模型缺失：检查 `/v1/models`。无推理：用 `stream: true` + `reasoning.effort` 的 Responses API。
 
 > 📖 完整指南：[故障排查](./docs/troubleshooting.md)
 
