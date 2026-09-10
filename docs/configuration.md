@@ -30,7 +30,7 @@
 
 | 变量 | 默认值 | 说明 |
 |:-----|:-------|:-----|
-| `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用（兼容别名；`OPENCODE_DISABLE_TOOLS` 优先，二者无效值都会让位给下一顺位：canonical env > legacy env > `config.json` > 默认） |
+| `OPENCODE_DISABLE_TOOLS` / `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用（兼容别名；`OPENCODE_DISABLE_TOOLS` 优先，二者无效值都会让位给下一顺位：canonical env > legacy env > `config.json` > 默认） |
 | `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式；当前仅支持 `proxy-bridge` |
 | `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 外部工具冲突隔离策略；当前仅支持 `namespace` |
 | `OPENCODE_INTERNAL_WEB_FETCH_ENABLED` | `false` | 兼容旧开关；未显式配置 allowlist 时，启用后默认放行 `web_fetch` |
@@ -72,6 +72,7 @@
 | 变量 | 默认值 | 说明 |
 |:-----|:-------|:-----|
 | `OPENCODE_PROXY_DEBUG` | `false` | 开启调试日志（`config.json` 中用短键 `DEBUG`） |
+| `OPENCODE_PROXY_MANAGE_BACKEND` | `false` | 是否由代理拉起本地后端（`config.json` 中用短键 `MANAGE_BACKEND`；prod/`index.ts` 默认 `false`，library/`buildProxyConfig` 默认 `true`——已知双入口差异） |
 | `OPENCODE_PATH` | `opencode` | OpenCode 可执行文件路径 |
 | `OPENCODE_ZEN_API_KEY` | - | Zen API Key 透传 |
 
@@ -92,6 +93,10 @@
     "INTERNAL_ALLOWED_TOOLS": ["web_fetch"],
     "INTERNAL_TOOL_METRICS_ENABLED": true,
     "INTERNAL_TOOL_DISCOVERY_FIXTURE": [],
+    "HEALTH_DETAILS_ENABLED": true,
+    "HEALTH_DETAILS_REQUIRE_AUTH": true,
+    "METRICS_ENABLED": false,
+    "METRICS_REQUIRE_AUTH": true,
     "USE_ISOLATED_HOME": false,
     "PROMPT_MODE": "standard",
     "OMIT_SYSTEM_PROMPT": false,
@@ -100,9 +105,16 @@
     "CLEANUP_MAX_AGE_MS": 86400000,
     "DEBUG": false,
     "OPENCODE_SERVER_URL": "http://127.0.0.1:10001",
+    "OPENCODE_SERVER_PASSWORD": "",
     "OPENCODE_PATH": "opencode",
+    "ZEN_API_KEY": "",
+    "MANAGE_BACKEND": false,
     "REQUEST_TIMEOUT_MS": 180000,
-    "RETRY_MAX_RETRIES": 3
+    "RETRY_MAX_RETRIES": 3,
+    "UPSTREAM_PROXIES": [],
+    "UPSTREAM_PROXY_STRATEGY": "failover-rr",
+    "UPSTREAM_PROXY_COOLDOWN_MS": 300000,
+    "UPSTREAM_PROXY_NO_PROXY": ["localhost", "127.0.0.1", "::1"]
 }
 ```
 

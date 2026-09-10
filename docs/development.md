@@ -11,7 +11,7 @@
 ### Node.js 环境
 
 ```bash
-# Node.js 18+
+# Node.js >=22.19 (engines floor; CI uses 24)
 node --version
 
 # npm

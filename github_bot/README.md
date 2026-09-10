@@ -36,9 +36,9 @@ To use an external gateway or CPA, export names only (never commit values):
 
 ```bash
 export GATEWAY_BASE_URL='http://127.0.0.1:10000'  # external override; in-job default when unset
-export GATEWAY_API_KEY='...'    # external gateway key; empty = no-auth localhost
-export CPA_BASE_URL='...'       # never commit (fallback channel)
-export CPA_API_KEY='...'        # never commit (fallback channel)
+export GATEWAY_API_KEY=your-gateway-key-here  # external gateway key; empty = no-auth localhost
+export CPA_BASE_URL=your-cpa-url-here     # never commit (fallback channel)
+export CPA_API_KEY=your-cpa-key-here      # never commit (fallback channel)
 export PYTHONPATH=github_bot/src
 python3 github_bot/src/github_runner.py --mode=review --dry-run
 python3 github_bot/src/github_runner.py --mode=triage --dry-run

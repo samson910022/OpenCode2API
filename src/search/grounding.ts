@@ -3,6 +3,7 @@
 // Maps OpenAI-style hosted search tools (`tools:[{type:web_search}]`) onto the
 // opencode built-in `websearch` tool and rebuilds `web_search_call` output
 // items + `url_citation` annotations from the backend tool parts.
+import { asRecord } from '../utils/guards.js';
 
 export const HOSTED_SEARCH_TOOL_TYPES = ['web_search', 'web_search_preview', 'google_search'];
 /** True for hosted search tool types, incl. versioned variants (e.g. Anthropic `web_search_20260222`). */
@@ -17,11 +18,6 @@ export const SEARCH_GROUNDING_INSTRUCTION =
   'When the request needs fresh or external facts, call websearch first and answer ' +
   'only from the conversation plus the search results. ' +
   'Include the source URLs you relied on verbatim in your answer so they can be cited.';
-
-function asRecord(value: unknown): Record<string, unknown> {
-  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
-  return {};
-}
 
 function toolTypeOf(def: unknown): string {
   return typeof asRecord(def)['type'] === 'string' ? String(asRecord(def)['type']) : '';

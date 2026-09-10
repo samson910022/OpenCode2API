@@ -100,7 +100,10 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   const client = rawClient as unknown as ProxyClient;
 
   // Multi-key auth (A): legacy single + list merge; empty = no auth (unchanged).
-  // Single shared verifier instance (also exposed via ctx for system routes).
+  // Two verifier instances read the same effective key content (middleware
+  // here, system routes via ctx.API_KEYS); each copies at construction
+  // (spread in system routes, filter in keys), so keep the inputs in sync
+  // instead of assuming a shared reference.
   const effectiveApiKeys: string[] = buildEffectiveApiKeys(API_KEY, API_KEYS);
   const apiKeyVerifier = createApiKeyVerifier(effectiveApiKeys);
 
