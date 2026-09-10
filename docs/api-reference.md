@@ -4,6 +4,8 @@
   <img src="https://img.shields.io/badge/version-1.6.0-blue" alt="Version">
 </p>
 
+> 📖 [Docs Index](./README.md) | 🏠 [Main README](../README.md)
+
 ---
 
 ## 📋 基础信息

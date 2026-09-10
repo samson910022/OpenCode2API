@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/version-1.6.0-blue" alt="Version">
 </p>
 
-> **Language:** [English](./README.md) | [简体中文](./README.zh-CN.md) *(per-guide Chinese versions, see Translation status below)*
+> **Language:** **English** | [简体中文](./README.zh-CN.md) *(per-guide Chinese versions, see Translation status below)*
 >
 > 🏠 [Main README](../README.md) | [简体中文 README](../README.zh-CN.md) | 🐛 [Issues](https://github.com/samson910022/OpenCode2API/issues)
 

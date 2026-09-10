@@ -83,6 +83,8 @@ npm run dev
 npm start
 ```
 
+See also [Development guide](./docs/development.md) and [Main README](./README.md).
+
 ## Testing
 
 - Unit tests: `npm run test:unit`
