@@ -4,9 +4,9 @@
   <img src="https://img.shields.io/badge/version-1.6.0-blue" alt="Version">
 </p>
 
-> **語言：** [English](./README.md) | [简体中文](./README.zh-CN.md)
+> **语言：** [English](./README.md) | **简体中文**
 >
-> 🏠 [主 README（English）](../README.md) | [主 README（简体中文）](../README.zh-CN.md)
+> 🏠 [主 README（English）](../README.md) | [主 README（简体中文）](../README.zh-CN.md) | 🐛 [Issues](https://github.com/samson910022/OpenCode2API/issues)
 >
 > 欢迎查看 OpenCode2API 文档
 

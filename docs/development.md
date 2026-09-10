@@ -136,3 +136,7 @@ OpenCode2API/
 ## 📄 许可证
 
 MIT License - 详见 [LICENSE](../LICENSE.md)
+
+---
+
+> 📖 [Docs Index](./README.md) | 🏠 [Main README](../README.md) | 🤝 [CONTRIBUTING](../CONTRIBUTING.md)

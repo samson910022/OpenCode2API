@@ -10,6 +10,8 @@
 
 > 配置优先级：**环境变量 > config.json > 默认值**
 
+> 📖 [Docs Index](./README.md) | 🏠 [Main README](../README.md)
+
 ---
 
 ## 🔧 环境变量

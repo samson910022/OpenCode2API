@@ -1,5 +1,7 @@
 # AI Bot (GitHub Actions)
 
+> 📖 [Docs Index](./README.md) | 🏠 [Main README](../README.md)
+
 In-repo advisory bot for OpenCode2API: issue investigation, multi-agent PR
 review, PR explanations, scheduled repo scans with auto-issue, and fix-plan
 proposals with opt-in draft PRs.

@@ -51,7 +51,7 @@ services:
       - opencode-config:/home/node/.config/opencode
     restart: unless-stopped
     # Guard small (1GB) hosts: cap memory/CPU so one slow request cannot wedge
-    # the whole machine (see docs/host-deployments.md §9). Raw `docker run`
+    # the whole machine (see `docs/host-deployments.md` §9). Raw `docker run`
     # hosts should pass the equivalents: --memory=768m --memory-reservation=256m
     # --cpus=1.5 --pids-limit=256.
     mem_limit: 768m

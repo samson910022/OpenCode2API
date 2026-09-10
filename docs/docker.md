@@ -154,3 +154,7 @@ docker compose logs
 ### 挂载权限问题
 
 确保 PUID/PGID 配置正确 (默认 1000:1000)。
+
+---
+
+> 📖 [Docs Index](./README.md) | 🚀 [Getting Started](./getting-started.md)
