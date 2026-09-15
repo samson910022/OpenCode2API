@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     && dpkgArch="$(dpkg --print-architecture | awk -F- '{ print $NF }')" \
-    && curl -Lo /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/1.17/gosu-$dpkgArch" \
+    && curl -Lo /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/1.19/gosu-$dpkgArch" \
     && chmod +x /usr/local/bin/gosu \
     && gosu --version \
     && rm -rf /var/lib/apt/lists/*
