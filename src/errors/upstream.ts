@@ -99,6 +99,11 @@ export function isTransientUpstreamError(error: unknown): boolean {
   // A 500 carrying a context message must surface immediately, not burn retries.
   if (/context.?length|context.?overflow|context_length_exceeded/i.test(message)) return false;
 
+  // First-party gate is permanent: retrying (or proxy-fallbacking) can never
+  // succeed, and a Python Traceback body might otherwise trip a generic
+  // transient signature. Fail fast.
+  if (/from within opencode|only be used from within/i.test(message)) return false;
+
   const record = asRecord(error);
   const data = asRecord(record['data']);
   // Provider-marked retryable (SDK ApiError.data.isRetryable) is transient,
@@ -204,7 +209,14 @@ export function normalizeBackendError(raw: unknown): NormalizedUpstreamError {
   }
   if (typeof statusCode !== 'number') {
     const s = messageStr.toLowerCase();
-    if (/insufficient balance|credits?error|insufficient credits|billing|quota exceeded|credit limit/.test(s)) statusCode = 402;
+    // First-party gate (server-side, closed-source inference service): the
+    // message carries no numeric status ("...can only be used from within
+    // OpenCode" + Python Traceback). Match it before the generic billing
+    // branch so it surfaces as 403, not 500/502. The bare "free tier" is
+    // deliberately "within"-anchored so plain quota text (e.g. "Free tier
+    // quota exceeded") still maps to 402 below.
+    if (/from within opencode|only be used from within|free tier[^.]*within/i.test(s)) statusCode = 403;
+    else if (/insufficient balance|credits?error|insufficient credits|billing|quota exceeded|credit limit/.test(s)) statusCode = 402;
     else if (/rate.?limit|too many requests|worker request limit/.test(s)) statusCode = 429;
     else if (/invalid api key|unauthorized|authentication/.test(s)) statusCode = 401;
   }
@@ -311,7 +323,9 @@ export function transformUpstreamError(error: unknown): TransformedUpstreamError
       upstreamType === 'PermissionError' ||
       statusCode === 403 ||
       upstreamMessage.toLowerCase().includes('permission denied') ||
-      upstreamMessage.toLowerCase().includes('access denied')
+      upstreamMessage.toLowerCase().includes('access denied') ||
+      upstreamMessage.toLowerCase().includes('from within') ||
+      upstreamMessage.toLowerCase().includes('within opencode')
     ) {
       // Permission errors - map to 403
       statusCode = 403;

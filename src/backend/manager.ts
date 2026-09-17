@@ -25,6 +25,41 @@ const STARTING_WAIT_INTERVAL_MS = 1000;
 
 const OPENCODE_BASENAME = 'opencode';
 
+/**
+ * Stage-1 (mimic-first-party, anonymous by default):
+ * Pin the client identity the spawned backend advertises to Zen
+ * (`x-opencode-client` + `User-Agent: opencode/<version>` are minted inside
+ * the backend from this env; the SDK path has no per-request passthrough).
+ * Unknown/foreign values inherited from the gateway host env would make the
+ * free-tier gate classify us as "not from within OpenCode", so fall back to
+ * the real CLI default `cli` unless the operator explicitly set a known
+ * first-party value. No login required; anonymous (`auth.json` absent) stays
+ * anonymous — we never inject credentials here.
+ */
+const KNOWN_BACKEND_CLIENTS = new Set(['cli', 'desktop', 'acp', 'app']);
+
+export function resolveBackendClient(): string {
+  const raw = (process.env['OPENCODE_CLIENT'] ?? '').trim();
+  if (raw && KNOWN_BACKEND_CLIENTS.has(raw)) return raw;
+  return 'cli';
+}
+
+/**
+ * Apply first-party identity to a spawned-backend env record in place.
+ * Also neutralizes the `OPENCODE_API_KEY="public"` footgun: the literal
+ * string disables the backend's local free-only filter but the server still
+ * treats it as anonymous, so paid models would 401. Empty/omitted is the
+ * correct anonymous signal.
+ */
+export function applyBackendIdentityEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  env['OPENCODE_CLIENT'] = resolveBackendClient();
+  if ((env['OPENCODE_API_KEY'] ?? '').trim() === 'public') {
+    delete env['OPENCODE_API_KEY'];
+    console.warn('[Proxy] OPENCODE_API_KEY="public" removed from backend env (anonymous uses empty, not the literal).');
+  }
+  return env;
+}
+
 export function splitPathEnv(): string[] {
   const raw: string = process.env['PATH'] || '';
   return raw.split(path.delimiter).filter(Boolean);
@@ -398,10 +433,10 @@ export async function ensureBackend(config: unknown): Promise<void> {
       // Windows: use normal user home to avoid opencode storage path issues
       fs.mkdirSync(workspace, { recursive: true });
       cwd = workspace;
-      envVars = {
+      envVars = applyBackendIdentityEnv({
         ...process.env,
         OPENCODE_PROJECT_DIR: workspace,
-      };
+      });
       console.log('[Proxy] Running on Windows, using standard user home directory');
     } else {
       fs.mkdirSync(workspace, { recursive: true });
@@ -421,12 +456,12 @@ export async function ensureBackend(config: unknown): Promise<void> {
           if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
         });
 
-        envVars = {
+        envVars = applyBackendIdentityEnv({
           ...process.env,
           HOME: fakeHome,
           USERPROFILE: fakeHome,
           OPENCODE_PROJECT_DIR: workspace,
-        };
+        });
 
         if (PROMPT_MODE === 'plugin-inject') {
           const configDir = path.join(fakeHome, '.config', 'opencode');
@@ -454,10 +489,10 @@ export async function ensureBackend(config: unknown): Promise<void> {
         }
         console.log('[Proxy] Using isolated home for OpenCode');
       } else {
-        envVars = {
+        envVars = applyBackendIdentityEnv({
           ...process.env,
           OPENCODE_PROJECT_DIR: workspace,
-        };
+        });
         console.log('[Proxy] Using real HOME for OpenCode (isolation disabled)');
       }
     }
@@ -486,6 +521,14 @@ export async function ensureBackend(config: unknown): Promise<void> {
     if (ZEN_API_KEY) {
       spawnArgs.push('--password', String(ZEN_API_KEY));
     }
+    // Stage-3 note: the jail empty-workspace (no git) resolves to the
+    // legitimate upstream project.id "global" (packages/core/src/project.ts);
+    // the server only uses x-opencode-project for $project forwarding and
+    // telemetry — never gating (omitted when empty, stripped for
+    // non-inference) — so we keep the jail for isolation and merely surface
+    // the posture in logs.
+    console.log(`[Proxy] Backend identity: OPENCODE_CLIENT=${envVars['OPENCODE_CLIENT']} (anonymous free-tier, no login)`);
+    console.log(`[Proxy] Backend project dir: ${cwd} (isolated jail, upstream project.id "global")`);
     state.process = spawn(opencodeBin, spawnArgs, spawnOptions);
 
     // Handle spawn errors
