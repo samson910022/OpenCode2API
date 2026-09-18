@@ -1,4 +1,7 @@
-import { resolveBackendClient, applyBackendIdentityEnv } from '../src/backend/manager.js';
+import { resolveBackendClient, applyBackendIdentityEnv, ensureJailGitRepo } from '../src/backend/manager.js';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 // Stage-1: spawned backend must advertise a first-party client identity
 // (x-opencode-client is minted inside the backend from OPENCODE_CLIENT).
@@ -70,5 +73,16 @@ describe('applyBackendIdentityEnv', () => {
         const real = applyBackendIdentityEnv({ OPENCODE_API_KEY: 'sk-real' });
         expect(real['OPENCODE_API_KEY']).toBe('sk-real');
         expect('OPENCODE_API_KEY' in applyBackendIdentityEnv({})).toBe(false);
+    });
+});
+
+describe('jail git repo', () => {
+    test('ensureJailGitRepo initializes and detects existing repos', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitrepo-test-'));
+        expect(fs.existsSync(path.join(dir, '.git'))).toBe(false);
+        expect(ensureJailGitRepo(dir)).toBe(true);
+        expect(fs.existsSync(path.join(dir, '.git'))).toBe(true);
+        expect(ensureJailGitRepo(dir)).toBe(true);
+        fs.rmSync(dir, { recursive: true, force: true });
     });
 });

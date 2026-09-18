@@ -59,6 +59,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
     getResponseState,
     storeResponseState,
     buildSystemPrompt,
+    selectPromptToolOverrides,
     normalizeReasoningEffort,
     stripFunctionCalls,
     normalizeTextContent,
@@ -460,8 +461,10 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           ...(top_p !== undefined ? { top_p } : {}),
         },
       };
-      if (toolOverrides && Object.keys(toolOverrides).length > 0) {
-        promptParams.body['tools'] = toolOverrides;
+      // Stage-5: drop all-disabled maps for free-tier suspects (Zen gate).
+      const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
+      if (promptToolOverrides) {
+        promptParams.body['tools'] = promptToolOverrides;
       }
 
       let content = '';

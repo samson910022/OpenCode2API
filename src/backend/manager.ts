@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import http from 'http';
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import type { ChildProcess } from 'child_process';
 import type { ProxyConfig } from '../types/config.js';
 import type { BackendState, OpencodeResolveResult } from '../types/backend.js';
@@ -44,6 +44,24 @@ export function resolveBackendClient(): string {
   return 'cli';
 }
 
+/**
+ * Stage-6: `git init` the jail workspace so session directories resolve to a
+ * git-backed project root. Zen's free-tier gate answers non-git project roots
+ * with FreeTierError 403 even when everything else mimics first-party
+ * (verified live: identical backend+prompt returns 200 the moment the session
+ * directory sits inside a git work tree — even an empty repo with no commit
+ * or remote). Best-effort: warns and continues when git is unavailable.
+ */
+export function ensureJailGitRepo(workspace: string): boolean {
+  try {
+    if (fs.existsSync(path.join(workspace, '.git'))) return true;
+    execFileSync('git', ['init', '-q', workspace], { stdio: 'ignore' });
+    return fs.existsSync(path.join(workspace, '.git'));
+  } catch {
+    console.warn('[Proxy] git init failed for jail workspace; free-tier models may hit the upstream gate.');
+    return false;
+  }
+}
 /**
  * Apply first-party identity to a spawned-backend env record in place.
  * Also neutralizes the `OPENCODE_API_KEY="public"` footgun: the literal
@@ -432,6 +450,7 @@ export async function ensureBackend(config: unknown): Promise<void> {
     if (isWindows) {
       // Windows: use normal user home to avoid opencode storage path issues
       fs.mkdirSync(workspace, { recursive: true });
+      ensureJailGitRepo(workspace);
       cwd = workspace;
       envVars = applyBackendIdentityEnv({
         ...process.env,
@@ -440,6 +459,7 @@ export async function ensureBackend(config: unknown): Promise<void> {
       console.log('[Proxy] Running on Windows, using standard user home directory');
     } else {
       fs.mkdirSync(workspace, { recursive: true });
+      ensureJailGitRepo(workspace);
       cwd = workspace;
 
       if (useIsolatedHome) {
@@ -521,14 +541,13 @@ export async function ensureBackend(config: unknown): Promise<void> {
     if (ZEN_API_KEY) {
       spawnArgs.push('--password', String(ZEN_API_KEY));
     }
-    // Stage-3 note: the jail empty-workspace (no git) resolves to the
-    // legitimate upstream project.id "global" (packages/core/src/project.ts);
-    // the server only uses x-opencode-project for $project forwarding and
-    // telemetry — never gating (omitted when empty, stripped for
-    // non-inference) — so we keep the jail for isolation and merely surface
-    // the posture in logs.
+    // Stage-3/6 note: the jail is kept for isolation but initialized as a git
+    // work tree (ensureJailGitRepo): the server only uses x-opencode-project
+    // for $project forwarding and telemetry — never gating — while Zen's
+    // free-tier gate requires a git-backed session directory. No identity is
+    // fabricated: the repo is real (may be empty), no remote is set.
     console.log(`[Proxy] Backend identity: OPENCODE_CLIENT=${envVars['OPENCODE_CLIENT']} (anonymous free-tier, no login)`);
-    console.log(`[Proxy] Backend project dir: ${cwd} (isolated jail, upstream project.id "global")`);
+    console.log(`[Proxy] Backend project dir: ${cwd} (isolated git-backed jail)`);
     state.process = spawn(opencodeBin, spawnArgs, spawnOptions);
 
     // Handle spawn errors

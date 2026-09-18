@@ -58,6 +58,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
     resolveRequestedModel,
     logDebug,
     buildSystemPrompt,
+    selectPromptToolOverrides,
     normalizeReasoningEffort,
     stripFunctionCalls,
     normalizeTextContent,
@@ -400,8 +401,10 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               REQUEST_TIMEOUT_MS,
               'load tool overrides',
             )) as Record<string, boolean> | null;
-            if (toolOverrides && Object.keys(toolOverrides).length > 0) {
-              promptParams.body['tools'] = toolOverrides;
+            // Stage-5: drop all-disabled maps for free-tier suspects (Zen gate).
+            const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
+            if (promptToolOverrides) {
+              promptParams.body['tools'] = promptToolOverrides;
             }
 
             const makeForcedChatToolCallRequester = (): (() => Promise<Record<string, unknown> | null>) =>

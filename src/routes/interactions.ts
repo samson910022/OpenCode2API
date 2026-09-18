@@ -91,6 +91,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
     getResponseState,
     storeResponseState,
     buildSystemPrompt,
+    selectPromptToolOverrides,
     createRequestToolContext,
     getToolOverridesForMode,
     trackToolMode,
@@ -273,8 +274,10 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           parts,
         },
       };
-      if (toolOverrides && Object.keys(toolOverrides).length > 0) {
-        promptParams.body['tools'] = toolOverrides;
+      // Stage-5: drop all-disabled maps for free-tier suspects (Zen gate).
+      const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
+      if (promptToolOverrides) {
+        promptParams.body['tools'] = promptToolOverrides;
       }
 
       // Thin retry: free-limit errors engage the proxy pool and rotate the

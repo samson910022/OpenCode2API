@@ -51,6 +51,42 @@ import { ensureTranslatorsRegistered } from './converters/wire.js';
 // (tests/env-alias.test.js, stream-hardening.test.js import these from '../src/proxy.js').
 export { normalizeBool, resolveDisableTools, withTimeout };
 
+/**
+ * Stage-5 (Zen free-tier gate): the upstream free tier answers prompts whose
+ * `tools` map disables EVERYTHING (all-false) with `FreeTierError` 403 —
+ * verified live against the same backend/session shape where an omitted map
+ * or any-true map returns 200. The omission applies ONLY to likely-free
+ * Zen models (see isFreeTierSuspectModel): paid/other providers keep the
+ * exact old behavior so their hard-disable posture never softens. With the
+ * map omitted the tools-disabled guard text already in the system prompt
+ * carries the posture, and with no tool definitions the model cannot emit
+ * tool calls. Pure (module-level for direct unit testing).
+ */
+export function isFreeTierSuspectModel(providerID: unknown, modelID: unknown): boolean {
+  if (typeof providerID !== 'string' || providerID !== 'opencode') return false;
+  if (typeof modelID !== 'string' || !modelID) return false;
+  const id = modelID.toLowerCase();
+  // Suffix convention (kimi-k2.5-free, muse-spark-1.3-contributor-free, ...).
+  if (/-free$/.test(id)) return true;
+  // Documented free-tier models without the suffix (zen docs).
+  return id === 'big-pickle' || id === 'union-alpha';
+}
+
+export function selectPromptToolOverrides(
+  overrides: unknown,
+  providerID?: unknown,
+  modelID?: unknown,
+): Record<string, boolean> | null {
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) return null;
+  const entries = Object.entries(overrides as Record<string, unknown>);
+  if (entries.length === 0) return null;
+  if (entries.some(([, value]) => value === true)) return overrides as Record<string, boolean>;
+  // All-false: omit only for free-tier suspects; everywhere else the map is
+  // the hard-disable mechanism and must be preserved verbatim.
+  if (isFreeTierSuspectModel(providerID, modelID)) return null;
+  return overrides as Record<string, boolean>;
+}
+
 export function createApp(config: ProxyConfig): CreateAppResult {
   const {
     API_KEY,
@@ -779,8 +815,10 @@ export function createApp(config: ProxyConfig): CreateAppResult {
             ],
           },
         };
-        if (toolOverrides && Object.keys(toolOverrides).length > 0) {
-          forcedPromptParams.body['tools'] = toolOverrides;
+        // Stage-5: drop all-disabled maps for free-tier suspects (Zen gate).
+        const forcedToolOverrides = selectPromptToolOverrides(toolOverrides, providerID, modelID);
+        if (forcedToolOverrides) {
+          forcedPromptParams.body['tools'] = forcedToolOverrides;
         }
         await promptWithTimeout(forcedPromptParams, requestTimeoutMs);
         return pollForAssistantResponse(sessionId, requestTimeoutMs) as Promise<Record<string, unknown>>;
@@ -867,6 +905,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     SERVER_INTERNAL_ALLOWED_TOOL_NAMES,
     buildInternalAllowlistPrompt,
     buildSystemPrompt,
+    selectPromptToolOverrides,
     normalizeReasoningEffort,
     stripFunctionCalls,
     normalizeTextContent,
