@@ -83,4 +83,17 @@ describe('first-party gate plumbing', () => {
         expect(incidental.statusCode).not.toBe(403);
         expect(incidental.error.type).not.toBe('permission_denied');
     });
+
+    test('transform gate anchor stays wider than normalize (fail-closed pin)', () => {
+        // Deliberate width difference (§9 no-touch): normalizeBackendError and
+        // isTransientUpstreamError anchor on /from within opencode|used from
+        // within|freetiererror/i, while transformUpstreamError also matches bare
+        // 'within opencode' so a numeric-status error carrying loose gate
+        // phrasing still surfaces as 403 instead of leaking as 5xx. Pinned here:
+        // do not narrow transform without widening the other two in the same change.
+        const loose = { name: 'APIError', data: { message: 'quota error within opencode gateway', statusCode: 500 } };
+        const out = transformUpstreamError(loose);
+        expect(out.statusCode).toBe(403);
+        expect(out.error.type).toBe('permission_denied');
+    });
 });

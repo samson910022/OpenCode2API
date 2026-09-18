@@ -32,7 +32,7 @@
 
 | 变量 | 默认值 | 说明 |
 |:-----|:-------|:-----|
-| `OPENCODE_DISABLE_TOOLS` / `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用（兼容别名；`OPENCODE_DISABLE_TOOLS` 优先，二者无效值都会让位给下一顺位：canonical env > legacy env > `config.json` > 默认）。例外：① 疑似免费 Zen 模型（`opencode` provider 且 `-free` 后缀、`big-pickle`、`union-alpha`）省略全 `false` 的 prompt `tools` 映射以避开上游 `FreeTierError` 403，此时仅靠 system prompt 禁用语 + 无 tool 定义 + 输出侧 markup 剥离承载禁用姿态；② `/v1/responses` 的 `web_search` 与 Interactions 的 `google_search` 会以 `hosted-search-grant` 单独放行 `websearch`（输出仅 `web_search_call` + 引文，不经过外部桥接） |
+| `OPENCODE_DISABLE_TOOLS` / `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用（兼容别名；`OPENCODE_DISABLE_TOOLS` 优先，二者无效值都会让位给下一顺位：canonical env > legacy env > `config.json` > 默认）。例外：① 疑似免费 Zen 模型（`opencode` provider 且 `-free` 后缀、`big-pickle`、`union-alpha`）剔除 prompt `tools` 映射中的 `false` 项（仅保留 `true` 项；全 `false` 则省略整个映射）以避开上游 `FreeTierError` 403（任意 `false` 均触发，`{}`/省略/`true`-only 通过），被剔除的工具回落服务端 agent 默认，此时仅靠 system prompt 禁用语 + 输出侧 markup 剥离承载禁用姿态；② `/v1/responses` 的 `web_search` 与 Interactions 的 `google_search` 会以 `hosted-search-grant` 单独放行 `websearch`（输出仅 `web_search_call` + 引文，不经过外部桥接） |
 | `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式；当前仅支持 `proxy-bridge` |
 | `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 外部工具冲突隔离策略；当前仅支持 `namespace` |
 | `OPENCODE_INTERNAL_WEB_FETCH_ENABLED` | `false` | 兼容旧开关；未显式配置 allowlist 时，启用后默认放行 `web_fetch` |
@@ -77,6 +77,12 @@
 | `OPENCODE_PROXY_MANAGE_BACKEND` | `false` | 是否由代理拉起本地后端（`config.json` 中用短键 `MANAGE_BACKEND`；prod/`index.ts` 默认 `false`，library/`buildProxyConfig` 默认 `true`——已知双入口差异） |
 | `OPENCODE_PATH` | `opencode` | OpenCode 可执行文件路径 |
 | `OPENCODE_ZEN_API_KEY` | - | Zen API Key 透传 |
+
+### 后端 identity（非 proxy knob，不进六向矩阵）
+
+- `OPENCODE_CLIENT`：被拉起后端向 Zen 声明的第一方身份。allowlist 为 `cli`/`desktop`/`acp`/`app`，默认 `cli`；未设置/空白/未知值一律回落 `cli`（allowlist clamp，非 bool fallthrough）。
+- 从网关宿主环境继承的外来值会被覆写（如 `opencode2api` 会被重写为 `cli`），已知值透传。无 file key、无别名，不进 `ProxyConfig`/`buildProxyConfig`，故 `.env.example`/`config.json.example`/`Dockerfile`/`docker-compose.yml`/`index.ts` 均不声明。
+- 附带：`OPENCODE_API_KEY="public"` 字面值会从后端环境删除（匿名应传空而非该字面）；jail 工作目录会 best-effort `git init`（5s 超时，失败 warn 继续）。
 
 ---
 

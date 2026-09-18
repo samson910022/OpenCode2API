@@ -461,7 +461,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           ...(top_p !== undefined ? { top_p } : {}),
         },
       };
-      // Stage-5: drop all-disabled maps for free-tier suspects (Zen gate).
+      // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
       const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
       if (promptToolOverrides) {
         promptParams.body['tools'] = promptToolOverrides;
@@ -861,8 +861,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           }
         }
         const { validCalls: validatedStreamedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
-        const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content) as string) as string;
-        const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning) as string) as string;
+        const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
+        const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
         if (streamedToolCalls.length === 0) {
           validatedStreamedToolCalls.forEach((toolCall) => {
             const record = toolCall as unknown as Record<string, unknown>;
@@ -1063,8 +1063,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         }
       }
       const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
-      const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content) as string) as string;
-      const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning) as string) as string;
+      const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
+      const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
 
       // P4: server-side grounding evidence → web_search_call items + citations.
       const searchEvidence = hostedSearch.requested

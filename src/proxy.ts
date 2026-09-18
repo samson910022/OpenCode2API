@@ -371,7 +371,8 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     return effortMap[value.toLowerCase()] ?? (fallback as string | null);
   };
 
-  const stripFunctionCalls = (text: unknown, trim: boolean = true): unknown => {
+  const stripFunctionCalls = (text: unknown, trim: boolean = true): string => {
+    if (typeof text !== 'string') return String(text ?? '');
     if (!DISABLE_TOOLS || !text) return text;
     return stripFunctionCallMarkup(String(text), trim);
   };
@@ -818,7 +819,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
             ],
           },
         };
-        // Stage-5: drop all-disabled maps for free-tier suspects (Zen gate).
+        // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
         const forcedToolOverrides = selectPromptToolOverrides(toolOverrides, providerID, modelID);
         if (forcedToolOverrides) {
           forcedPromptParams.body['tools'] = forcedToolOverrides;

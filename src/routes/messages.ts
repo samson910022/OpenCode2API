@@ -311,7 +311,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
             REQUEST_TIMEOUT_MS,
             'load tool overrides',
           )) as Record<string, boolean> | null;
-          // Stage-5: drop all-disabled maps for free-tier suspects (Zen gate).
+          // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
           const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
           if (promptToolOverrides) promptParams.body['tools'] = promptToolOverrides;
 
@@ -338,8 +338,8 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
             reasoning: unknown,
             validatedToolCalls: unknown,
           ): Record<string, unknown> => {
-            const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content) as string) as string;
-            const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning) as string) as string;
+            const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
+            const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
             const publicCalls = toPublicToolCalls(validatedToolCalls);
             const anthropicTools = publicCalls.map((tc) => {
               const tcr = tc as unknown as Record<string, unknown>;

@@ -46,11 +46,11 @@ export function resolveBackendClient(): string {
 
 /**
  * Stage-6: `git init` the jail workspace so session directories resolve to a
- * git-backed project root. Zen's free-tier gate answers non-git project roots
- * with FreeTierError 403 even when everything else mimics first-party
- * (verified live: identical backend+prompt returns 200 the moment the session
- * directory sits inside a git work tree — even an empty repo with no commit
- * or remote). Best-effort: warns and continues when git is unavailable.
+ * git-backed project root. Kept as defense-in-depth for backend versions
+ * whose free-tier gate is sensitive to non-git project roots (live round-2
+ * verification showed plain dirs also pass on the current backend, so this
+ * is compatibility insurance, not a requirement). Best-effort: warns and
+ * continues when git is unavailable.
  */
 export function ensureJailGitRepo(workspace: string): boolean {
   try {

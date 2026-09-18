@@ -121,7 +121,7 @@ export interface AppContext {
   buildSystemPrompt: (systemMsg: unknown, reasoningEffort?: unknown, toolMode?: unknown, internalAllowedTools?: unknown) => string | undefined;
   selectPromptToolOverrides: (overrides: unknown, providerID?: unknown, modelID?: unknown) => Record<string, boolean> | null;
   normalizeReasoningEffort: (value: unknown, fallback?: unknown) => string | null;
-  stripFunctionCalls: (text: unknown, trim?: boolean) => unknown;
+  stripFunctionCalls: (text: unknown, trim?: boolean) => string;
   normalizeTextContent: (content: unknown) => string;
   normalizeToolArguments: (args: unknown) => string;
   normalizeToolResultContent: (content: unknown) => string;

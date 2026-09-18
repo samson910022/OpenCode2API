@@ -1,6 +1,6 @@
 // Session/message ID format guardrails (Stage-2 mimic work).
 //
-// Upstream facts (opencode@5a8335857b):
+// Upstream facts as of opencode@5a8335857b (re-verify on backend bump):
 // - `x-opencode-session` is minted inside the backend:
 //   `packages/schema/src/session-id.ts` = `"ses_" + descending()`,
 //   where descending = 12 lowercase hex + 14 base62
@@ -15,7 +15,8 @@
 // - The SDK path (`session.create()` with no params) offers no per-request
 //   header passthrough: the gateway CANNOT and MUST NOT forge these IDs.
 //   They are validated here only as a debug drift signal (e.g. backend
-//   version change), never to block a request.
+//   version change), never to block a request. The regexes below are
+//   intentionally strict: a backend format change only emits a debug log.
 const SESSION_SUFFIX = '[0-9a-f]{12}[0-9A-Za-z]{14}';
 
 export const SESSION_ID_RE = new RegExp(`^ses_${SESSION_SUFFIX}$`);

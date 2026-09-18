@@ -275,7 +275,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           parts,
         },
       };
-      // Stage-5: drop all-disabled maps for free-tier suspects (Zen gate).
+      // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
       const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
       if (promptToolOverrides) {
         promptParams.body['tools'] = promptToolOverrides;
@@ -358,10 +358,10 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           return;
         }
         // Parity with chat/responses/messages: strip tool-call markup when
-        // DISABLE_TOOLS so a free-tier omission (no all-false tools map,
+        // DISABLE_TOOLS so a free-tier strip (no false entries in the tools map,
         // see selectPromptToolOverrides) cannot leak call syntax to clients.
         // stripFunctionCalls is a no-op unless DISABLE_TOOLS=true.
-        const text = String(stripFunctionCalls(polled.content || '') ?? '');
+        const text = stripFunctionCalls(polled.content || '');
           // Chunked deltas keep clients alive on long answers.
           for (let i = 0; i < text.length; i += 500) {
             emit({ type: 'step.delta', interaction_id: interactionId, delta: text.slice(i, i + 500) });
@@ -393,7 +393,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
 
       const polled = await promptAndPoll();
       // Same parity strip as the stream path above.
-      const text = String(stripFunctionCalls(polled.content || '') ?? '');
+      const text = stripFunctionCalls(polled.content || '');
       const evidence = hostedSearch.requested ? extractSearchEvidence(polled.toolParts ?? []) : { queries: [] as string[], sources: [] as { url: string; title: string }[] };
       const searchCalls = buildWebSearchCallItems(evidence);
       const annotations = buildCitationAnnotations(text, evidence.sources);
