@@ -32,7 +32,7 @@
 
 | 变量 | 默认值 | 说明 |
 |:-----|:-------|:-----|
-| `OPENCODE_DISABLE_TOOLS` / `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用（兼容别名；`OPENCODE_DISABLE_TOOLS` 优先，二者无效值都会让位给下一顺位：canonical env > legacy env > `config.json` > 默认） |
+| `OPENCODE_DISABLE_TOOLS` / `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用（兼容别名；`OPENCODE_DISABLE_TOOLS` 优先，二者无效值都会让位给下一顺位：canonical env > legacy env > `config.json` > 默认）。例外：① 疑似免费 Zen 模型（`opencode` provider 且 `-free` 后缀、`big-pickle`、`union-alpha`）省略全 `false` 的 prompt `tools` 映射以避开上游 `FreeTierError` 403，此时仅靠 system prompt 禁用语 + 无 tool 定义 + 输出侧 markup 剥离承载禁用姿态；② `/v1/responses` 的 `web_search` 与 Interactions 的 `google_search` 会以 `hosted-search-grant` 单独放行 `websearch`（输出仅 `web_search_call` + 引文，不经过外部桥接） |
 | `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式；当前仅支持 `proxy-bridge` |
 | `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 外部工具冲突隔离策略；当前仅支持 `namespace` |
 | `OPENCODE_INTERNAL_WEB_FETCH_ENABLED` | `false` | 兼容旧开关；未显式配置 allowlist 时，启用后默认放行 `web_fetch` |

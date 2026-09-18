@@ -92,6 +92,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
     storeResponseState,
     buildSystemPrompt,
     selectPromptToolOverrides,
+    stripFunctionCalls,
     createRequestToolContext,
     getToolOverridesForMode,
     trackToolMode,
@@ -356,7 +357,11 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           await deleteEphemeralSession();
           return;
         }
-        const text = polled.content || '';
+        // Parity with chat/responses/messages: strip tool-call markup when
+        // DISABLE_TOOLS so a free-tier omission (no all-false tools map,
+        // see selectPromptToolOverrides) cannot leak call syntax to clients.
+        // stripFunctionCalls is a no-op unless DISABLE_TOOLS=true.
+        const text = String(stripFunctionCalls(polled.content || '') ?? '');
           // Chunked deltas keep clients alive on long answers.
           for (let i = 0; i < text.length; i += 500) {
             emit({ type: 'step.delta', interaction_id: interactionId, delta: text.slice(i, i + 500) });
@@ -387,7 +392,8 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       }
 
       const polled = await promptAndPoll();
-      const text = polled.content || '';
+      // Same parity strip as the stream path above.
+      const text = String(stripFunctionCalls(polled.content || '') ?? '');
       const evidence = hostedSearch.requested ? extractSearchEvidence(polled.toolParts ?? []) : { queries: [] as string[], sources: [] as { url: string; title: string }[] };
       const searchCalls = buildWebSearchCallItems(evidence);
       const annotations = buildCitationAnnotations(text, evidence.sources);

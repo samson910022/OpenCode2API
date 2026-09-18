@@ -48,4 +48,13 @@ describe('selectPromptToolOverrides', () => {
         expect(selectPromptToolOverrides([], ...FREE)).toBeNull();
         expect(selectPromptToolOverrides('bash', ...FREE)).toBeNull();
     });
+
+    test('omitted provider/model IDs keep the safe default (all-false preserved)', () => {
+        // A route forgetting to pass provider/model must NOT soften the
+        // hard-disable: isFreeTierSuspectModel(undefined, undefined) is false.
+        const allFalse = { bash: false, read: false };
+        expect(selectPromptToolOverrides(allFalse)).toBe(allFalse);
+        expect(selectPromptToolOverrides(allFalse, undefined, undefined)).toBe(allFalse);
+        expect(selectPromptToolOverrides(allFalse, 'opencode')).toBe(allFalse);
+    });
 });

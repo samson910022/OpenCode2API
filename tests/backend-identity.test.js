@@ -1,3 +1,4 @@
+import { jest } from '@jest/globals';
 import { resolveBackendClient, applyBackendIdentityEnv, ensureJailGitRepo } from '../src/backend/manager.js';
 import fs from 'fs';
 import os from 'os';
@@ -70,8 +71,8 @@ describe('applyBackendIdentityEnv', () => {
     test('removes only the literal public API key (anonymous uses empty)', () => {
         expect(applyBackendIdentityEnv({ OPENCODE_API_KEY: 'public' })['OPENCODE_API_KEY']).toBeUndefined();
         expect(applyBackendIdentityEnv({ OPENCODE_API_KEY: '  public  ' })['OPENCODE_API_KEY']).toBeUndefined();
-        const real = applyBackendIdentityEnv({ OPENCODE_API_KEY: 'sk-real' });
-        expect(real['OPENCODE_API_KEY']).toBe('sk-real');
+        const real = applyBackendIdentityEnv({ OPENCODE_API_KEY: 'opencode-real-key-1' });
+        expect(real['OPENCODE_API_KEY']).toBe('opencode-real-key-1');
         expect('OPENCODE_API_KEY' in applyBackendIdentityEnv({})).toBe(false);
     });
 });
@@ -84,5 +85,16 @@ describe('jail git repo', () => {
         expect(fs.existsSync(path.join(dir, '.git'))).toBe(true);
         expect(ensureJailGitRepo(dir)).toBe(true);
         fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    test('ensureJailGitRepo fails open (warn + false) when git cannot run', () => {
+        const spy = jest.spyOn(fs, 'existsSync').mockImplementationOnce(() => {
+            throw new Error('boom');
+        });
+        try {
+            expect(ensureJailGitRepo('/nonexistent-workspace-xyz')).toBe(false);
+        } finally {
+            spy.mockRestore();
+        }
     });
 });

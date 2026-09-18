@@ -55,7 +55,7 @@ export function resolveBackendClient(): string {
 export function ensureJailGitRepo(workspace: string): boolean {
   try {
     if (fs.existsSync(path.join(workspace, '.git'))) return true;
-    execFileSync('git', ['init', '-q', workspace], { stdio: 'ignore' });
+    execFileSync('git', ['init', '-q', workspace], { stdio: 'ignore', timeout: 5000 });
     return fs.existsSync(path.join(workspace, '.git'));
   } catch {
     console.warn('[Proxy] git init failed for jail workspace; free-tier models may hit the upstream gate.');
@@ -547,7 +547,9 @@ export async function ensureBackend(config: unknown): Promise<void> {
     // free-tier gate requires a git-backed session directory. No identity is
     // fabricated: the repo is real (may be empty), no remote is set.
     console.log(`[Proxy] Backend identity: OPENCODE_CLIENT=${envVars['OPENCODE_CLIENT']} (anonymous free-tier, no login)`);
-    console.log(`[Proxy] Backend project dir: ${cwd} (isolated git-backed jail)`);
+    // Log hygiene: never print the absolute jail path (tmpdir + salt). The
+    // basename is enough to correlate; the full path stays out of stdout.
+    console.log(`[Proxy] Backend project dir: <jail>/${path.basename(cwd)} (isolated git-backed jail)`);
     state.process = spawn(opencodeBin, spawnArgs, spawnOptions);
 
     // Handle spawn errors
