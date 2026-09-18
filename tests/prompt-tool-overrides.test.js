@@ -1,9 +1,10 @@
 import { selectPromptToolOverrides, isFreeTierSuspectModel } from '../src/proxy.js';
 
-// Stage-5: Zen's free tier answers all-false tools maps with FreeTierError
-// 403 (verified live); omitted or any-true maps return 200. The omission
-// applies ONLY to likely-free Zen models — paid/other providers keep the
-// exact old behavior (map always sent) so hard-disable never softens there.
+// Stage-5: Zen's free tier answers tools maps containing ANY `false` with
+// FreeTierError 403 (verified live: single/all-false/mixed all gate; {},
+// omitted, and true-only maps pass). The stripping applies ONLY to
+// likely-free Zen models — paid/other providers keep the exact old behavior
+// (map always sent) so hard-disable never softens there.
 describe('isFreeTierSuspectModel', () => {
     test('matches opencode free-suffixed models', () => {
         expect(isFreeTierSuspectModel('opencode', 'muse-spark-1.3-contributor-free')).toBe(true);
@@ -29,16 +30,17 @@ describe('selectPromptToolOverrides', () => {
     const FREE = ['opencode', 'muse-spark-1.3-contributor-free'];
     const PAID = ['opencode', 'kimi-k2.5'];
 
-    test('passes through maps with at least one enabled tool (any tier)', () => {
+    test('passes maps through verbatim for paid/other tiers', () => {
         const mixed = { bash: false, read: true };
-        expect(selectPromptToolOverrides(mixed, ...FREE)).toBe(mixed);
         expect(selectPromptToolOverrides(mixed, ...PAID)).toBe(mixed);
+        const allFalse = { bash: false };
+        expect(selectPromptToolOverrides(allFalse, ...PAID)).toBe(allFalse);
     });
 
-    test('drops all-false maps only for free-tier suspects', () => {
+    test('strips false entries for free-tier suspects (any false gates)', () => {
+        expect(selectPromptToolOverrides({ bash: false, read: true }, ...FREE)).toEqual({ read: true });
         expect(selectPromptToolOverrides({ bash: false, read: false }, ...FREE)).toBeNull();
-        const paidMap = { bash: false };
-        expect(selectPromptToolOverrides(paidMap, ...PAID)).toBe(paidMap);
+        expect(selectPromptToolOverrides({ bash: true }, ...FREE)).toEqual({ bash: true });
     });
 
     test('drops empty/non-object inputs (previous call-site behavior)', () => {

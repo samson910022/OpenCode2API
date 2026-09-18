@@ -53,14 +53,14 @@ export { normalizeBool, resolveDisableTools, withTimeout };
 
 /**
  * Stage-5 (Zen free-tier gate): the upstream free tier answers prompts whose
- * `tools` map disables EVERYTHING (all-false) with `FreeTierError` 403 —
- * verified live against the same backend/session shape where an omitted map
- * or any-true map returns 200. The omission applies ONLY to likely-free
- * Zen models (see isFreeTierSuspectModel): paid/other providers keep the
- * exact old behavior so their hard-disable posture never softens. With the
- * map omitted the tools-disabled guard text already in the system prompt
- * carries the posture, and with no tool definitions the model cannot emit
- * tool calls. Pure (module-level for direct unit testing).
+ * `tools` map contains ANY `false` entry with `FreeTierError` 403 — verified
+ * live (single-false, all-false, and mixed false+true maps all gate; {},
+ * omitted, and true-only maps pass). The stripping applies ONLY to
+ * likely-free Zen models (see isFreeTierSuspectModel): paid/other providers
+ * keep the exact old behavior so their hard-disable posture never softens.
+ * Stripped tools fall back to agent defaults server-side while the guard
+ * text still narrows usage; backend ask-defaults remain the backstop.
+ * Pure (module-level for direct unit testing).
  */
 export function isFreeTierSuspectModel(providerID: unknown, modelID: unknown): boolean {
   if (typeof providerID !== 'string' || providerID !== 'opencode') return false;
@@ -80,11 +80,14 @@ export function selectPromptToolOverrides(
   if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) return null;
   const entries = Object.entries(overrides as Record<string, unknown>);
   if (entries.length === 0) return null;
-  if (entries.some(([, value]) => value === true)) return overrides as Record<string, boolean>;
-  // All-false: omit only for free-tier suspects; everywhere else the map is
-  // the hard-disable mechanism and must be preserved verbatim.
-  if (isFreeTierSuspectModel(providerID, modelID)) return null;
-  return overrides as Record<string, boolean>;
+  if (!isFreeTierSuspectModel(providerID, modelID)) {
+    return overrides as Record<string, boolean>;
+  }
+  const enabled: Record<string, boolean> = {};
+  for (const [key, value] of entries) {
+    if (value === true) enabled[key] = true;
+  }
+  return Object.keys(enabled).length > 0 ? enabled : null;
 }
 
 export function createApp(config: ProxyConfig): CreateAppResult {
