@@ -2,6 +2,7 @@
 import http from 'http';
 import https from 'https';
 import { sleep } from '../backend/manager.js';
+import { isValidSessionId } from '../session/ids.js';
 import { withTimeout, DEFAULT_POLL_INTERVAL_MS } from '../config/proxy-config.js';
 import type { ProxyClient } from '../types/client.js';
 import type { CollectorHandle } from '../types/context.js';
@@ -116,6 +117,10 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     timeoutMs: number,
     intervalMs: number = DEFAULT_POLL_INTERVAL_MS,
   ): Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[] }> {
+    // Drift signal only: backend-minted ses_* IDs should match the canonical
+    // shape (see src/session/ids.ts). Never block on mismatch — the schema
+    // itself accepts any startsWith("ses") value.
+    if (!isValidSessionId(sessionId)) logDebug('Unexpected backend session ID format', { sessionId });
     const pollStart = Date.now();
     const startedAt = Date.now();
     // Best-effort snapshot of the most recent in-flight assistant message. Polling
@@ -200,6 +205,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     firstDeltaTimeoutMs?: number | null,
     idleTimeoutMs?: number | null,
   ): Promise<Record<string, unknown>> {
+    if (!isValidSessionId(sessionId)) logDebug('Unexpected backend session ID format', { sessionId });
     const controller = new AbortController();
     const eventStreamResult: unknown = await client.event.subscribe({ signal: controller.signal });
     const eventStream = asRecord(eventStreamResult)['stream'] as AsyncIterable<BackendEvent>;

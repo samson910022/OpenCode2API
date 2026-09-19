@@ -190,6 +190,55 @@ describe('POST /v1beta/interactions', () => {
         expect(sdkMocks.eventSubscribe).not.toHaveBeenCalled();
     });
 
+    test('non-stream strips tool-call markup from output_text and steps when DISABLE_TOOLS=true', async () => {
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    {
+                        type: 'text',
+                        text: 'Summary of findings. <function_calls>{"name":"bash","arguments":{"command":"ls"}}</function_calls>',
+                    },
+                ],
+            },
+        ]);
+        const app = createApp(baseConfig({})).app;
+        const res = await request(app).post('/v1beta/interactions').send({
+            model: 'opencode/kimi-k2.5',
+            input: 'hi',
+        });
+        expect(res.statusCode).toBe(200);
+        expect(res.body.output_text).toContain('Summary of findings.');
+        expect(res.body.output_text).not.toContain('<function_calls>');
+        const out = res.body.steps.find((s) => s.type === 'model_output');
+        expect(out).toBeDefined();
+        expect(out.text).not.toContain('<function_calls>');
+    });
+
+    test('stream strips tool-call markup from deltas and completed output when DISABLE_TOOLS=true', async () => {
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    {
+                        type: 'text',
+                        text: 'Summary of findings. <function_calls>{"name":"bash","arguments":{"command":"ls"}}</function_calls>',
+                    },
+                ],
+            },
+        ]);
+        const app = createApp(baseConfig({})).app;
+        const res = await request(app).post('/v1beta/interactions').send({
+            model: 'opencode/kimi-k2.5',
+            input: 'hi',
+            stream: true,
+        });
+        expect(res.statusCode).toBe(200);
+        expect(res.text).toContain('interaction.completed');
+        expect(res.text).toContain('Summary of findings.');
+        expect(res.text).not.toContain('<function_calls>');
+    });
+
     test('free-limit engages fallback and retries via proxy within the same request', async () => {
         sdkMocks.sessionPrompt.mockRejectedValueOnce({
             name: 'APIError',

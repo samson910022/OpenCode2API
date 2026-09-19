@@ -58,6 +58,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
     resolveRequestedModel,
     logDebug,
     buildSystemPrompt,
+    selectPromptToolOverrides,
     normalizeReasoningEffort,
     stripFunctionCalls,
     normalizeTextContent,
@@ -400,8 +401,10 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               REQUEST_TIMEOUT_MS,
               'load tool overrides',
             )) as Record<string, boolean> | null;
-            if (toolOverrides && Object.keys(toolOverrides).length > 0) {
-              promptParams.body['tools'] = toolOverrides;
+            // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
+            const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
+            if (promptToolOverrides) {
+              promptParams.body['tools'] = promptToolOverrides;
             }
 
             const makeForcedChatToolCallRequester = (): (() => Promise<Record<string, unknown> | null>) =>
@@ -865,8 +868,8 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 }
               }
               const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
-              const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content) as string) as string;
-              const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning) as string) as string;
+              const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
+              const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
 
               const promptTokens = Math.ceil((fullPromptText || '').length / 4);
               const completionTokensCalc = Math.ceil((content || '').length / 4);

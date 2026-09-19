@@ -13,7 +13,8 @@ const sdkMocks = {
                     id: 'opencode',
                     models: {
                         'kimi-k2.5': { name: 'Kimi k2.5', release_date: '2024-01-15' },
-                        'gpt-5-nano': { name: 'GPT-5 Nano', release_date: '2025-01-15' }
+                        'gpt-5-nano': { name: 'GPT-5 Nano', release_date: '2025-01-15' },
+                        'muse-spark-1.3-contributor-free': { name: 'Muse Spark', release_date: '2026-01-15' }
                     }
                 }
             ]
@@ -475,6 +476,72 @@ describe('Proxy OpenAI API', () => {
         expect(promptCall.body.tools).toEqual({
             bash: false
         });
+    });
+
+    test('POST /v1/chat/completions omits all-false tools map for free-tier models (Stage-5 gate)', async () => {
+        const freeApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false
+        }).app;
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: 'Free tier answer' }]
+            }
+        ]);
+
+        const res = await request(freeApp)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/muse-spark-1.3-contributor-free',
+                messages: [{ role: 'user', content: 'Hi' }]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.tools).toBeUndefined();
+        expect(promptCall.body.system).toContain('Tools are disabled');
+    });
+
+    test('POST /v1/chat/completions strips tool-call markup from output when DISABLE_TOOLS=true', async () => {
+        const lockedApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false
+        }).app;
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    {
+                        type: 'text',
+                        text: 'Here is the summary. <function_calls>{"name":"bash","arguments":{"command":"ls"}}</function_calls>'
+                    }
+                ]
+            }
+        ]);
+
+        const res = await request(lockedApp)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'List files' }]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        const content = res.body.choices[0].message.content;
+        expect(content).toContain('Here is the summary.');
+        expect(content).not.toContain('<function_calls>');
+        expect(content).not.toContain('function_calls');
     });
 
     test('POST /v1/chat/completions applies request-level allowlist narrowing (intersection)', async () => {
@@ -2052,6 +2119,41 @@ describe('Proxy OpenAI API', () => {
 
         expect(res.statusCode).toEqual(200);
         expect(res.body.output).toEqual([]);
+    });
+
+    test('POST /v1/responses strips tool-call markup from output when DISABLE_TOOLS=true', async () => {
+        const lockedApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false
+        }).app;
+
+        sdkMocks.sessionPrompt.mockResolvedValueOnce({
+            data: {
+                parts: [
+                    {
+                        type: 'text',
+                        text: 'Search summary here. <function_calls>{"name":"webfetch","arguments":{"url":"https://example.com"}}</function_calls>'
+                    }
+                ]
+            }
+        });
+
+        const res = await request(lockedApp)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'Summarize https://example.com'
+            });
+
+        expect(res.statusCode).toEqual(200);
+        const flat = JSON.stringify(res.body.output);
+        expect(flat).toContain('Search summary here.');
+        expect(flat).not.toContain('<function_calls>');
     });
 
     /**

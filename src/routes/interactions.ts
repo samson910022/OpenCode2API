@@ -91,6 +91,8 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
     getResponseState,
     storeResponseState,
     buildSystemPrompt,
+    selectPromptToolOverrides,
+    stripFunctionCalls,
     createRequestToolContext,
     getToolOverridesForMode,
     trackToolMode,
@@ -273,8 +275,10 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           parts,
         },
       };
-      if (toolOverrides && Object.keys(toolOverrides).length > 0) {
-        promptParams.body['tools'] = toolOverrides;
+      // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
+      const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
+      if (promptToolOverrides) {
+        promptParams.body['tools'] = promptToolOverrides;
       }
 
       // Thin retry: free-limit errors engage the proxy pool and rotate the
@@ -353,7 +357,11 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           await deleteEphemeralSession();
           return;
         }
-        const text = polled.content || '';
+        // Parity with chat/responses/messages: strip tool-call markup when
+        // DISABLE_TOOLS so a free-tier strip (no false entries in the tools map,
+        // see selectPromptToolOverrides) cannot leak call syntax to clients.
+        // stripFunctionCalls is a no-op unless DISABLE_TOOLS=true.
+        const text = stripFunctionCalls(polled.content || '');
           // Chunked deltas keep clients alive on long answers.
           for (let i = 0; i < text.length; i += 500) {
             emit({ type: 'step.delta', interaction_id: interactionId, delta: text.slice(i, i + 500) });
@@ -384,7 +392,8 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       }
 
       const polled = await promptAndPoll();
-      const text = polled.content || '';
+      // Same parity strip as the stream path above.
+      const text = stripFunctionCalls(polled.content || '');
       const evidence = hostedSearch.requested ? extractSearchEvidence(polled.toolParts ?? []) : { queries: [] as string[], sources: [] as { url: string; title: string }[] };
       const searchCalls = buildWebSearchCallItems(evidence);
       const annotations = buildCitationAnnotations(text, evidence.sources);

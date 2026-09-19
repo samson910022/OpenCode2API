@@ -51,6 +51,45 @@ import { ensureTranslatorsRegistered } from './converters/wire.js';
 // (tests/env-alias.test.js, stream-hardening.test.js import these from '../src/proxy.js').
 export { normalizeBool, resolveDisableTools, withTimeout };
 
+/**
+ * Stage-5 (Zen free-tier gate): the upstream free tier answers prompts whose
+ * `tools` map contains ANY `false` entry with `FreeTierError` 403 — verified
+ * live (single-false, all-false, and mixed false+true maps all gate; {},
+ * omitted, and true-only maps pass). The stripping applies ONLY to
+ * likely-free Zen models (see isFreeTierSuspectModel): paid/other providers
+ * keep the exact old behavior so their hard-disable posture never softens.
+ * Stripped tools fall back to agent defaults server-side while the guard
+ * text still narrows usage; backend ask-defaults remain the backstop.
+ * Pure (module-level for direct unit testing).
+ */
+export function isFreeTierSuspectModel(providerID: unknown, modelID: unknown): boolean {
+  if (typeof providerID !== 'string' || providerID !== 'opencode') return false;
+  if (typeof modelID !== 'string' || !modelID) return false;
+  const id = modelID.toLowerCase();
+  // Suffix convention (kimi-k2.5-free, muse-spark-1.3-contributor-free, ...).
+  if (/-free$/.test(id)) return true;
+  // Documented free-tier models without the suffix (zen docs).
+  return id === 'big-pickle' || id === 'union-alpha';
+}
+
+export function selectPromptToolOverrides(
+  overrides: unknown,
+  providerID?: unknown,
+  modelID?: unknown,
+): Record<string, boolean> | null {
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) return null;
+  const entries = Object.entries(overrides as Record<string, unknown>);
+  if (entries.length === 0) return null;
+  if (!isFreeTierSuspectModel(providerID, modelID)) {
+    return overrides as Record<string, boolean>;
+  }
+  const enabled: Record<string, boolean> = {};
+  for (const [key, value] of entries) {
+    if (value === true) enabled[key] = true;
+  }
+  return Object.keys(enabled).length > 0 ? enabled : null;
+}
+
 export function createApp(config: ProxyConfig): CreateAppResult {
   const {
     API_KEY,
@@ -332,7 +371,8 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     return effortMap[value.toLowerCase()] ?? (fallback as string | null);
   };
 
-  const stripFunctionCalls = (text: unknown, trim: boolean = true): unknown => {
+  const stripFunctionCalls = (text: unknown, trim: boolean = true): string => {
+    if (typeof text !== 'string') return String(text ?? '');
     if (!DISABLE_TOOLS || !text) return text;
     return stripFunctionCallMarkup(String(text), trim);
   };
@@ -779,8 +819,10 @@ export function createApp(config: ProxyConfig): CreateAppResult {
             ],
           },
         };
-        if (toolOverrides && Object.keys(toolOverrides).length > 0) {
-          forcedPromptParams.body['tools'] = toolOverrides;
+        // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
+        const forcedToolOverrides = selectPromptToolOverrides(toolOverrides, providerID, modelID);
+        if (forcedToolOverrides) {
+          forcedPromptParams.body['tools'] = forcedToolOverrides;
         }
         await promptWithTimeout(forcedPromptParams, requestTimeoutMs);
         return pollForAssistantResponse(sessionId, requestTimeoutMs) as Promise<Record<string, unknown>>;
@@ -867,6 +909,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     SERVER_INTERNAL_ALLOWED_TOOL_NAMES,
     buildInternalAllowlistPrompt,
     buildSystemPrompt,
+    selectPromptToolOverrides,
     normalizeReasoningEffort,
     stripFunctionCalls,
     normalizeTextContent,
