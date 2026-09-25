@@ -10,7 +10,7 @@ const sdkMocks = {
         data: { providers: [{ id: 'opencode', models: { 'big-pickle': { name: 'Big Pickle' } } }] }
     })),
     configUpdate: jest.fn(async () => ({})),
-    toolIds: jest.fn(async () => ({ data: [] })),
+    toolIds: jest.fn(async () => ({ data: ['web_fetch', 'filesystem', 'bash'] })),
     sessionCreate: jest.fn(async () => ({ data: { id: SESSION_ID } })),
     sessionPrompt: jest.fn(async () => ({ data: { parts: [{ type: 'text', text: 'Mock response' }] } })),
     sessionMessages: jest.fn(async () => ([

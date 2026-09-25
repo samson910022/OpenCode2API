@@ -73,7 +73,7 @@ export function normalizeBool(value: unknown): boolean | undefined {
  * Invalid values ('garbage', '', whitespace) are treated as unset and fall
  * through to the next source instead of coercing.
  */
-export function resolveDisableTools(options?: unknown, fallback: boolean = false): boolean {
+export function resolveDisableTools(options?: unknown, fallback: boolean = true): boolean {
   const o = (options ?? {}) as DisableToolsOptions;
   const record = o as Record<string, unknown>;
   return (

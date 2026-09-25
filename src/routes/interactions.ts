@@ -110,6 +110,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
     client,
     config,
     REQUEST_TIMEOUT_MS,
+    DISABLE_TOOLS,
     maxAttempts,
     resolveRequestedModel,
     logDebug,
@@ -270,6 +271,16 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           }
           toolOverrides = merged;
         }
+      }
+      if (DISABLE_TOOLS && (!toolOverrides || Object.keys(toolOverrides).length === 0)) {
+        res.status(503).json({
+          error: {
+            message: 'Tool discovery unavailable; backend tool IDs could not be verified',
+            type: 'tool_discovery_unavailable',
+            code: 'tool_discovery_unavailable',
+          },
+        });
+        return;
       }
 
       let sessionId: string | null = previousState?.sessionId || null;

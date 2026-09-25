@@ -6,7 +6,7 @@ const sdkMocks = {
         data: { providers: [{ id: 'opencode', models: { 'kimi-k2.5': { name: 'Kimi' } } }] },
     })),
     configUpdate: jest.fn(async () => ({})),
-    toolIds: jest.fn(async () => ({ data: [] })),
+    toolIds: jest.fn(async () => ({ data: ['web_fetch', 'filesystem', 'bash'] })),
     sessionCreate: jest.fn(async () => ({ data: { id: 'xlat-session' } })),
     sessionPrompt: jest.fn(async () => ({ data: { parts: [] } })),
     sessionMessages: jest.fn(async () => ([

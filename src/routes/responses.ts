@@ -20,7 +20,7 @@ import {
   createToolCallFilter,
   createExternalToolCallStreamParser,
 } from '../tool-runtime/parser.js';
-import { isTransientUpstreamError, normalizeBackendError, transformUpstreamError, createInvalidRequestError } from '../errors/upstream.js';
+import { isTransientUpstreamError, normalizeBackendError, transformUpstreamError, createInvalidRequestError, createToolDiscoveryUnavailableError } from '../errors/upstream.js';
 import { engageFallbackForFreeLimit } from '../upstream-proxy/fallback.js';
 import {
   buildCitationAnnotations,
@@ -699,7 +699,34 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             if (granted === true) merged[id] = true;
           }
           toolOverrides = merged;
+        } else if (DISABLE_TOOLS) {
+          await cleanupOwnedResponsesSession();
+          if (stream) {
+            throw createToolDiscoveryUnavailableError();
+          }
+          res.status(503).json({
+            error: {
+              message: 'Tool discovery unavailable; backend tool IDs could not be verified',
+              type: 'tool_discovery_unavailable',
+              code: 'tool_discovery_unavailable',
+            },
+          });
+          return;
         }
+      }
+      if (DISABLE_TOOLS && (!toolOverrides || Object.keys(toolOverrides).length === 0)) {
+        await cleanupOwnedResponsesSession();
+        if (stream) {
+          throw createToolDiscoveryUnavailableError();
+        }
+        res.status(503).json({
+          error: {
+            message: 'Tool discovery unavailable; backend tool IDs could not be verified',
+            type: 'tool_discovery_unavailable',
+            code: 'tool_discovery_unavailable',
+          },
+        });
+        return;
       }
       const makeForcedResponsesToolCallRequester = (): (() => Promise<Record<string, unknown> | null>) =>
         createForcedToolCallRequester({

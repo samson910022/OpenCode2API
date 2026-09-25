@@ -239,6 +239,25 @@ describe('POST /v1beta/interactions', () => {
         expect(res.text).not.toContain('<function_calls>');
     });
 
+    test('tool discovery unavailable fails closed instead of prompting without overrides', async () => {
+        const app = createApp(baseConfig({})).app;
+        sdkMocks.toolIds.mockRejectedValueOnce(new Error('discovery down'));
+        const res = await request(app).post('/v1beta/interactions').send({
+            model: 'opencode/kimi-k2.5',
+            input: 'hi',
+        });
+        expect(res.statusCode).toBe(503);
+        expect(res.body).toEqual({
+            error: {
+                message: 'Tool discovery unavailable; backend tool IDs could not be verified',
+                type: 'tool_discovery_unavailable',
+                code: 'tool_discovery_unavailable',
+            },
+        });
+        expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
+        expect(sdkMocks.sessionPrompt).not.toHaveBeenCalled();
+    });
+
     test('free-limit engages fallback and retries via proxy within the same request', async () => {
         sdkMocks.sessionPrompt.mockRejectedValueOnce({
             name: 'APIError',

@@ -12,7 +12,7 @@ import {
   createToolCallFilter,
   createExternalToolCallStreamParser,
 } from '../tool-runtime/parser.js';
-import { isTransientUpstreamError, transformUpstreamError } from '../errors/upstream.js';
+import { isTransientUpstreamError, normalizeBackendError, transformUpstreamError } from '../errors/upstream.js';
 import { engageFallbackForFreeLimit } from '../upstream-proxy/fallback.js';
 import { detectHostedSearchTools } from '../search/grounding.js';
 import {
@@ -418,6 +418,21 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               REQUEST_TIMEOUT_MS,
               'load tool overrides',
             )) as Record<string, boolean> | null;
+            if (DISABLE_TOOLS && (!toolOverrides || Object.keys(toolOverrides).length === 0)) {
+              try {
+                await activeClient.session.delete({ path: { id: sessionId as string } });
+              } catch (cleanupError: unknown) {
+                logDebug('Failed to cleanup session after tool discovery unavailable', { error: toErrorMessage(cleanupError) });
+              }
+              res.status(503).json({
+                error: {
+                  message: 'Tool discovery unavailable; backend tool IDs could not be verified',
+                  type: 'tool_discovery_unavailable',
+                  code: 'tool_discovery_unavailable',
+                },
+              });
+              return;
+            }
             // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
             const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
             if (promptToolOverrides) {
@@ -965,6 +980,10 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               }
               if (error != null) {
                 if (/^Request timeout after/.test(toErrorMessage(error))) throw error;
+                const normalizedDiscovery = normalizeBackendError(error);
+                if (normalizedDiscovery.statusCode === 503 && normalizedDiscovery.code === 'tool_discovery_unavailable') {
+                  throw normalizedDiscovery;
+                }
                 const er = asRecord(error);
                 const ed = asRecord(er['data']);
                 res.status(502).json({
@@ -1048,7 +1067,8 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               const transformed = transformUpstreamError(error);
               res.status(transformed.statusCode).json(transformed.error);
             } else if (!res.destroyed) {
-               res.write(`data: ${JSON.stringify({ error: { message: `${readErrorName(error)}: ${readDataMessage(error)}` } })}\n\n`);
+              const transformed = transformUpstreamError(error);
+              res.write(`data: ${JSON.stringify({ error: transformed.error })}\n\n`);
               res.end();
             }
              if (sessionId) {

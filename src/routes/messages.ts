@@ -327,6 +327,21 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
             REQUEST_TIMEOUT_MS,
             'load tool overrides',
           )) as Record<string, boolean> | null;
+          if (DISABLE_TOOLS && (!toolOverrides || Object.keys(toolOverrides).length === 0)) {
+            try {
+              await activeClient.session.delete({ path: { id: sessionId as string } });
+            } catch (cleanupError: unknown) {
+              logDebug('Failed to cleanup session after tool discovery unavailable', { error: toErrorMessage(cleanupError) });
+            }
+            res.status(503).json({
+              type: 'error',
+              error: {
+                type: 'tool_discovery_unavailable',
+                message: 'Tool discovery unavailable; backend tool IDs could not be verified',
+              },
+            });
+            return;
+          }
           // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
           const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
           if (promptToolOverrides) promptParams.body['tools'] = promptToolOverrides;

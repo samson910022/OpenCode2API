@@ -53,10 +53,10 @@ describe('resolveDisableTools', () => {
     });
 
     test('defaults to the fallback when nothing is set', () => {
-        expect(resolveDisableTools()).toBe(false);
-        expect(resolveDisableTools({})).toBe(false);
+        expect(resolveDisableTools()).toBe(true);
+        expect(resolveDisableTools({})).toBe(true);
         expect(resolveDisableTools({}, true)).toBe(true);
-        expect(resolveDisableTools(null)).toBe(false);
+        expect(resolveDisableTools(null)).toBe(true);
         expect(resolveDisableTools(null, true)).toBe(true);
     });
 
@@ -112,13 +112,13 @@ describe('resolveDisableTools', () => {
             process.env[LEGACY] = 'false';
             expect(resolveDisableTools({})).toBe(false);
             delete process.env[LEGACY];
-            expect(resolveDisableTools({})).toBe(false);
+            expect(resolveDisableTools({})).toBe(true);
             expect(resolveDisableTools({}, true)).toBe(true);
         }
         // Legacy layer alone with garbage also falls back (not coerced).
         for (const garbage of ['garbage', '', '   ']) {
             process.env[LEGACY] = garbage;
-            expect(resolveDisableTools({})).toBe(false);
+            expect(resolveDisableTools({})).toBe(true);
             expect(resolveDisableTools({}, true)).toBe(true);
         }
         // Invalid option values fall through to env as well.
@@ -141,7 +141,7 @@ describe('resolveDisableTools', () => {
         process.env[CANONICAL] = 'false';
         expect(resolveDisableTools({ DISABLE_TOOLS: 2 })).toBe(false);
         delete process.env[CANONICAL];
-        expect(resolveDisableTools({ DISABLE_TOOLS: 2 })).toBe(false);
+        expect(resolveDisableTools({ DISABLE_TOOLS: 2 })).toBe(true);
         expect(resolveDisableTools({ DISABLE_TOOLS: 2 }, true)).toBe(true);
     });
 });

@@ -20,7 +20,7 @@ const sdkMocks = {
         data: { providers: [{ id: 'opencode', models: { 'kimi-k2.5': { name: 'Kimi' }, 'muse-spark-1.3-contributor-free': { name: 'Muse Spark' } } }] }
     })),
     configUpdate: jest.fn(async () => ({})),
-    toolIds: jest.fn(async () => ({ data: [] })),
+    toolIds: jest.fn(async () => ({ data: ['web_fetch', 'filesystem', 'bash'] })),
     sessionCreate: jest.fn(async () => ({ data: { id: 'err-session' } })),
     sessionPrompt: jest.fn(async () => ({ data: { parts: [] } })),
     sessionMessages: jest.fn(async () => ([
@@ -349,6 +349,76 @@ describe('POST /v1/responses backend plain-object error', () => {
                 .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
             expect(res.statusCode).toBe(502);
             expect(sdkMocks.sessionCreate.mock.calls.length).toBe(1);
+        });
+    });
+
+    describe('503 discovery and upstream errors', () => {
+        test('a proxy-authored discovery failure keeps 503 and its wire contract', async () => {
+            const { createToolDiscoveryUnavailableError } = await import('../src/errors/upstream.js');
+            expect(transformUpstreamError(createToolDiscoveryUnavailableError())).toEqual({
+                statusCode: 503,
+                error: {
+                    message: 'Tool discovery unavailable; backend tool IDs could not be verified',
+                    type: 'tool_discovery_unavailable',
+                    code: 'tool_discovery_unavailable'
+                }
+            });
+        });
+
+        test('an unmarked upstream 503 keeps 503 but never uses the discovery contract', () => {
+            expect(transformUpstreamError({
+                name: 'ServiceUnavailableError',
+                data: { message: '503: backend overloaded', statusCode: 503 }
+            })).toEqual({
+                statusCode: 503,
+                error: {
+                    message: '503: backend overloaded',
+                    type: 'server_error',
+                    code: 'server_error'
+                }
+            });
+        });
+
+        test('chat non-stream preserves a discovery 503 through the shared transformer', async () => {
+            const chatApp = createApp({
+                PORT: 10000, API_KEY: 'test-key',
+                OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+                REQUEST_TIMEOUT_MS: 5000, DISABLE_TOOLS: true, DEBUG: false,
+                RETRY_MAX_RETRIES: 0
+            }).app;
+            sdkMocks.toolIds.mockRejectedValueOnce(new Error('discovery down'));
+            sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [] } });
+            const res = await request(chatApp).post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
+            expect(res.statusCode).toBe(503);
+            expect(res.body).toEqual({
+                error: {
+                    message: 'Tool discovery unavailable; backend tool IDs could not be verified',
+                    type: 'tool_discovery_unavailable',
+                    code: 'tool_discovery_unavailable'
+                }
+            });
+            expect(sdkMocks.sessionPrompt).not.toHaveBeenCalled();
+        });
+
+        test('responses stream preserves a discovery 503 as response.failed', async () => {
+            const responsesApp = createApp({
+                PORT: 10000, API_KEY: 'test-key',
+                OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+                REQUEST_TIMEOUT_MS: 5000, DISABLE_TOOLS: true, DEBUG: false,
+                RETRY_MAX_RETRIES: 0
+            }).app;
+            sdkMocks.toolIds.mockRejectedValueOnce(new Error('discovery down'));
+            sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [] } });
+            const res = await request(responsesApp).post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', input: 'hi', stream: true });
+            expect(res.statusCode).toBe(200);
+            expect(res.text).toContain('"type":"response.failed"');
+            expect(res.text).toContain('"code":"tool_discovery_unavailable"');
+            expect(res.text).toContain('data: [DONE]');
+            expect(sdkMocks.sessionPrompt).not.toHaveBeenCalled();
         });
     });
 });

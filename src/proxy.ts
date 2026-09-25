@@ -624,16 +624,24 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   };
 
   const TOOL_IDS_CACHE_MS = 5 * 60 * 1000;
+  const TOOL_DISCOVERY_TIMEOUT_MS = 10000;
+  const TOOL_DISCOVERY_FAILURE_COOLDOWN_MS = 30000;
   let cachedToolIds: string[] | null = null;
   let cachedToolIdsAt = 0;
   let cachedDisabledToolOverrides: Record<string, boolean> | null = null;
   let cachedDisabledToolOverridesAt = 0;
+  let discoverySource = 'none';
+  let discoveryLastSuccessAt = 0;
+  let discoveryLastErrorAt = 0;
+  let discoveryLastError: string | null = null;
+  let discoveryCooldownUntil = 0;
   const internalToolMetrics: InternalToolMetrics = {
     externalBridgeRequests: 0,
     internalAllowlistRequests: 0,
     disabledRequests: 0,
     discoveryFailures: 0,
     fallbackToDisabled: 0,
+    overrideOmitted: 0,
   };
 
   const logInternalToolEvent = (event: unknown, details: unknown = {}): void => {
@@ -663,27 +671,62 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   };
 
   const getBackendToolIds = async (): Promise<string[] | null> => {
-    if (cachedToolIds && Date.now() - cachedToolIdsAt < TOOL_IDS_CACHE_MS) {
-      return cachedToolIds;
+    const now = Date.now();
+    if (cachedToolIds && now - cachedToolIdsAt < TOOL_IDS_CACHE_MS) {
+      const cachedNormalized = normalizeBackendToolIds(cachedToolIds);
+      if (cachedNormalized.length > 0) return cachedToolIds;
+      if (!DISABLE_TOOLS) return cachedToolIds;
     }
     const fixtureIds = normalizeConfiguredToolNames(INTERNAL_TOOL_DISCOVERY_FIXTURE);
     if (fixtureIds.length > 0) {
       cachedToolIds = fixtureIds;
       cachedToolIdsAt = Date.now();
-      logInternalToolEvent('backend-tool-ids-fixture-loaded', { count: fixtureIds.length, fixtureIds });
+      discoverySource = 'fixture';
+      discoveryLastSuccessAt = Date.now();
+      logInternalToolEvent('backend-tool-ids-fixture-loaded', { count: fixtureIds.length });
       return fixtureIds;
     }
+    if (now < discoveryCooldownUntil) {
+      return null;
+    }
     try {
-      const idsRes = (await client.tool.ids()) as unknown;
-      const data: unknown = asRecord(idsRes)['data'] ?? idsRes;
-      const ids = Array.isArray(data) ? (data as string[]) : [];
-      cachedToolIds = ids;
+      const idsRes = (await withTimeout(client.tool.ids(), TOOL_DISCOVERY_TIMEOUT_MS, 'tool discovery')) as unknown;
+      const idsRecord = asRecord(idsRes);
+      const tupleError: unknown = idsRecord['error'];
+      if (tupleError !== undefined && tupleError !== null) {
+        throw new Error(toErrorMessage(tupleError) || 'tool discovery returned error');
+      }
+      const data: unknown = idsRecord['data'] ?? idsRes;
+      if (!Array.isArray(data)) {
+        throw new Error('tool discovery returned malformed payload');
+      }
+      const normalized = normalizeBackendToolIds(data);
+      if (normalized.length === 0) {
+        if (DISABLE_TOOLS) {
+          throw new Error('tool discovery returned empty ids');
+        }
+        cachedToolIds = normalized;
+        cachedToolIdsAt = Date.now();
+        discoverySource = 'live';
+        discoveryLastSuccessAt = Date.now();
+        logInternalToolEvent('backend-tool-ids-loaded', { count: 0 });
+        return normalized;
+      }
+      cachedToolIds = normalized;
       cachedToolIdsAt = Date.now();
-      logInternalToolEvent('backend-tool-ids-loaded', { count: ids.length });
-      return ids;
+      discoverySource = 'live';
+      discoveryLastSuccessAt = Date.now();
+      cachedDisabledToolOverrides = null;
+      cachedDisabledToolOverridesAt = 0;
+      logInternalToolEvent('backend-tool-ids-loaded', { count: normalized.length });
+      return normalized;
     } catch (e: unknown) {
       internalToolMetrics.discoveryFailures += 1;
-      logInternalToolEvent('backend-tool-ids-failed', { error: toErrorMessage(e) });
+      discoveryLastError = toErrorMessage(e).slice(0, 500);
+      discoveryLastErrorAt = Date.now();
+      discoveryCooldownUntil = Date.now() + TOOL_DISCOVERY_FAILURE_COOLDOWN_MS;
+      if (discoverySource !== 'live' && discoverySource !== 'fixture') discoverySource = 'none';
+      logInternalToolEvent('backend-tool-ids-failed', { error: discoveryLastError });
       return null;
     }
   };
@@ -738,16 +781,30 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   };
 
   const getDisabledToolOverrides = async (): Promise<Record<string, boolean> | null> => {
-    if (!DISABLE_TOOLS) return null;
+    if (!DISABLE_TOOLS) {
+      internalToolMetrics.overrideOmitted += 1;
+      logInternalToolEvent('disabled-tool-overrides-omitted', { reason: 'operator-allow' });
+      return null;
+    }
+    const ids = await getBackendToolIds();
+    if (!Array.isArray(ids)) {
+      cachedDisabledToolOverrides = null;
+      cachedDisabledToolOverridesAt = 0;
+      return null;
+    }
+    const normalized = normalizeBackendToolIds(ids);
+    if (normalized.length === 0) {
+      cachedDisabledToolOverrides = null;
+      cachedDisabledToolOverridesAt = 0;
+      return null;
+    }
     if (cachedDisabledToolOverrides && Date.now() - cachedDisabledToolOverridesAt < TOOL_IDS_CACHE_MS) {
       return cachedDisabledToolOverrides;
     }
-    const ids = await getBackendToolIds();
-    if (!Array.isArray(ids)) return null;
-    const overrides = buildDisabledToolOverrides(ids);
+    const overrides = buildDisabledToolOverrides(normalized);
     cachedDisabledToolOverrides = overrides;
     cachedDisabledToolOverridesAt = Date.now();
-    logInternalToolEvent('disabled-tool-overrides-loaded', { count: ids.length });
+    logInternalToolEvent('disabled-tool-overrides-loaded', { count: normalized.length });
     return overrides;
   };
 
@@ -766,10 +823,20 @@ export function createApp(config: ProxyConfig): CreateAppResult {
       return getDisabledToolOverrides();
     }
     if (toolMode !== TOOL_MODE.INTERNAL_ALLOWLIST) {
+      if (!DISABLE_TOOLS) {
+        internalToolMetrics.overrideOmitted += 1;
+      }
       return null;
     }
     const ids = await getBackendToolIds();
-    if (!Array.isArray(ids) || (ids as unknown[]).length === 0) return null;
+    const normalizedPre = normalizeBackendToolIds(ids);
+    if (!Array.isArray(ids) || normalizedPre.length === 0) {
+      if (!DISABLE_TOOLS) {
+        internalToolMetrics.overrideOmitted += 1;
+        logInternalToolEvent('internal-allowlist-omitted', { reason: 'operator-allow' });
+      }
+      return null;
+    }
     const resolution = resolveInternalAllowedToolIds(
       ids,
       (ctxRecord['allowedToolNames'] ?? SERVER_INTERNAL_ALLOWED_TOOL_NAMES) as unknown,
@@ -1015,6 +1082,10 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     proxyPollForAssistantResponse,
     getCachedToolIds: () => cachedToolIds,
     getCachedToolIdsAt: () => cachedToolIdsAt,
+    getDiscoverySource: () => discoverySource,
+    getDiscoveryLastSuccessAt: () => discoveryLastSuccessAt,
+    getDiscoveryLastErrorAt: () => discoveryLastErrorAt,
+    getDiscoveryLastError: () => discoveryLastError,
     translators: ensureTranslatorsRegistered(defaultTranslatorRegistry()),
   };
 

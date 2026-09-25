@@ -75,6 +75,7 @@ export interface InternalToolMetrics {
   disabledRequests: number;
   discoveryFailures: number;
   fallbackToDisabled: number;
+  overrideOmitted: number;
 }
 
 /** Per-instance context threaded through route registrars (same names as closures). */
@@ -164,6 +165,10 @@ export interface AppContext {
   proxyPollForAssistantResponse: CollectorHandle['pollForAssistantResponse'];
   getCachedToolIds: () => string[] | null;
   getCachedToolIdsAt: () => number;
+  getDiscoverySource: () => string;
+  getDiscoveryLastSuccessAt: () => number;
+  getDiscoveryLastErrorAt: () => number;
+  getDiscoveryLastError: () => string | null;
   /** Wired N×N translator registry (Phase 1 wiring; optional so manual test ctx still compiles). */
   translators?: TranslatorRegistry;
 }

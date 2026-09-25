@@ -73,6 +73,32 @@ export function createInvalidRequestError(message: string, code: string): LocalI
   return error;
 }
 
+/** Marker for a proxy-authored tool-discovery failure. Only this marker may use the discovery wire contract. */
+const LOCAL_TOOL_DISCOVERY = Symbol.for('opencode2api.localToolDiscovery');
+
+export interface LocalToolDiscoveryError extends Error {
+  statusCode: number;
+  code: string;
+  type: string;
+}
+
+/** Author a tool-discovery failure that may use the discovery wire contract verbatim. */
+export function createToolDiscoveryUnavailableError(
+  message: string = 'Tool discovery unavailable; backend tool IDs could not be verified',
+): LocalToolDiscoveryError {
+  const error = new Error(message) as LocalToolDiscoveryError;
+  error.statusCode = 503;
+  error.code = 'tool_discovery_unavailable';
+  error.type = 'tool_discovery_unavailable';
+  Object.defineProperty(error, LOCAL_TOOL_DISCOVERY, { value: true, enumerable: false });
+  return error;
+}
+
+/** True only for proxy-authored discovery failures, never for backend 503 responses. */
+function isLocalToolDiscoveryError(error: unknown): boolean {
+  return Boolean(error) && (typeof error === 'object' || typeof error === 'function') && Reflect.get(error as object, LOCAL_TOOL_DISCOVERY) === true;
+}
+
 /** The wire-safe 400 code of a proxy-authored error, or null for anything else. */
 function localInvalidRequestCode(error: unknown): string | null {
   if (!error || typeof error !== 'object') return null;
@@ -297,6 +323,18 @@ export function transformUpstreamError(error: unknown): TransformedUpstreamError
   let type = 'internal_error';
   let code: string = (typeof typed['code'] === 'string' ? (typed['code'] as string) : 'upstream_error') || 'upstream_error';
 
+  const discoveryMarker = String(typed['code'] ?? typed['type'] ?? '');
+  if (discoveryMarker === 'tool_discovery_unavailable' && isLocalToolDiscoveryError(normalized)) {
+    return {
+      statusCode: 503,
+      error: {
+        message: normalized.message || 'Tool discovery unavailable',
+        type: 'tool_discovery_unavailable',
+        code: 'tool_discovery_unavailable',
+      },
+    };
+  }
+
   // Handle timeout errors
   if (normalized.message && normalized.message.includes('Request timeout')) {
     statusCode = 504;
@@ -390,6 +428,13 @@ export function transformUpstreamError(error: unknown): TransformedUpstreamError
       type = 'invalid_request_error';
       code = localInvalidRequestCode(normalized) ?? 'invalid_request_error';
       message = upstreamMessage || 'Invalid request';
+    } else if (statusCode === 503) {
+      // An unmarked upstream 503 keeps its status but never inherits the
+      // discovery wire contract, which is reserved for proxy-authored errors.
+      statusCode = 503;
+      type = 'server_error';
+      code = 'server_error';
+      message = upstreamMessage || 'Upstream provider error';
     } else if (statusCode >= 500) {
       // Server errors from upstream - map to 502/503
       statusCode = 502;
