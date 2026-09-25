@@ -30,8 +30,8 @@ import { DEFAULT_PROXY_STRATEGY, PROXY_STRATEGIES } from '../src/upstream-proxy/
 
 // Regression tests: docker-compose/.env document DISABLE_TOOLS, but the code
 // only honored OPENCODE_DISABLE_TOOLS, so a legacy DISABLE_TOOLS=true was
-// silently ignored. Note the unit default here is false; the production
-// default (true) comes from index.ts passing defaultConfig as fallback.
+// silently ignored. Both unit and production defaults are true (tools disabled);
+// index.ts passes an explicit file fallback that also defaults to true.
 describe('resolveDisableTools', () => {
     const CANONICAL = 'OPENCODE_DISABLE_TOOLS';
     const LEGACY = 'DISABLE_TOOLS';
