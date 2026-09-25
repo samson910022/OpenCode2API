@@ -448,6 +448,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           steps.push({ type: 'model_output', text, annotations });
           emit({ type: 'interaction.completed', interaction: { id: interactionId, status: 'completed', output_text: text, steps } });
            if (store) {
+             // Text+grounding only: no function tool calls to persist, default [] is intentional.
              storeResponseState(interactionId, sessionId as string, `${pID}/${mID}`);
              ownedSessionId = null;
            }
@@ -480,6 +481,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       steps.push({ type: 'model_output', text, annotations });
       const groundingCount = searchCalls.length;
        if (store) {
+         // Text+grounding only: no function tool calls to persist, default [] is intentional.
          storeResponseState(interactionId, sessionId as string, `${pID}/${mID}`);
          ownedSessionId = null;
        }
