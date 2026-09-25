@@ -90,7 +90,9 @@ docker run -d \
   my-opencode2api
 ```
 
-> 后端 `10001` 仅容器内部使用，不要对外发布（compose 默认也只映射代理端口；改端口用 `OPENCODE_PROXY_PORT`，如 `8090`）。
+> 后端 `10001` 仅容器内部使用，不要对外发布（compose 默认也只映射代理端口；改端口用 `OPENCODE_PROXY_PORT`，legacy 别名 `PORT` 也生效，如 `8090`；`ports` 映射与 `healthcheck` 会同步跟随）。
+
+> compose 里所有配置项都写成空值（`${X:-}`），默认值由代码持有：这样挂载进来的 `config.json` 与 legacy 别名不会被镜像/编排里的非空默认值遮蔽。端口类变量在 `entrypoint.sh` 启动时做 `1..65535` 校验，非法值告警后回落默认，不会把坏端口传给后端。
 
 > 注意：镜像构建时**不会**把本地 `config.json` 烘焙进去（多阶段构建只复制 `dist/` 与依赖，避免把本地密钥带进镜像）。容器内配置请用环境变量，或 `-v ./config.json:/home/node/project/config.json:ro` 挂载（代理会按 `dist/` 同层 → 项目根 → 工作目录顺序查找）。
 
@@ -131,7 +133,7 @@ docker compose logs -f
 
 ```yaml
 healthcheck:
-  test: ["CMD", "curl", "-f", "http://localhost:${OPENCODE_PROXY_PORT:-10000}/health"]
+  test: ["CMD", "curl", "-f", "http://localhost:${OPENCODE_PROXY_PORT:-${PORT:-10000}}/health"]
   interval: 30s
   timeout: 10s
   retries: 3

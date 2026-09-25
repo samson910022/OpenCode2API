@@ -83,12 +83,13 @@ export function parseProxyNoProxyList(value: unknown, fallback: string[]): strin
 
 export const DEFAULT_PROXY_NO_PROXY = ['localhost', '127.0.0.1', '::1'];
 export const DEFAULT_PROXY_COOLDOWN_MS = 300000;
+export const PROXY_STRATEGIES: readonly ProxyStrategy[] = ['failover-rr', 'round-robin', 'random'];
 export const DEFAULT_PROXY_STRATEGY: ProxyStrategy = 'failover-rr';
 
 /** Allow-list the strategy at the config layer so the stored value is always real. */
 export function normalizeProxyStrategy(value: unknown): ProxyStrategy {
   const v = typeof value === 'string' ? value.trim().toLowerCase() : '';
-  return v === 'round-robin' || v === 'random' || v === 'failover-rr' ? (v as ProxyStrategy) : DEFAULT_PROXY_STRATEGY;
+  return (PROXY_STRATEGIES as readonly string[]).includes(v) ? (v as ProxyStrategy) : DEFAULT_PROXY_STRATEGY;
 }
 
 /** Clamp the cooldown at the config layer (positive finite, else default). */

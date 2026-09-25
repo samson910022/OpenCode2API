@@ -17,8 +17,37 @@ chown -R node:node /home/node/.config/opencode
 chown -R node:node /home/node/project
 
 # Allow overriding via environment variables
-PROXY_PORT=${OPENCODE_PROXY_PORT:-10000}
-SERVER_PORT=${OPENCODE_SERVER_PORT:-10001}
+# Ports are validated/normalized here so an invalid value never reaches
+# `opencode serve --port`; canonical names are exported so the proxy merges
+# the same value the container actually uses.
+normalize_port() {
+    local label="$1"
+    local value="$2"
+    local fallback="$3"
+    if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 1 ] && [ "$value" -le 65535 ]; then
+        echo "$value"
+        return 0
+    fi
+    if [ -n "$value" ]; then
+        echo "[Config] Warning: ${label}=\"${value}\" is not a valid port (1-65535); using ${fallback}" >&2
+    fi
+    echo "$fallback"
+}
+
+PROXY_PORT=$(normalize_port "OPENCODE_PROXY_PORT" "${OPENCODE_PROXY_PORT:-}" "")
+if [ -z "$PROXY_PORT" ] && [[ "${PORT:-}" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ]; then
+    PROXY_PORT="$PORT"
+elif [ -z "$PROXY_PORT" ] && [ -n "${OPENCODE_PROXY_PORT:-}${PORT:-}" ]; then
+    echo "[Config] Warning: OPENCODE_PROXY_PORT=\"${OPENCODE_PROXY_PORT:-}\" PORT=\"${PORT:-}\" is not a valid port (1-65535); leaving unset for config.json/file merge" >&2
+fi
+SERVER_PORT=$(normalize_port "OPENCODE_SERVER_PORT" "${OPENCODE_SERVER_PORT:-}" 10001)
+if [ -n "$PROXY_PORT" ]; then
+    export OPENCODE_PROXY_PORT="$PROXY_PORT"
+else
+    unset OPENCODE_PROXY_PORT
+    PROXY_PORT=10000
+fi
+export OPENCODE_SERVER_PORT="$SERVER_PORT"
 
 if [[ "${OPENCODE_PROXY_PROMPT_MODE:-standard}" == "plugin-inject" ]]; then
     echo "Preparing opencode2api plugin-inject prompt mode..."

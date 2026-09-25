@@ -14,6 +14,11 @@ export interface ProxyConfig {
   DISABLE_TOOLS: boolean;
   EXTERNAL_TOOLS_MODE: string;
   EXTERNAL_TOOLS_CONFLICT_POLICY: string;
+  EXTERNAL_TOOL_POLICY_MODE: string;
+  EXTERNAL_TOOL_DEFAULT_RISK_LEVEL: string;
+  EXTERNAL_TOOL_ALLOWLIST: string[];
+  EXTERNAL_TOOL_DENYLIST: string[];
+  EXTERNAL_TOOL_REQUIRE_CONFIRMATION_FOR: string[];
   INTERNAL_WEB_FETCH_ENABLED: boolean;
   INTERNAL_ALLOWED_TOOLS: string[];
   INTERNAL_TOOL_METRICS_ENABLED: boolean;
@@ -57,6 +62,11 @@ export interface ProxyConfigOptions {
   externalToolsMode?: unknown;
   EXTERNAL_TOOLS_CONFLICT_POLICY?: unknown;
   externalToolsConflictPolicy?: unknown;
+  EXTERNAL_TOOL_POLICY_MODE?: unknown;
+  EXTERNAL_TOOL_DEFAULT_RISK_LEVEL?: unknown;
+  EXTERNAL_TOOL_ALLOWLIST?: unknown;
+  EXTERNAL_TOOL_DENYLIST?: unknown;
+  EXTERNAL_TOOL_REQUIRE_CONFIRMATION_FOR?: unknown;
   INTERNAL_WEB_FETCH_ENABLED?: unknown;
   INTERNAL_ALLOWED_TOOLS?: unknown;
   INTERNAL_TOOL_METRICS_ENABLED?: unknown;
