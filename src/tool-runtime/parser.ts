@@ -65,6 +65,7 @@ export type ToolCallStreamParser = ((chunk: string) => FinalToolCall[]) & { flus
 interface ExtractedCalls {
   calls: RawToolCall[];
   spans: TextSpan[];
+  valid?: boolean;
 }
 
 interface JsonValueLocation {
@@ -89,13 +90,148 @@ const RE = {
   invokeParam: new RegExp(`<${MARK}parameter\\s+name\\s*=\\s*["']([^"']+)["']([^>]*)>([\\s\\S]*?)</${MARK}parameter\\s*>`, 'g'),
   // Singular <tool_call> JSON wrapper. Plural is handled by dsmlContainer, which
   // falls through to JSON parsing when it holds no invoke blocks.
-  jsonWrapper: /<tool_call\s*>([\s\S]*?)<\/tool_call\s*>/g,
+  jsonWrapper: /<\u200b?tool_call\s*>([\s\S]*?)<\/\u200b?tool_call\s*>/g,
+  // Opener/closer pairs counted separately so an envelope that never closes is still
+  // detected; the paired patterns above only match complete blocks.
+  dsmlOpen: new RegExp(`<${MARK}tool_calls\\s*>`, 'g'),
+  dsmlClose: new RegExp(`</${MARK}tool_calls\\s*>`, 'g'),
+  jsonOpen: /<\u200b?tool_call\s*>/g,
+  jsonClose: /<\/\u200b?tool_call\s*>/g,
   codeFence: /^\s*```(?:[a-zA-Z0-9_-]*)\s*\n([\s\S]*?)\n?\s*```\s*$/,
+  jsonNameField: /["'](?:tool_name|tool|name)["']\s*:\s*["']([^"'\n]{1,200})["']/g,
   leadingNewline: /^\r?\n/,
   trailingNewline: /\r?\n[ \t]*$/
 };
 
 const escapeRegExp = (value: unknown): string => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+type ScannedTagName = 'canonical' | 'tool_calls' | 'tool_call' | 'invoke' | 'parameter' | 'function';
+
+interface ScannedMarkupTag {
+  start: number;
+  end: number;
+  closing: boolean;
+  name: ScannedTagName;
+  raw: string;
+}
+
+interface MarkupScan {
+  tags: ScannedMarkupTag[];
+  unterminatedStart: number | null;
+}
+
+interface MarkupBlock {
+  start: number;
+  end: number;
+  bodyStart: number;
+  bodyEnd: number;
+}
+
+function maskDoubleQuotedStrings(source: string): string {
+  const chars = source.split('');
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < chars.length; index += 1) {
+    const ch = chars[index] as string;
+    if (inString) {
+      chars[index] = ' ';
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      chars[index] = ' ';
+    }
+  }
+  return chars.join('');
+}
+
+function matchAllOutsideStrings(source: string, pattern: RegExp): RegExpExecArray[] {
+  const masked = maskDoubleQuotedStrings(source);
+  return [...source.matchAll(pattern)].filter((match) => {
+    const index = match.index ?? 0;
+    return masked[index] === source[index];
+  });
+}
+
+function classifyMarkupTag(raw: string): { closing: boolean; name: ScannedTagName } | null {
+  if (/^<function_calls>$/i.test(raw)) return { closing: false, name: 'canonical' };
+  if (/^<\/function_calls>$/i.test(raw)) return { closing: true, name: 'canonical' };
+  if (/^<\u200b?tool_call\s*>$/i.test(raw)) return { closing: false, name: 'tool_call' };
+  if (/^<\/\u200b?tool_call\s*>$/i.test(raw)) return { closing: true, name: 'tool_call' };
+  const dsmlToolCalls = new RegExp(`^<${MARK}tool_calls\\s*>$`, 'i');
+  const dsmlToolCallsClose = new RegExp(`^</${MARK}tool_calls\\s*>$`, 'i');
+  if (dsmlToolCalls.test(raw)) return { closing: false, name: 'tool_calls' };
+  if (dsmlToolCallsClose.test(raw)) return { closing: true, name: 'tool_calls' };
+  const dsmlInvoke = new RegExp(`^<${MARK}invoke\\b`, 'i');
+  const dsmlInvokeClose = new RegExp(`^</${MARK}invoke\\s*>$`, 'i');
+  if (dsmlInvoke.test(raw)) return { closing: false, name: 'invoke' };
+  if (dsmlInvokeClose.test(raw)) return { closing: true, name: 'invoke' };
+  const dsmlParameter = new RegExp(`^<${MARK}parameter\\b`, 'i');
+  const dsmlParameterClose = new RegExp(`^</${MARK}parameter\\s*>$`, 'i');
+  if (dsmlParameter.test(raw)) return { closing: false, name: 'parameter' };
+  if (dsmlParameterClose.test(raw)) return { closing: true, name: 'parameter' };
+  if (/^<function\s*=\s*[^\s/>]+\s*>$/i.test(raw)) return { closing: false, name: 'function' };
+  if (/^<\/function\s*>$/i.test(raw)) return { closing: true, name: 'function' };
+  return null;
+}
+
+function scanMarkupTags(source: string): MarkupScan {
+  const masked = maskDoubleQuotedStrings(source);
+  const tags: ScannedMarkupTag[] = [];
+  let unterminatedStart: number | null = null;
+  for (let index = 0; index < source.length;) {
+    if (masked[index] !== '<') {
+      index += 1;
+      continue;
+    }
+    const end = findTagEnd(source, index + 1);
+    if (end === -1) {
+      const remainder = masked.slice(index);
+      if (new RegExp(`^<(?:\\u200b?tool_call|${MARK}(?:tool_calls|invoke|parameter)|function_calls)`, 'i').test(remainder)) {
+        unterminatedStart = index;
+      }
+      break;
+    }
+    const raw = source.slice(index, end + 1);
+    const classified = classifyMarkupTag(raw);
+    if (classified) tags.push({ start: index, end: end + 1, raw, ...classified });
+    index = end + 1;
+  }
+  return { tags, unterminatedStart };
+}
+
+function findMarkupBlocks(scan: MarkupScan, name: ScannedTagName): MarkupBlock[] {
+  const stack: ScannedMarkupTag[] = [];
+  const blocks: MarkupBlock[] = [];
+  for (const tag of scan.tags) {
+    if (tag.name !== name) continue;
+    if (!tag.closing) {
+      stack.push(tag);
+      continue;
+    }
+    const open = stack.pop();
+    if (!open) continue;
+    blocks.push({ start: open.start, end: tag.end, bodyStart: open.end, bodyEnd: tag.start });
+  }
+  return blocks.sort((a, b) => a.start - b.start);
+}
+
+function hasBalancedMarkupTag(scan: MarkupScan, name: ScannedTagName): boolean {
+  const stack: ScannedMarkupTag[] = [];
+  for (const tag of scan.tags) {
+    if (tag.name !== name) continue;
+    if (!tag.closing) {
+      stack.push(tag);
+      continue;
+    }
+    if (!stack.length) return false;
+    stack.pop();
+  }
+  return stack.length === 0;
+}
 
 /** Tool names accepted for the registry-gated formats, longest first so `<foo_2` wins over `<foo`. */
 function registryNames(registry: unknown): string[] {
@@ -230,6 +366,97 @@ function rawCallsFromJsonText(text: unknown): RawToolCall[] {
   }
 }
 
+function jsonPayloadCandidates(parsed: unknown): unknown[] {
+  if (Array.isArray(parsed)) return parsed as unknown[];
+  if (parsed && typeof parsed === 'object') {
+    const record = parsed as Record<string, unknown>;
+    if (Array.isArray(record['tool_calls'])) return record['tool_calls'] as unknown[];
+    if (Array.isArray(record['invokes'])) return record['invokes'] as unknown[];
+  }
+  return [parsed];
+}
+
+function isJsonMarkupPrefixOrSuffix(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return true;
+  if (/^```[\s\S]*```$/.test(trimmed)) return true;
+  return new RegExp(`^(?:\\s|</${MARK}(?:function_calls|tool_calls|tool_call)\\s*>)+$`, 'i').test(trimmed);
+}
+
+function hasUnclosedJsonDelimiter(value: string): boolean {
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  for (const ch of value) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}' || ch === ']') {
+      const expected: string = ch === '}' ? '{' : '[';
+      if (stack[stack.length - 1] === expected) stack.pop();
+    }
+  }
+  return stack.length > 0 || inString;
+}
+
+function parseJsonEnvelopeText(text: unknown): { parsed: unknown } | null {
+  const trimmed = String(text ?? '').trim();
+  if (!trimmed) return null;
+  try {
+    return { parsed: JSON.parse(trimmed) as unknown };
+  } catch {
+    const found = findFirstJsonValue(trimmed);
+    if (!found) return null;
+    const prefix = trimmed.slice(0, found.start).trim();
+    if (hasUnclosedJsonDelimiter(prefix)) return null;
+    if (!isJsonMarkupPrefixOrSuffix(trimmed.slice(found.end))) return null;
+    try {
+      return { parsed: JSON.parse(found.json) as unknown };
+    } catch {
+      return null;
+    }
+  }
+}
+
+function rawCallsFromJsonEnvelopeText(text: unknown): RawToolCall[] {
+  const parsed = parseJsonEnvelopeText(text);
+  return parsed ? rawCallsFromJsonPayload(parsed.parsed) : [];
+}
+
+function hasValidJsonCallEnvelope(text: unknown, registry?: unknown): boolean {
+  const parsed = parseJsonEnvelopeText(text);
+  if (!parsed) return false;
+  const candidates = jsonPayloadCandidates(parsed.parsed);
+  if (!candidates.length) return false;
+  const calls = candidates.map((candidate) => rawCallFromJson(candidate));
+  if (calls.some((call) => call === null)) return false;
+  if (registry !== undefined && registry !== null && calls.some((call) => !findExternalToolByName(registry, call?.name))) return false;
+  return true;
+}
+
+function rawCallsFromJsonFragments(text: unknown): RawToolCall[] {
+  const source = String(text ?? '');
+  const calls: RawToolCall[] = [];
+  let offset = 0;
+  while (offset < source.length) {
+    const found = findFirstJsonValue(source.slice(offset));
+    if (!found) break;
+    calls.push(...rawCallsFromJsonPayload(JSON.parse(found.json) as unknown));
+    const next = offset + found.end;
+    if (next <= offset) break;
+    offset = next;
+  }
+  return calls;
+}
+
 /** Byte offset just past the JSON value starting at `start`, or -1 if it never closes. */
 function findJsonEnd(text: string, start: number): number {
   const opener: string = text[start] as string;
@@ -276,62 +503,225 @@ function findFirstJsonValue(text: string): JsonValueLocation | null {
 // --- format extractors -----------------------------------------------------
 // Each returns { calls, spans } where spans are [start, end) ranges of consumed markup.
 
-function extractCanonical(text: string): ExtractedCalls {
+function hasSingleValidNestedCanonicalBody(body: string, registry?: unknown): boolean {
+  const nested = matchAllOutsideStrings(body, RE.canonicalBlock);
+  if (nested.length !== 1) return false;
+  const match = nested[0] as RegExpExecArray;
+  const start = match.index ?? 0;
+  return (
+    body.slice(0, start).trim() === '' &&
+    body.slice(start + match[0].length).trim() === '' &&
+    hasValidJsonCallEnvelope(match[1], registry)
+  );
+}
+
+function extractCanonical(text: string, registry?: unknown): ExtractedCalls {
   const calls: RawToolCall[] = [];
   const spans: TextSpan[] = [];
-  for (const match of text.matchAll(RE.canonicalBlock)) {
-    const start: number = match.index ?? 0;
-    spans.push([start, start + match[0].length]);
-    calls.push(...rawCallsFromJsonText(match[1]));
+  let structurallyValid = hasValidCanonicalTagStructure(text);
+  const blocks = findMarkupBlocks(scanMarkupTags(text), 'canonical');
+  for (const block of blocks) {
+    spans.push([block.start, block.end]);
+    const body = text.slice(block.bodyStart, block.bodyEnd);
+    if (hasValidJsonCallEnvelope(body, registry)) calls.push(...rawCallsFromJsonEnvelopeText(body));
+    else if (!hasSingleValidNestedCanonicalBody(body, registry)) structurallyValid = false;
   }
-  return { calls, spans };
+  return { calls: structurallyValid ? calls : [], spans, valid: structurallyValid };
+}
+
+interface DsmlTagToken {
+  closing: boolean;
+  name: string;
+  start: number;
+  end: number;
+  raw: string;
+}
+
+interface DsmlAnalysis {
+  hasMarkup: boolean;
+  valid: boolean;
+  calls: RawToolCall[];
+  spans: TextSpan[];
+}
+
+function dsmlTagTokens(segment: string): { tokens: DsmlTagToken[]; unterminatedStart: number | null } {
+  const scan = scanMarkupTags(segment);
+  const dsmlSyntax = new RegExp(`<${MARK}(?:invoke|parameter)\\s+name\\s*=`, 'i').test(maskDoubleQuotedStrings(segment));
+  const tokens: DsmlTagToken[] = [];
+  for (const tag of scan.tags) {
+    if (tag.name !== 'tool_calls' && tag.name !== 'invoke' && tag.name !== 'parameter') continue;
+    if (tag.name === 'parameter' && !dsmlSyntax) continue;
+    tokens.push({ closing: tag.closing, name: tag.name, start: tag.start, end: tag.end, raw: tag.raw });
+  }
+  return { tokens, unterminatedStart: scan.unterminatedStart };
+}
+
+function dsmlInvokeName(raw: string): string | null {
+  const match = new RegExp(`^<${MARK}invoke\\s+name\\s*=\\s*(["'])([^"']+)\\1\\s*>$`, 'i').exec(raw);
+  return match?.[2] ?? null;
+}
+
+function dsmlParameter(raw: string): { name: string; attrs: string } | null {
+  const match = new RegExp(`^<${MARK}parameter\\s+name\\s*=\\s*(["'])([^"']+)\\1([^>]*)>$`, 'i').exec(raw);
+  if (!match?.[2]) return null;
+  return { name: match[2], attrs: match[3] ?? '' };
+}
+
+function isDsmlClose(raw: string, name: string): boolean {
+  return new RegExp(`^</${MARK}${name}\\s*>$`, 'i').test(raw);
+}
+
+function analyzeDsmlSegment(segment: string, allowOutsideText: boolean = false): DsmlAnalysis {
+  const scan = dsmlTagTokens(segment);
+  const hasMarkup = scan.tokens.length > 0 || scan.unterminatedStart !== null;
+  if (!hasMarkup) return { hasMarkup: false, valid: true, calls: [], spans: [] };
+
+  const calls: RawToolCall[] = [];
+  const spans: TextSpan[] = [];
+  let valid = true;
+  let cursor = 0;
+  let invoke: { name: string; args: Record<string, unknown>; start: number } | null = null;
+  let parameter: { name: string; attrs: string; contentStart: number } | null = null;
+  const firstMarkupStart = scan.unterminatedStart ?? scan.tokens[0]?.start ?? 0;
+
+  for (const token of scan.tokens) {
+    if (!allowOutsideText && !parameter && segment.slice(cursor, token.start).trim()) valid = false;
+    if (token.name === 'tool_calls') valid = false;
+    if (token.closing) {
+      if (!isDsmlClose(token.raw, token.name)) valid = false;
+      if (token.name === 'parameter') {
+        if (!parameter || !invoke) {
+          valid = false;
+        } else {
+          invoke.args[parameter.name] = coerceParamValue(
+            trimParamValue(segment.slice(parameter.contentStart, token.start)),
+            parameter.attrs
+          );
+          parameter = null;
+        }
+      } else if (token.name === 'invoke') {
+        if (!invoke || parameter) {
+          valid = false;
+        } else {
+          calls.push({ name: invoke.name, arguments: invoke.args });
+          spans.push([invoke.start, token.end]);
+          invoke = null;
+        }
+      }
+    } else if (token.name === 'invoke') {
+      const name = dsmlInvokeName(token.raw);
+      if (invoke || parameter || !name) valid = false;
+      else invoke = { name, args: {}, start: token.start };
+    } else if (token.name === 'parameter') {
+      const parsed = dsmlParameter(token.raw);
+      if (!invoke || parameter || !parsed) valid = false;
+      else parameter = { name: parsed.name, attrs: parsed.attrs, contentStart: token.end };
+    }
+    cursor = token.end;
+  }
+
+  if (parameter) valid = false;
+  if (invoke) {
+    valid = false;
+    spans.push([invoke.start, segment.length]);
+  }
+  if (!allowOutsideText && segment.slice(cursor).trim()) valid = false;
+  if (!valid) spans.push([firstMarkupStart, segment.length]);
+  return { hasMarkup, valid, calls: valid ? calls : [], spans };
 }
 
 function extractInvokeBlocks(segment: string): RawToolCall[] {
-  const calls: RawToolCall[] = [];
-  for (const invoke of segment.matchAll(RE.invokeBlock)) {
-    const args: Record<string, unknown> = {};
-    for (const param of invoke[2].matchAll(RE.invokeParam)) {
-      args[param[1]] = coerceParamValue(trimParamValue(param[3]), param[2]);
-    }
-    calls.push({ name: invoke[1], arguments: args });
-  }
-  return calls;
+  return analyzeDsmlSegment(segment).calls;
 }
 
 /** DSML/plain `<tool_calls>` containers, plus bare `<invoke>` blocks outside any container. */
-function extractDsml(text: string): ExtractedCalls {
-  const calls: RawToolCall[] = [];
-  const spans: TextSpan[] = [];
-  let remainder = text;
-
-  for (const container of text.matchAll(RE.dsmlContainer)) {
-    const start: number = container.index ?? 0;
-    spans.push([start, start + container[0].length]);
-    const inner = extractInvokeBlocks(container[1]);
-    // A <tool_calls> wrapper around plain JSON is also common.
-    calls.push(...(inner.length ? inner : rawCallsFromJsonText(container[1])));
-    remainder = remainder.replace(container[0], ' '.repeat(container[0].length));
+function dsmlRemainder(text: string): string {
+  const blocks = findMarkupBlocks(scanMarkupTags(text), 'tool_calls');
+  let remainder = '';
+  let cursor = 0;
+  for (const block of blocks) {
+    if (block.start < cursor) continue;
+    remainder += text.slice(cursor, block.start) + ' '.repeat(block.end - block.start);
+    cursor = block.end;
   }
-
-  for (const invoke of remainder.matchAll(RE.invokeBlock)) {
-    const start: number = invoke.index ?? 0;
-    spans.push([start, start + invoke[0].length]);
-    calls.push(...extractInvokeBlocks(invoke[0]));
-  }
-
-  return { calls, spans };
+  return remainder + text.slice(cursor);
 }
 
-function extractJsonWrapper(text: string): ExtractedCalls {
+function extractDsml(text: string, registry?: unknown): ExtractedCalls {
   const calls: RawToolCall[] = [];
   const spans: TextSpan[] = [];
-  for (const match of text.matchAll(RE.jsonWrapper)) {
-    const start: number = match.index ?? 0;
-    spans.push([start, start + match[0].length]);
-    calls.push(...rawCallsFromJsonText(match[1]));
+  let structurallyValid = true;
+  const scan = scanMarkupTags(text);
+
+  for (const container of findMarkupBlocks(scan, 'tool_calls')) {
+    spans.push([container.start, container.end]);
+    const body = text.slice(container.bodyStart, container.bodyEnd);
+    const analysis = analyzeDsmlSegment(body);
+    if (analysis.hasMarkup) {
+      if (
+        analysis.valid &&
+        (registry === undefined || analysis.calls.every((call) => Boolean(findExternalToolByName(registry, call.name))))
+      ) calls.push(...analysis.calls);
+      else structurallyValid = false;
+    } else {
+      const jsonCalls = rawCallsFromJsonEnvelopeText(body);
+      if (
+        jsonCalls.length &&
+        (registry === undefined || jsonCalls.every((call) => Boolean(findExternalToolByName(registry, call.name))))
+      ) calls.push(...jsonCalls);
+      else structurallyValid = false;
+    }
   }
-  return { calls, spans };
+
+  const naked = analyzeDsmlSegment(dsmlRemainder(text), true);
+  if (naked.hasMarkup) {
+    if (
+      naked.valid &&
+      (registry === undefined || naked.calls.every((call) => Boolean(findExternalToolByName(registry, call.name))))
+    ) calls.push(...naked.calls);
+    else structurallyValid = false;
+    spans.push(...naked.spans);
+  }
+
+  return { calls: structurallyValid ? calls : [], spans, valid: structurallyValid };
+}
+
+interface NonJsonToolWrapperResult {
+  calls: RawToolCall[];
+  spans: TextSpan[];
+  valid: boolean;
+}
+
+function extractNonJsonToolWrapper(registry: unknown, body: string): NonJsonToolWrapperResult {
+  const functionResult = extractFunctionEquals(body);
+  const tagResult = extractTagNamed(body, registryNames(registry), registrySchemas(registry));
+  const calls = [...functionResult.calls, ...tagResult.calls];
+  const spans = [...functionResult.spans, ...tagResult.spans];
+  const valid = calls.length > 0 && !textOutsideSpans(body, spans).some((segment) => segment.trim());
+  return { calls, spans, valid };
+}
+
+function extractJsonWrapper(text: string, registry?: unknown): ExtractedCalls {
+  const calls: RawToolCall[] = [];
+  const spans: TextSpan[] = [];
+  let structurallyValid = true;
+  for (const wrapper of findMarkupBlocks(scanMarkupTags(text), 'tool_call')) {
+    const body = text.slice(wrapper.bodyStart, wrapper.bodyEnd);
+    const bodyCalls = rawCallsFromJsonEnvelopeText(body);
+    if (bodyCalls.length) {
+      if (hasValidJsonCallEnvelope(body, registry)) {
+        calls.push(...bodyCalls);
+        spans.push([wrapper.start, wrapper.end]);
+      } else {
+        structurallyValid = false;
+      }
+      continue;
+    }
+    const nonJson = extractNonJsonToolWrapper(registry, body);
+    if (nonJson.valid) spans.push([wrapper.start, wrapper.end]);
+    else structurallyValid = false;
+  }
+  return { calls: structurallyValid ? calls : [], spans, valid: structurallyValid };
 }
 
 /**
@@ -483,7 +873,7 @@ function extractTagNamed(text: string, names: string[], schemas: Map<string, unk
 
   const opener = new RegExp(`<(${names.map(escapeRegExp).join('|')})(?=[\\s/>"'])`, 'g');
 
-  for (const match of text.matchAll(opener)) {
+  for (const match of matchAllOutsideStrings(text, opener)) {
     const name: string = match[1];
     const matchIndex: number = match.index ?? 0;
     const attrsStart = matchIndex + match[0].length;
@@ -518,7 +908,8 @@ function extractTagNamed(text: string, names: string[], schemas: Map<string, unk
 
     // Body may be wrapped in a matching close tag, or simply trail the opener.
     const closeTag = `</${name}>`;
-    const closeIdx = text.indexOf(closeTag, openEnd);
+    const closeMatch = matchAllOutsideStrings(text.slice(openEnd), new RegExp(`</${escapeRegExp(name)}\\s*>`, 'gi'))[0];
+    const closeIdx = closeMatch ? openEnd + (closeMatch.index ?? 0) : -1;
     const body = closeIdx === -1 ? text.slice(openEnd) : text.slice(openEnd, closeIdx);
     const json = findFirstJsonValue(body);
     const consumedEnd = closeIdx === -1
@@ -535,17 +926,23 @@ function extractTagNamed(text: string, names: string[], schemas: Map<string, unk
           const decoded: unknown = JSON.parse(json.json);
           calls.push({ name, arguments: decoded });
         } catch {
-          calls.push({ name, arguments: {} });
+          continue;
         }
       }
-    } else {
-      // No JSON body. Arguments may still be present as XML child elements named
-      // after the schema's properties; dropping them here produced tool calls with
-      // empty arguments, which fail validation for any tool with required fields.
-      const xmlArgs = argsFromXmlChildren(body, schemas.get(name));
-      calls.push({ name, arguments: xmlArgs || {} });
+      spans.push([matchIndex, consumedEnd]);
+      continue;
     }
-    spans.push([matchIndex, consumedEnd]);
+
+    // No JSON body. Arguments may still be present as XML child elements named
+    // after the schema's properties; dropping them here produced tool calls with
+    // empty arguments, which fail validation for any tool with required fields.
+    const xmlArgs = argsFromXmlChildren(body, schemas.get(name));
+    if (xmlArgs) {
+      calls.push({ name, arguments: xmlArgs });
+      spans.push([matchIndex, consumedEnd]);
+      continue;
+    }
+    spans.push([matchIndex, closeIdx === -1 ? openEnd : closeIdx + closeTag.length]);
   }
 
   return { calls, spans };
@@ -555,8 +952,8 @@ function extractTagNamed(text: string, names: string[], schemas: Map<string, unk
  * Registry-gated bare JSON. Requires the JSON to be the whole message body (optionally
  * inside one code fence) so that payloads quoted inside prose are left alone.
  */
-function extractBareJson(text: string, names: string[]): ExtractedCalls {
-  if (!names.length) return { calls: [], spans: [] };
+function extractBareJson(text: string, registry: unknown): ExtractedCalls {
+  if (!Array.isArray(registry) || registry.length === 0) return { calls: [], spans: [] };
   const trimmed = text.trim();
   if (!trimmed || (trimmed[0] !== '{' && trimmed[0] !== '[' && !trimmed.startsWith('```'))) {
     return { calls: [], spans: [] };
@@ -565,10 +962,19 @@ function extractBareJson(text: string, names: string[]): ExtractedCalls {
   const fenced = trimmed.match(RE.codeFence);
   const body = (fenced ? String(fenced[1]) : trimmed).trim();
   if (!body || (body[0] !== '{' && body[0] !== '[')) return { calls: [], spans: [] };
-
-  const calls = rawCallsFromJsonText(body).filter((call) => names.includes(call.name));
-  if (!calls.length) return { calls: [], spans: [] };
-  return { calls, spans: [[0, text.length]] };
+  const parsed = parseJsonEnvelopeText(body);
+  if (!parsed) {
+    const known = rawCallsFromJsonFragments(body).some((call) => Boolean(findExternalToolByName(registry, call.name))) || hasKnownJsonNameHint(registry, body);
+    return known ? { calls: [], spans: [[0, text.length]] } : { calls: [], spans: [] };
+  }
+  const candidates = jsonPayloadCandidates(parsed.parsed);
+  if (!candidates.length) return { calls: [], spans: [] };
+  const calls = candidates.map((candidate) => rawCallFromJson(candidate));
+  if (calls.some((call) => call === null || !findExternalToolByName(registry, call?.name))) {
+    const known = calls.some((call) => call !== null && Boolean(findExternalToolByName(registry, call.name)));
+    return known ? { calls: [], spans: [[0, text.length]] } : { calls: [], spans: [] };
+  }
+  return { calls: calls as RawToolCall[], spans: [[0, text.length]] };
 }
 
 /**
@@ -588,29 +994,54 @@ function extractBareJson(text: string, names: string[]): ExtractedCalls {
  * whole `<function>...</function>` block for hiding. Name mapping (e.g. `webfetch` →
  * `web_fetch`) is resolved later against the request's registry.
  */
-function extractFunctionEquals(text: string): ExtractedCalls {
+function functionEqualsAllowsEmptyArguments(name: string, registry: unknown): boolean {
+  if (registry === undefined || registry === null) return true;
+  const tool = findExternalToolByName(registry, name);
+  if (!tool) return false;
+  const parameters = tool.parameters && typeof tool.parameters === 'object' ? tool.parameters as Record<string, unknown> : {};
+  const required = parameters['required'];
+  return !Array.isArray(required) || required.length === 0;
+}
+
+function extractFunctionEquals(text: string, registry?: unknown): ExtractedCalls {
   const calls: RawToolCall[] = [];
   const spans: TextSpan[] = [];
+  let structurallyValid = true;
   const openerRe = /<function\s*=\s*([^\s/>]+)\s*>/gi;
-  for (const match of text.matchAll(openerRe)) {
+  for (const match of matchAllOutsideStrings(text, openerRe)) {
     const name: string = String(match[1]).trim();
     if (!name) continue;
     const matchIndex: number = match.index ?? 0;
     const openEnd = matchIndex + match[0].length;
-    const closeIdx = text.indexOf('</function>', openEnd);
-    const end = closeIdx === -1 ? text.length : closeIdx + '</function>'.length;
-    const body = closeIdx === -1 ? text.slice(openEnd) : text.slice(openEnd, closeIdx);
+    const closeMatch = matchAllOutsideStrings(text.slice(openEnd), /<\/function\s*>/gi)[0];
+    const closeIdx = closeMatch ? openEnd + (closeMatch.index ?? 0) : -1;
+    if (closeIdx === -1) {
+      spans.push([matchIndex, openEnd]);
+      structurallyValid = false;
+      continue;
+    }
+    const end = closeIdx + String(closeMatch[0]).length;
+    const body = text.slice(openEnd, closeIdx);
 
     const args: Record<string, unknown> = {};
     const paramRe = /<parameter\s*=\s*([^\s/>]+)\s*>([\s\S]*?)<\/parameter\s*>/gi;
-    for (const param of body.matchAll(paramRe)) {
+    for (const param of matchAllOutsideStrings(body, paramRe)) {
       args[String(param[1]).trim()] = trimParamValue(param[2]);
+    }
+    const openCount = (body.match(/<parameter\s*=/gi) || []).length;
+    const closeCount = (body.match(/<\/parameter\s*>/gi) || []).length;
+    if (openCount !== closeCount || Object.keys(args).length !== openCount) structurallyValid = false;
+    if (!Object.keys(args).length) {
+      spans.push([matchIndex, end]);
+      if (functionEqualsAllowsEmptyArguments(name, registry)) calls.push({ name, arguments: {} });
+      else structurallyValid = false;
+      continue;
     }
 
     calls.push({ name, arguments: args });
     spans.push([matchIndex, end]);
   }
-  return { calls, spans };
+  return { calls, spans, valid: structurallyValid };
 }
 
 /** Every format in one pass. `spans` cover all markup that should be hidden from users. */
@@ -621,39 +1052,210 @@ function collectAll(text: unknown, registry: unknown): ExtractedCalls {
   const schemas = registrySchemas(registry);
 
   const results: ExtractedCalls[] = [
-    extractCanonical(source),
-    extractDsml(source),
-    extractJsonWrapper(source),
-    extractFunctionEquals(source),
+    extractCanonical(source, registry),
+    extractDsml(source, registry),
+    extractJsonWrapper(source, registry),
+    extractFunctionEquals(source, registry),
     extractTagNamed(source, names, schemas),
-    extractBareJson(source, names)
+    extractBareJson(source, registry)
   ];
 
   const seen = new Set<string>();
   const calls: RawToolCall[] = [];
   results.forEach((result) => {
     result.calls.forEach((call) => {
-      // Distinct formats can describe the same call (e.g. a tag wrapping JSON that
-      // also names the tool); keep one entry per name+arguments pair.
-      const key = `${call.name}::${JSON.stringify(call.arguments)}`;
+      const explicit = typeof call.id === 'string' && Boolean(call.id);
+      const key = `${explicit ? `id:${call.id}` : 'generated'}::${toolCallKey(call.name, call.arguments)}`;
       if (seen.has(key)) return;
       seen.add(key);
       calls.push(call);
     });
   });
 
-  return { calls, spans: results.flatMap((result) => result.spans) };
+  const structurallyValid = results.every((result) => result.valid !== false);
+  return { calls: structurallyValid ? calls : [], spans: results.flatMap((result) => result.spans) };
+}
+
+const GENERATED_CALL_MARKER = '__opencode_generated_tool_call__';
+
+type InternalFinalToolCall = FinalToolCall & { [GENERATED_CALL_MARKER]?: boolean };
+
+function markGeneratedToolCall(call: FinalToolCall): FinalToolCall {
+  const marked = { ...call } as InternalFinalToolCall;
+  Object.defineProperty(marked, GENERATED_CALL_MARKER, {
+    value: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return marked;
+}
+
+function isGeneratedToolCall(call: unknown): boolean {
+  return Boolean(
+    call &&
+      typeof call === 'object' &&
+      (call as Record<string, unknown>)[GENERATED_CALL_MARKER] === true,
+  );
 }
 
 function toFinalCalls(rawCalls: RawToolCall[], seed = 0): FinalToolCall[] {
-  return rawCalls.map((call, index) => ({
-    id: typeof call.id === 'string' && call.id ? call.id : `call_${Date.now()}_${seed + index + 1}`,
-    type: 'function' as const,
-    function: {
-      name: call.name,
-      arguments: typeof call.arguments === 'string' ? call.arguments : JSON.stringify(call.arguments ?? {})
+  return rawCalls.map((call, index) => {
+    const finalCall: FinalToolCall = {
+      id: typeof call.id === 'string' && call.id ? call.id : `call_${Date.now()}_${seed + index + 1}`,
+      type: 'function' as const,
+      function: {
+        name: call.name,
+        arguments: typeof call.arguments === 'string' ? call.arguments : JSON.stringify(call.arguments ?? {})
+      }
+    };
+    return typeof call.id === 'string' && call.id ? finalCall : markGeneratedToolCall(finalCall);
+  });
+}
+
+function stringifyToolArguments(args: unknown): string {
+  if (typeof args === 'string') return args;
+  try {
+    return JSON.stringify(args ?? {}) ?? '{}';
+  } catch {
+    return '{}';
+  }
+}
+
+function canonicalizeJsonValue(value: unknown, seen: WeakSet<object> = new WeakSet()): unknown {
+  if (Array.isArray(value)) {
+    if (seen.has(value)) throw new Error('circular tool arguments');
+    seen.add(value);
+    const canonical = value.map((item) => canonicalizeJsonValue(item, seen));
+    seen.delete(value);
+    return canonical;
+  }
+  if (value && typeof value === 'object') {
+    if (seen.has(value)) throw new Error('circular tool arguments');
+    seen.add(value);
+    const record = value as Record<string, unknown>;
+    const canonical: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    Object.keys(record).sort().forEach((key) => {
+      canonical[key] = canonicalizeJsonValue(record[key], seen);
+    });
+    seen.delete(value);
+    return canonical;
+  }
+  return value;
+}
+
+function canonicalToolArguments(args: unknown): string {
+  let value = args;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return stringifyToolArguments(args);
     }
-  }));
+  }
+  try {
+    return JSON.stringify(canonicalizeJsonValue(value)) ?? stringifyToolArguments(args);
+  } catch {
+    return stringifyToolArguments(args);
+  }
+}
+
+function toolCallKey(name: string, args: unknown): string {
+  return `${name}\u0000${canonicalToolArguments(args)}`;
+}
+
+export function mergeToolCallArtifacts(...artifacts: unknown[]): FinalToolCall[] {
+  const values: unknown[] = [];
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (value && typeof value === 'object') {
+      const nested = (value as Record<string, unknown>)['calls'];
+      if (Array.isArray(nested)) {
+        nested.forEach(visit);
+        return;
+      }
+      values.push(value);
+    }
+  };
+  artifacts.forEach(visit);
+
+  const reservedExplicitIds = new Set<string>();
+  values.forEach((value: unknown) => {
+    const record = value as Record<string, unknown>;
+    const generated = isGeneratedToolCall(record);
+    const id = record['id'];
+    if (!generated && typeof id === 'string' && id) reservedExplicitIds.add(id);
+  });
+
+  const output: FinalToolCall[] = [];
+  const usedIds = new Set<string>();
+  const seenExplicitArtifacts = new Set<string>();
+  const seenGenerated = new Set<string>();
+  const generatedCounts = new Map<string, number>();
+
+  values.forEach((value: unknown) => {
+    const record = value as Record<string, unknown>;
+    const fn = record['function'];
+    const fnRecord = fn && typeof fn === 'object' && !Array.isArray(fn)
+      ? (fn as Record<string, unknown>)
+      : {};
+    const name = String(fnRecord['name'] ?? '');
+    const args = fnRecord['arguments'] ?? {};
+    const generated = isGeneratedToolCall(record) || (typeof record['id'] !== 'string' || !record['id']);
+    const rawId = typeof record['id'] === 'string' ? record['id'] : '';
+
+    if (!generated) {
+      const key = `${rawId}\u0000${toolCallKey(name, args)}`;
+      if (seenExplicitArtifacts.has(key)) return;
+      seenExplicitArtifacts.add(key);
+      usedIds.add(rawId);
+      output.push({
+        id: rawId,
+        type: 'function',
+        function: {
+          name,
+          arguments: stringifyToolArguments(args)
+        }
+      });
+      return;
+    }
+
+    const key = toolCallKey(name, args);
+    if (seenGenerated.has(key)) return;
+    seenGenerated.add(key);
+    const generatedBase = rawId || `call_${name.replace(/[^a-zA-Z0-9_]/g, '_') || 'tool'}`;
+    let id: string;
+    if (rawId) {
+      id = rawId;
+      let suffix = generatedCounts.get(rawId) || 0;
+      while (usedIds.has(id) || reservedExplicitIds.has(id)) {
+        suffix += 1;
+        id = `${rawId}_${suffix + 1}`;
+      }
+      generatedCounts.set(rawId, suffix);
+    } else {
+      let count = (generatedCounts.get(generatedBase) || 0) + 1;
+      id = `${generatedBase}_${count}`;
+      while (usedIds.has(id) || reservedExplicitIds.has(id)) {
+        count += 1;
+        id = `${generatedBase}_${count}`;
+      }
+      generatedCounts.set(generatedBase, count);
+    }
+    usedIds.add(id);
+    output.push(markGeneratedToolCall({
+      id,
+      type: 'function',
+      function: {
+        name,
+        arguments: stringifyToolArguments(args)
+      }
+    }));
+  });
+
+  return output;
 }
 
 // --- public API ------------------------------------------------------------
@@ -666,6 +1268,23 @@ export function parseToolCallsFromText(...chunks: unknown[]): FinalToolCall[] {
     calls.push(...extractCanonical(chunk).calls);
   });
   return toFinalCalls(calls);
+}
+
+function mergeTextSpans(spans: TextSpan[]): TextSpan[] {
+  return [...spans].sort((a, b) => a[0] - b[0]).reduce((acc: TextSpan[], span: TextSpan) => {
+    const last: TextSpan | undefined = acc[acc.length - 1];
+    if (last && span[0] <= last[1]) last[1] = Math.max(last[1], span[1]);
+    else acc.push([...span] as TextSpan);
+    return acc;
+  }, []);
+}
+
+function stripTextSpans(text: string, spans: TextSpan[]): string {
+  if (!spans.length) return text;
+  return mergeTextSpans(spans).reduceRight((acc: string, span: TextSpan) => {
+    const [start, end] = span;
+    return acc.slice(0, start) + acc.slice(end);
+  }, text);
 }
 
 export interface StripMarkupOptions {
@@ -683,23 +1302,70 @@ export function stripFunctionCallMarkup(text: string, trim: boolean = true, opti
   const opts: Record<string, unknown> =
     options && typeof options === 'object' ? (options as unknown as Record<string, unknown>) : {};
   const { spans } = collectAll(text, opts['registry']);
-
-  let cleaned = text;
-  if (spans.length) {
-    const merged: TextSpan[] = [...spans].sort((a, b) => a[0] - b[0]).reduce((acc: TextSpan[], span: TextSpan) => {
-      const last: TextSpan | undefined = acc[acc.length - 1];
-      if (last && span[0] <= last[1]) last[1] = Math.max(last[1], span[1]);
-      else acc.push([...span] as TextSpan);
-      return acc;
-    }, []);
-    cleaned = merged.reduceRight((acc: string, span: TextSpan) => {
-      const [start, end] = span;
-      return acc.slice(0, start) + acc.slice(end);
-    }, cleaned);
-  }
-
-  cleaned = cleaned.replace(RE.canonicalStrayTag, '');
+  const cleaned = stripTextSpans(text, spans).replace(RE.canonicalStrayTag, '');
   return trim ? cleaned.trim() : cleaned;
+}
+
+export function stripExternalToolCallMarkupFromJoinedText(
+  registry: unknown,
+  reasoning: unknown,
+  content: unknown,
+  trim: boolean = false,
+): { reasoning: string; content: string } {
+  const reasoningText = typeof reasoning === 'string' ? reasoning : '';
+  const contentText = typeof content === 'string' ? content : '';
+  const source = `${reasoningText}${contentText}`;
+  const { spans } = collectAll(source, registry);
+  // A bare tool-call payload normally occupies one whole channel while the other carries
+  // ordinary reasoning or text. Joined, the body no longer looks like bare JSON, so the
+  // registry-gated whole-body rule never fires and the raw payload would stay visible.
+  // Re-derive the payload per channel; a joined span that swallows such a channel span
+  // is dropped in favour of the narrower per-channel one so the sibling channel's text
+  // survives. Ordinary JSON and non-tool arrays produce no channel span and stay visible.
+  const names = registryNames(registry);
+  const channelSpans: TextSpan[] = [];
+  if (names.length) {
+    for (const span of extractBareJson(reasoningText, registry).spans) {
+      channelSpans.push([span[0], span[1]]);
+    }
+    for (const span of extractBareJson(contentText, registry).spans) {
+      channelSpans.push([reasoningText.length + span[0], reasoningText.length + span[1]]);
+    }
+  }
+  // A payload split across the two channels only completes in the joined body, so the
+  // joined whole-body span is the accurate one; narrowing it to the half that parses would
+  // leave the other half visible.
+  const joinedWholeBody = hasValidJsonCallEnvelope(source, registry);
+  const widenedSpans = channelSpans.length && !joinedWholeBody
+    ? spans.filter((span) => !channelSpans.some((inner) => inner[0] >= span[0] && inner[1] <= span[1]))
+    : spans;
+  const merged = mergeTextSpans([...widenedSpans, ...channelSpans]);
+  let reasoningOut = '';
+  let contentOut = '';
+  let cursor = 0;
+  const append = (start: number, end: number): void => {
+    if (end <= start) return;
+    const segment = source.slice(start, end);
+    if (start < reasoningText.length) {
+      const reasoningEnd = Math.min(end, reasoningText.length);
+      reasoningOut += segment.slice(0, reasoningEnd - start);
+    }
+    const contentStart = Math.max(start, reasoningText.length);
+    if (end > contentStart) {
+      contentOut += segment.slice(contentStart - start);
+    }
+  };
+  merged.forEach(([start, end]) => {
+    append(cursor, start);
+    cursor = Math.max(cursor, end);
+  });
+  append(cursor, source.length);
+  reasoningOut = reasoningOut.replace(RE.canonicalStrayTag, '');
+  contentOut = contentOut.replace(RE.canonicalStrayTag, '');
+  return {
+    reasoning: trim ? reasoningOut.trim() : reasoningOut,
+    content: trim ? contentOut.trim() : contentOut,
+  };
 }
 
 /** Parse tool calls and map them onto the request's registry, dropping unknown tools. */
@@ -718,7 +1384,7 @@ export function parseExternalToolCallsFromText(registry: unknown, ...chunks: unk
     if (!tool) return [];
     const nextCount = (counts.get(tool.namespacedName) || 0) + 1;
     counts.set(tool.namespacedName, nextCount);
-    return [{
+    const finalCall: FinalToolCall = {
       id: typeof rawCall.id === 'string' && rawCall.id
         ? rawCall.id
         : `call_${tool.namespacedName.replace(/[^a-zA-Z0-9_]/g, '_')}_${nextCount}`,
@@ -729,8 +1395,296 @@ export function parseExternalToolCallsFromText(registry: unknown, ...chunks: unk
           ? rawCall.arguments
           : JSON.stringify(rawCall.arguments ?? {})
       }
-    }];
+    };
+    return typeof rawCall.id === 'string' && rawCall.id
+      ? [finalCall]
+      : [markGeneratedToolCall(finalCall)];
   });
+}
+
+export function parseExternalToolCallsFromJoinedText(
+  registry: unknown,
+  reasoning: unknown,
+  content: unknown,
+): FinalToolCall[] {
+  if (!Array.isArray(registry) || (registry as unknown[]).length === 0) return [];
+  const reasoningText = typeof reasoning === 'string' ? reasoning : '';
+  const contentText = typeof content === 'string' ? content : '';
+  return mergeToolCallArtifacts(
+    parseExternalToolCallsFromText(registry, reasoningText),
+    parseExternalToolCallsFromText(registry, contentText),
+    parseExternalToolCallsFromText(registry, `${reasoningText}${contentText}`),
+  );
+}
+
+export function hasExternalToolCallMarkup(registry: unknown, text: unknown): boolean {
+  if (typeof text !== 'string' || !text) return false;
+  return collectAll(text, registry).spans.length > 0;
+}
+
+/**
+ * Bare tool-call payload (format 5): the whole body is one call, an array of calls, or a
+ * `{tool_calls:[...]}` wrapper. Ordinary JSON and non-tool arrays are left alone, so the
+ * check is inert until at least one member resolves onto a registered tool. Once it is
+ * tool-call shaped the batch is all-or-nothing: every member must be a well-formed call
+ * for a registered tool, which also covers invalid and trailing members.
+ */
+function hasKnownJsonNameHint(registry: unknown, text: string): boolean {
+  if (!Array.isArray(registry) || registry.length === 0) return false;
+  for (const match of text.matchAll(RE.jsonNameField)) {
+    if (findExternalToolByName(registry, match[1])) return true;
+  }
+  return false;
+}
+
+function hasMalformedBareJsonCall(registry: unknown, text: string, joined?: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (joined !== undefined && hasUnclosedJsonDelimiter(trimmed) && !hasUnclosedJsonDelimiter(joined)) return false;
+  const fenced = trimmed.match(RE.codeFence);
+  const body = (fenced ? String(fenced[1]) : trimmed).trim();
+  if (!body || (body[0] !== '{' && body[0] !== '[')) {
+    return trimmed.startsWith('```') && hasKnownJsonNameHint(registry, trimmed);
+  }
+
+  const parsed = parseJsonEnvelopeText(body);
+  const calls = parsed
+    ? jsonPayloadCandidates(parsed.parsed).map((candidate) => rawCallFromJson(candidate)).filter((call): call is RawToolCall => call !== null)
+    : [];
+  const known = calls.filter((call) => Boolean(findExternalToolByName(registry, call.name)));
+  if (known.length) return !hasValidJsonCallEnvelope(body, registry);
+  if (parsed) return false;
+  return rawCallsFromJsonFragments(body).some((call) => Boolean(findExternalToolByName(registry, call.name))) || hasKnownJsonNameHint(registry, body);
+}
+
+function bareJsonLooksLikeToolCall(registry: unknown, text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  const fenced = trimmed.match(RE.codeFence);
+  const body = (fenced ? String(fenced[1]) : trimmed).trim();
+  if (!body || (body[0] !== '{' && body[0] !== '[')) return false;
+  const parsed = parseJsonEnvelopeText(body);
+  if (!parsed) return hasKnownJsonNameHint(registry, body);
+  return jsonPayloadCandidates(parsed.parsed).some((candidate) => {
+    const call = rawCallFromJson(candidate);
+    return call !== null && Boolean(findExternalToolByName(registry, call.name));
+  });
+}
+
+function textOutsideSpans(source: string, spans: TextSpan[]): string[] {
+  if (!spans.length) return source ? [source] : [];
+  const segments: string[] = [];
+  let cursor = 0;
+  for (const [start, end] of mergeTextSpans(spans)) {
+    if (start > cursor) segments.push(source.slice(cursor, start));
+    cursor = Math.max(cursor, end);
+  }
+  if (cursor < source.length) segments.push(source.slice(cursor));
+  return segments;
+}
+
+function hasStrayBareJsonToolPayload(registry: unknown, source: string, spans: TextSpan[]): boolean {
+  return textOutsideSpans(source, spans).some((segment) => bareJsonLooksLikeToolCall(registry, segment));
+}
+
+interface CanonicalTagToken {
+  start: number;
+  end: number;
+  closing: boolean;
+}
+
+function canonicalTagTokens(source: string): CanonicalTagToken[] {
+  return scanMarkupTags(source)
+    .tags.filter((tag) => tag.name === 'canonical')
+    .map((tag) => ({ start: tag.start, end: tag.end, closing: tag.closing }));
+}
+
+function hasValidCanonicalTagStructure(source: string): boolean {
+  const stack: CanonicalTagToken[] = [];
+  const nestedCounts = new Map<CanonicalTagToken, number>();
+  const invalidNestedPrefixes = new Set<CanonicalTagToken>();
+  let invalidClose = false;
+  let maxDepth = 0;
+
+  for (const token of canonicalTagTokens(source)) {
+    if (token.closing) {
+      if (!stack.length) {
+        invalidClose = true;
+        continue;
+      }
+      stack.pop();
+      continue;
+    }
+    const outer = stack[stack.length - 1];
+    if (stack.length === 1 && outer) {
+      nestedCounts.set(outer, (nestedCounts.get(outer) || 0) + 1);
+      if (source.slice(outer.end, token.start).trim() !== '') invalidNestedPrefixes.add(outer);
+    }
+    stack.push(token);
+    maxDepth = Math.max(maxDepth, stack.length);
+  }
+
+  if (invalidClose || maxDepth > 2) return false;
+  if (stack.length === 0) return true;
+  if (stack.length !== 1) return false;
+  const unmatched = stack[0];
+  return unmatched !== undefined && nestedCounts.get(unmatched) === 1 && !invalidNestedPrefixes.has(unmatched);
+}
+
+interface ToolCallSourceView {
+  joined: string;
+  channels: string[];
+}
+
+function buildToolCallSourceView(entries: unknown[]): ToolCallSourceView | null {
+  const channels = entries.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0);
+  return channels.length ? { joined: channels.join(''), channels } : null;
+}
+
+function normalizeToolCallSource(source: unknown): ToolCallSourceView[] {
+  if (typeof source === 'string') {
+    const view = buildToolCallSourceView([source]);
+    return view ? [view] : [];
+  }
+  if (!Array.isArray(source)) return [];
+  if (source.some((entry) => Array.isArray(entry))) {
+    return source
+      .filter((entry): entry is unknown[] => Array.isArray(entry))
+      .map((group) => buildToolCallSourceView(group))
+      .filter((view): view is ToolCallSourceView => view !== null);
+  }
+  const view = buildToolCallSourceView(source);
+  return view ? [view] : [];
+}
+
+function hasMalformedToolEnvelope(registry: unknown, text: unknown): boolean {
+  if (!Array.isArray(registry) || registry.length === 0) return false;
+  return normalizeToolCallSource(text).some(
+    (view) =>
+      hasMalformedToolSource(registry, view.joined) ||
+      view.channels.some((channel) => hasMalformedBareJsonCall(registry, channel, view.joined))
+  );
+}
+
+function hasMalformedToolSource(registry: unknown, source: string): boolean {
+  const collected = collectAll(source, registry);
+  if (collected.calls.some((call) => !findExternalToolByName(registry as ExternalToolEntry[], call.name))) return true;
+
+  if (!hasValidCanonicalTagStructure(source)) return true;
+  const scan = scanMarkupTags(source);
+  for (const block of findMarkupBlocks(scan, 'canonical')) {
+    const body = source.slice(block.bodyStart, block.bodyEnd);
+    if (hasValidJsonCallEnvelope(body, registry)) continue;
+    if (canonicalTagTokens(body).length > 0 && hasValidCanonicalTagStructure(body)) continue;
+    return true;
+  }
+
+  if (!hasBalancedMarkupTag(scan, 'tool_calls')) return true;
+  for (const container of findMarkupBlocks(scan, 'tool_calls')) {
+    const body = source.slice(container.bodyStart, container.bodyEnd);
+    const analysis = analyzeDsmlSegment(body);
+    if (analysis.hasMarkup) {
+      if (!analysis.valid || analysis.calls.some((call) => !findExternalToolByName(registry, call.name))) return true;
+    } else if (!hasValidJsonCallEnvelope(body, registry)) return true;
+  }
+  const naked = analyzeDsmlSegment(dsmlRemainder(source), true);
+  if (
+    naked.hasMarkup &&
+    (!naked.valid || naked.calls.some((call) => !findExternalToolByName(registry, call.name)))
+  ) return true;
+
+  if (!hasBalancedMarkupTag(scan, 'tool_call')) return true;
+  for (const wrapper of findMarkupBlocks(scan, 'tool_call')) {
+    const body = source.slice(wrapper.bodyStart, wrapper.bodyEnd);
+    const jsonCalls = rawCallsFromJsonEnvelopeText(body);
+    if (jsonCalls.length) {
+      if (!hasValidJsonCallEnvelope(body, registry)) return true;
+      continue;
+    }
+    const nonJson = extractNonJsonToolWrapper(registry, body);
+    if (!nonJson.valid) return true;
+    if (nonJson.calls.some((call) => !findExternalToolByName(registry, call.name))) return true;
+  }
+
+  if (hasStrayBareJsonToolPayload(registry, source, collected.spans)) return true;
+
+  const names = registryNames(registry);
+  const schemas = registrySchemas(registry);
+  if (names.length) {
+    const opener = new RegExp(`<(${names.map(escapeRegExp).join('|')})(?=[\\s/>"'])`, 'g');
+    for (const match of matchAllOutsideStrings(source, opener)) {
+      const name = match[1];
+      const matchIndex = match.index ?? 0;
+      const attrsStart = matchIndex + match[0].length;
+      const tagEnd = findTagEnd(source, attrsStart);
+      if (tagEnd === -1) return true;
+      const attrs = source.slice(attrsStart, tagEnd);
+      const attrArgs = argsFromAttrs(attrs);
+      if (attrArgs !== null) {
+        try {
+          JSON.parse(attrArgs);
+          continue;
+        } catch {
+          return true;
+        }
+      }
+      if (attrs.trim().endsWith('/')) continue;
+      const openEnd = tagEnd + 1;
+      const closeMatch = matchAllOutsideStrings(source.slice(openEnd), new RegExp(`</${escapeRegExp(name)}\\s*>`, 'gi'))[0];
+      const closeIdx = closeMatch ? openEnd + (closeMatch.index ?? 0) : -1;
+      const body = closeIdx === -1 ? source.slice(openEnd) : source.slice(openEnd, closeIdx);
+      if (findFirstJsonValue(body) || argsFromXmlChildren(body, schemas.get(name))) continue;
+      return true;
+    }
+  }
+
+  for (const match of matchAllOutsideStrings(source, /<function\s*=\s*([^\s/>]+)\s*>/gi)) {
+    const name = String(match[1]).trim();
+    const openEnd = (match.index ?? 0) + match[0].length;
+    const closeMatch = matchAllOutsideStrings(source.slice(openEnd), /<\/function\s*>/gi)[0];
+    const closeIdx = closeMatch ? openEnd + (closeMatch.index ?? 0) : -1;
+    if (closeIdx === -1) return true;
+    const body = source.slice(openEnd, closeIdx);
+    const completeParameters = matchAllOutsideStrings(
+      body,
+      /<parameter\s*=\s*([^\s/>]+)\s*>([\s\S]*?)<\/parameter\s*>/gi,
+    ).length;
+    const maskedBody = maskDoubleQuotedStrings(body);
+    const parameterOpenCount = (maskedBody.match(/<parameter\s*=/gi) || []).length;
+    const parameterCloseCount = (maskedBody.match(/<\/parameter\s*>/gi) || []).length;
+    if (completeParameters !== parameterOpenCount || completeParameters !== parameterCloseCount) return true;
+    if (completeParameters === 0 && !functionEqualsAllowsEmptyArguments(name, registry)) return true;
+  }
+
+  return false;
+}
+
+export function assertToolCallArtifactIntegrity(calls: unknown, registry: unknown, sourceText: unknown): void {
+  const ids = new Map<string, string>();
+  if (Array.isArray(calls)) {
+    for (const call of calls) {
+      const record = call && typeof call === 'object' ? (call as Record<string, unknown>) : {};
+      const id = record['id'];
+      if (typeof id !== 'string' || !id) continue;
+      const fn = record['function'];
+      const fnRecord = fn && typeof fn === 'object' && !Array.isArray(fn)
+        ? (fn as Record<string, unknown>)
+        : {};
+      const semanticKey = toolCallKey(String(fnRecord['name'] ?? ''), fnRecord['arguments'] ?? {});
+      const previous = ids.get(id);
+      if (previous !== undefined && previous !== semanticKey) {
+        const error = new Error('The model emitted conflicting arguments for a duplicate external tool call id.') as Error & { code?: string };
+        error.code = 'duplicate_external_tool_call_id';
+        throw error;
+      }
+      ids.set(id, semanticKey);
+    }
+  }
+  if (hasMalformedToolEnvelope(registry, sourceText)) {
+    const error = new Error('The model emitted malformed external tool markup.') as Error & { code?: string };
+    error.code = 'malformed_external_tool_call';
+    throw error;
+  }
 }
 
 /**
@@ -745,8 +1699,11 @@ function markerOpeners(registry: unknown): string[] {
 
 /** True when `candidate` is a prefix of an opener, or already contains one. */
 function couldBeMarker(candidate: string, openers: string[]): boolean {
-  const lower = candidate.toLowerCase();
-  return openers.some((opener) => opener.startsWith(lower) || lower.startsWith(opener));
+  const lower = candidate.toLowerCase().replace(/\u200b/g, '');
+  return openers.some((opener) => {
+    const normalized = opener.toLowerCase().replace(/\u200b/g, '');
+    return normalized.startsWith(lower) || lower.startsWith(normalized);
+  });
 }
 
 interface InlineBlock {
@@ -758,7 +1715,7 @@ interface InlineBlock {
 const INLINE_BLOCKS: InlineBlock[] = [
   { open: new RegExp(`^<${MARK}tool_calls\\s*>`, 'i'), close: new RegExp(`</${MARK}tool_calls\\s*>`, 'i') },
   { open: new RegExp(`^<${MARK}invoke\\s`, 'i'), close: new RegExp(`</${MARK}invoke\\s*>`, 'i') },
-  { open: /^<tool_call\s*>/i, close: /<\/tool_call\s*>/i },
+  { open: /^<\u200b?tool_call\s*>/i, close: /<\/\u200b?tool_call\s*>/i },
   { open: new RegExp(`^${escapeRegExp(CANONICAL_OPEN)}`, 'i'), close: new RegExp(escapeRegExp(CANONICAL_CLOSE), 'i') }
 ];
 
@@ -768,12 +1725,12 @@ const INLINE_BLOCKS: InlineBlock[] = [
  * channel that only receives the closer must drop it instead of printing it as prose.
  */
 const KNOWN_CLOSE_TAG = new RegExp(
-  `^</${MARK}(?:function_calls|function|tool_calls|tool_call|invoke|parameter)\\s*>`,
+  `^</(?:\\u200b?tool_call|${MARK}(?:function_calls|function|tool_calls|invoke|parameter))\\s*>`,
   'i'
 );
 
 /** A close tag truncated at a chunk boundary, e.g. "</function_". */
-const PARTIAL_CLOSE_TAG = /^<\/[a-z0-9_\uFF5C|]*$/i;
+const PARTIAL_CLOSE_TAG = /^<\/\u200b?[a-z0-9_\uFF5C|]*$/i;
 
 function matchInlineBlock(buffer: string): { pending: true } | { end: number } | null {
   for (const block of INLINE_BLOCKS) {
@@ -904,8 +1861,9 @@ export function createExternalToolCallStreamParser(registry: unknown): ToolCallS
   let sequence = 0;
 
   const withUniqueIds = (calls: FinalToolCall[]): FinalToolCall[] => calls.map((call) => {
+    if (!isGeneratedToolCall(call)) return call;
     sequence += 1;
-    return { ...call, id: `${call.id}_${sequence}` };
+    return markGeneratedToolCall({ ...call, id: `${call.id}_${sequence}` });
   });
 
   const parser = ((chunk: string): FinalToolCall[] => {

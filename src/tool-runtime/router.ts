@@ -108,12 +108,16 @@ function exactToolForName(registry: ExternalToolEntry[], name: unknown): Externa
 
 export function preflightExternalToolChoice(toolChoice: unknown, registry: unknown): ToolChoicePreflightResult {
   const list = asRegistryList(registry);
+  const hasExternalSurface = list.some((tool) => tool.enabled !== false);
   if (toolChoice === undefined) {
     return { ok: true, normalized: { mode: 'auto', requiredTool: null } };
   }
   if (typeof toolChoice === 'string') {
     if (toolChoice === 'auto' || toolChoice === 'none' || toolChoice === 'required') {
-      return { ok: true, normalized: { mode: toolChoice, requiredTool: null } };
+      return {
+        ok: true,
+        normalized: { mode: toolChoice === 'required' && !hasExternalSurface ? 'auto' : toolChoice, requiredTool: null },
+      };
     }
     return preflightFailure('invalid_tool_choice', `Invalid tool_choice: ${toolChoice}`);
   }
@@ -127,10 +131,13 @@ export function preflightExternalToolChoice(toolChoice: unknown, registry: unkno
     return preflightFailure('invalid_tool_choice', 'tool_choice.type is required.');
   }
   if (type === 'auto' || type === 'none' || type === 'required') {
-    return { ok: true, normalized: { mode: type, requiredTool: null } };
+    return {
+      ok: true,
+      normalized: { mode: type === 'required' && !hasExternalSurface ? 'auto' : type, requiredTool: null },
+    };
   }
   if (type === 'any') {
-    return { ok: true, normalized: { mode: 'required', requiredTool: null } };
+    return { ok: true, normalized: { mode: hasExternalSurface ? 'required' : 'auto', requiredTool: null } };
   }
 
   let requestedName: unknown;

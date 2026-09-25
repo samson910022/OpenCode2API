@@ -55,6 +55,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
 }));
 
 const { createApp, withTimeout } = await import('../src/proxy.js');
+const { createCollector } = await import('../src/stream/collector.js');
 
 describe('withTimeout', () => {
     test('resolves with the value on success', async () => {
@@ -171,4 +172,171 @@ describe('POST /v1/messages stream does not cancel itself', () => {
         expect(res.headers['content-type']).toContain('text/event-stream');
         expect(res.text).toContain('message_stop');
     }, 20000);
+});
+
+describe('collector terminal state', () => {
+    const run = (events, firstDeltaTimeoutMs = null) => {
+        const client = {
+            event: {
+                subscribe: async () => ({
+                    stream: (async function* () {
+                        for (const event of events) {
+                            if (typeof event.delay === 'number') {
+                                await new Promise((resolve) => setTimeout(resolve, event.delay));
+                            }
+                            yield event;
+                        }
+                    })()
+                })
+            }
+        };
+        return createCollector({ client, logDebug: () => {} })
+            .collectFromEvents('collector-session', 1000, null, firstDeltaTimeoutMs);
+    };
+
+    test('gives finish plus error priority over completion', async () => {
+        const result = await run([
+            { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'collector-session' }, delta: 'partial' } },
+            { type: 'message.updated', properties: { info: { sessionID: 'collector-session', finish: 'stop', error: { name: 'MessageAbortedError' } } } }
+        ]);
+        expect(result.error).toMatchObject({ name: 'MessageAbortedError' });
+        expect(result.noData).toBeUndefined();
+    });
+
+    test('marks a completed empty message as noData', async () => {
+        const result = await run([
+            { type: 'message.updated', properties: { info: { sessionID: 'collector-session', finish: 'stop' } } }
+        ]);
+        expect(result).toMatchObject({ content: '', reasoning: '', noData: true });
+    });
+
+    test.each([['tool'], ['tool-calls']])(
+        'keeps the stream open when a turn finishes with %s',
+        async (finish) => {
+            const result = await run([
+                { type: 'message.updated', properties: { info: { sessionID: 'collector-session', finish } } },
+                {
+                    delay: 150,
+                    type: 'message.part.updated',
+                    properties: { part: { type: 'text', sessionID: 'collector-session' }, delta: 'after the tool' }
+                },
+                { type: 'message.updated', properties: { info: { sessionID: 'collector-session', finish: 'stop' } } }
+            ], 60);
+            expect(result).toMatchObject({ content: 'after the tool' });
+            expect(result.noData).toBeUndefined();
+        }
+    );
+});
+
+describe('collector event error and tool deltas', () => {
+    const run = (events, signal) => {
+        const client = {
+            event: {
+                subscribe: async () => ({
+                    stream: (async function* () {
+                        for (const event of events) yield event;
+                    })()
+                })
+            }
+        };
+        return createCollector({ client, logDebug: () => {} })
+            .collectFromEvents('collector-session', 1000, null, null, null, signal);
+    };
+
+    test('does not emit a tool part delta as assistant content', async () => {
+        const result = await run([
+            { type: 'message.part.updated', properties: { part: { id: 'tool-1', type: 'tool', sessionID: 'collector-session', state: { status: 'completed' } }, delta: 'LEAK' } },
+            { type: 'message.updated', properties: { info: { sessionID: 'collector-session', finish: 'stop' } } }
+        ]);
+        expect(result).toMatchObject({ content: '', reasoning: '', noData: true });
+        expect(JSON.stringify(result)).not.toContain('LEAK');
+    });
+
+    test('returns session.error as an error result', async () => {
+        const result = await run([
+            { type: 'session.error', properties: { sessionID: 'collector-session', error: { name: 'SessionBoom', data: { message: 'session failed' } } } }
+        ]);
+        expect(result.error).toMatchObject({ name: 'SessionBoom' });
+        expect(result.noData).toBeUndefined();
+    });
+
+    test('cancels an active event wait through the supplied signal', async () => {
+        const controller = new AbortController();
+        const pending = new Promise(() => {});
+        const client = {
+            event: {
+                subscribe: async () => ({
+                    stream: (async function* () {
+                        await pending;
+                    })()
+                })
+            }
+        };
+        const resultPromise = createCollector({ client, logDebug: () => {} })
+            .collectFromEvents('collector-session', 5000, null, null, null, controller.signal);
+        controller.abort();
+        await expect(resultPromise).resolves.toMatchObject({ cancelled: true });
+    });
+});
+
+describe('collector polling finish classification', () => {
+    const run = (snapshots, timeoutMs = 1000) => {
+        let call = 0;
+        const client = {
+            session: {
+                messages: async () => {
+                    const next = snapshots[Math.min(call, snapshots.length - 1)];
+                    call += 1;
+                    return next;
+                }
+            }
+        };
+        return createCollector({ client, logDebug: () => {} }).pollForAssistantResponse('collector-session', timeoutMs, 1);
+    };
+    const assistant = (info, text) => [{ info: { role: 'assistant', ...info }, parts: [{ type: 'text', text }] }];
+
+    test.each([['tool'], ['tool-calls']])(
+        'does not finish on time.completed while a turn awaits %s',
+        async (finish) => {
+            const result = await run([
+                assistant({ finish, time: { completed: 1 } }, 'Calling a tool.'),
+                assistant({ finish: 'stop', time: { completed: 2 } }, 'Done: 42.')
+            ]);
+            expect(result.content).toBe('Done: 42.');
+        }
+    );
+
+    test('still finishes on time.completed for a terminal turn', async () => {
+        const result = await run([assistant({ time: { completed: 1 } }, 'Answer without a finish reason.')]);
+        expect(result.content).toBe('Answer without a finish reason.');
+    });
+
+    test.each(['pending', 'running'])('does not finish while a tool part is %s', async (status) => {
+        let call = 0;
+        const client = {
+            session: {
+                messages: async () => {
+                    call += 1;
+                    const finish = call === 1 ? 'stop' : 'stop';
+                    return [{
+                        info: { role: 'assistant', finish, time: { completed: call } },
+                        parts: [
+                            { type: 'text', text: call === 1 ? 'working' : 'done' },
+                            { type: 'tool', id: 'tool-1', state: { status: call === 1 ? status : 'completed' } }
+                        ]
+                    }];
+                }
+            }
+        };
+        const result = await createCollector({ client, logDebug: () => {} }).pollForAssistantResponse('collector-session', 1000, 1);
+        expect(result.content).toBe('done');
+        expect(call).toBeGreaterThan(1);
+    });
+
+    test('bounds a hanging session.messages request', async () => {
+        const client = { session: { messages: () => new Promise(() => {}) } };
+        await expect(
+            createCollector({ client, logDebug: () => {} }).pollForAssistantResponse('collector-session', 40, 1)
+        ).rejects.toThrow('Request timeout after');
+    });
 });

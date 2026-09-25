@@ -56,14 +56,16 @@ export interface CollectorHandle {
   pollForAssistantResponse: (
     sessionId: string,
     timeoutMs: number,
-    intervalMs?: number
+    intervalMs?: number,
+    signal?: AbortSignal
   ) => Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[] }>;
   collectFromEvents: (
     sessionId: string,
     timeoutMs: number,
     onDelta?: ((delta: string, isReasoning?: boolean) => void) | null,
     firstDeltaTimeoutMs?: number | null,
-    idleTimeoutMs?: number | null
+    idleTimeoutMs?: number | null,
+    signal?: AbortSignal
   ) => Promise<Record<string, unknown>>;
 }
 
@@ -132,6 +134,7 @@ export interface AppContext {
     parsedToolCalls: unknown,
     registry: unknown
   ) => { validCalls: ValidatedToolCall[]; invalidCalls: Array<{ call: unknown; validation: unknown }> };
+  finalizeStreamToolCalls: (parsedToolCalls: unknown, registry: unknown, toolChoice: unknown, sourceText?: unknown) => ValidatedToolCall[];
   toPublicToolCalls: (toolCalls: unknown) => FinalToolCall[];
   createForcedToolCallRequester: (options: ForcedToolCallRequesterOptions) => () => Promise<Record<string, unknown> | null>;
   TOOL_IDS_CACHE_MS: number;

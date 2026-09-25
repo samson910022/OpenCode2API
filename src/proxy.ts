@@ -7,12 +7,12 @@ import path from 'path';
 import { createOpencodeClient } from '@opencode-ai/sdk';
 import type { OpencodeClient } from '@opencode-ai/sdk';
 import type { Application, Request, Response, NextFunction } from 'express';
-import { buildExternalToolRegistry, normalizeToolNameForMatch } from './tool-runtime/registry.js';
+import { buildExternalToolRegistry, findExternalToolByName, normalizeToolNameForMatch } from './tool-runtime/registry.js';
 import { resolveMaxRetries } from './retry/policy.js';
 import { buildToolExposure } from './tool-runtime/router.js';
 import { evaluateToolPolicy } from './tool-runtime/policy.js';
 import { validateToolCalls } from './tool-runtime/validator.js';
-import { stripFunctionCallMarkup } from './tool-runtime/parser.js';
+import { stripFunctionCallMarkup, assertToolCallArtifactIntegrity } from './tool-runtime/parser.js';
 import type { ExternalToolEntry } from './tool-runtime/registry.js';
 import type { ValidatedToolCall } from './tool-runtime/validator.js';
 import type { FinalToolCall } from './tool-runtime/parser.js';
@@ -541,6 +541,51 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     return { validCalls: allowedCalls, invalidCalls: invalidCalls as Array<{ call: unknown; validation: unknown }> };
   };
 
+  const finalizeStreamToolCalls = (
+    parsedToolCalls: unknown,
+    registry: unknown,
+    toolChoice: unknown,
+    sourceText: unknown = undefined,
+  ): ValidatedToolCall[] => {
+    const calls = Array.isArray(parsedToolCalls) ? (parsedToolCalls as ValidatedToolCall[]) : [];
+    const choice = asRecord(toolChoice);
+    const mode = String(choice['mode'] || 'auto');
+    const requiredTool = typeof choice['requiredTool'] === 'string' ? choice['requiredTool'] : null;
+    const fail = (code: string, message: string): never => {
+      const error = new Error(message) as Error & { code?: string };
+      error.code = code;
+      throw error;
+    };
+
+    assertToolCallArtifactIntegrity(calls, registry, sourceText);
+    if (calls.length > 1) {
+      fail('parallel_external_tool_calls', 'More than one external tool call was emitted for this turn.');
+    }
+    if (mode === 'none' && calls.length > 0) {
+      fail('external_tool_choice_none', 'The model emitted a tool call when tool_choice was none.');
+    }
+    if (mode === 'required' && calls.length === 0) {
+      fail('external_tool_choice_required', 'The model did not emit the required external tool call.');
+    }
+
+    const { validCalls, invalidCalls } = finalizeValidatedToolCalls(calls, registry);
+    if (invalidCalls.length > 0) {
+      fail('invalid_external_tool_call', 'The model emitted an invalid external tool call.');
+    }
+    if (validCalls.length !== calls.length) {
+      fail('external_tool_policy_blocked', 'The model emitted a tool call blocked by policy.');
+    }
+    if (requiredTool && validCalls.length === 1) {
+      const record = asRecord(validCalls[0]);
+      const fn = asRecord(record['function']);
+      const selected = findExternalToolByName(registry, fn['name']);
+      if (!selected || selected.namespacedName !== requiredTool) {
+        fail('external_tool_choice_mismatch', 'The model emitted a tool call that did not match tool_choice.');
+      }
+    }
+    return validCalls;
+  };
+
   const toPublicToolCalls = (toolCalls: unknown): FinalToolCall[] => {
     if (!Array.isArray(toolCalls) || (toolCalls as unknown[]).length === 0) return [];
     return ((toolCalls as unknown[]) as ValidatedToolCall[]).map((toolCall) => {
@@ -923,6 +968,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     resolveToolMode,
     createRequestToolContext: createRequestToolContext as unknown as AppContext['createRequestToolContext'],
     finalizeValidatedToolCalls,
+    finalizeStreamToolCalls,
     toPublicToolCalls,
     createForcedToolCallRequester: createForcedToolCallRequester as unknown as AppContext['createForcedToolCallRequester'],
     TOOL_IDS_CACHE_MS,

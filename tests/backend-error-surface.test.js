@@ -72,6 +72,21 @@ describe('POST /v1/responses backend plain-object error', () => {
     let app;
     beforeEach(() => {
         jest.clearAllMocks();
+        sdkMocks.sessionPrompt.mockReset();
+        sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [] } }));
+        sdkMocks.sessionMessages.mockReset();
+        sdkMocks.sessionMessages.mockImplementation(async () => ([
+            { info: { role: 'assistant', finish: 'stop', error: BACKEND_CREDITS_ERROR }, parts: [] }
+        ]));
+        sdkMocks.eventSubscribe.mockReset();
+        sdkMocks.eventSubscribe.mockImplementation(async () => ({
+            stream: (async function* () {
+                yield {
+                    type: 'message.updated',
+                    properties: { info: { sessionID: 'err-session', finish: 'stop', error: BACKEND_CREDITS_ERROR } }
+                };
+            })()
+        }));
         app = createApp({
             PORT: 10000, API_KEY: 'test-key',
             OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
@@ -107,6 +122,27 @@ describe('POST /v1/responses backend plain-object error', () => {
             .send({ model: 'opencode/kimi-k2.5', input: 'hi', stream: true });
         expect(res.text).toContain('Insufficient balance');
         expect(res.text).not.toContain('"Object"');
+    });
+
+    test('session.error is surfaced as a stream error', async () => {
+        sdkMocks.eventSubscribe.mockResolvedValueOnce({
+            stream: (async function* () {
+                yield {
+                    type: 'session.error',
+                    properties: {
+                        sessionID: 'err-session',
+                        error: { name: 'SessionError', data: { message: 'session failed' } }
+                    }
+                };
+            })()
+        });
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/kimi-k2.5', input: 'hi', stream: true });
+        expect(res.text).toContain('session failed');
+        expect(res.text).toContain('response.failed');
+        expect(res.text).not.toContain('response.completed');
     });
 
     test('messages non-stream uses transformed status/type, not hardcoded 502', async () => {

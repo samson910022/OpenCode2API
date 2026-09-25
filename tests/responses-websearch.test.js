@@ -193,6 +193,7 @@ describe('POST /v1/responses web_search grounding', () => {
             model: 'opencode/kimi-k2.5',
             input: 'What is the latest PostgreSQL release?',
             tools: [{ type: 'web_search' }],
+            tool_choice: 'required',
             stream: true,
         });
         expect(res.statusCode).toBe(200);
@@ -204,5 +205,18 @@ describe('POST /v1/responses web_search grounding', () => {
         expect(searchCalls).toHaveLength(1);
         const message = completed.response.output.find((o) => o.type === 'message');
         expect(message.content[0].annotations.length).toBeGreaterThan(0);
+    });
+
+    test('internal-only required choice does not require an external call', async () => {
+        const app = createApp(baseConfig({ INTERNAL_ALLOWED_TOOLS: ['webfetch'] })).app;
+        const res = await request(app).post('/v1/responses').send({
+            model: 'opencode/kimi-k2.5',
+            input: 'Use an internal tool if needed.',
+            tool_choice: 'required',
+            stream: true,
+        });
+        expect(res.statusCode).toBe(200);
+        expect(res.text).toContain('response.completed');
+        expect(res.text).not.toContain('response.failed');
     });
 });

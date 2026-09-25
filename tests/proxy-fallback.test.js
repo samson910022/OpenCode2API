@@ -236,10 +236,19 @@ jest.unstable_mockModule('https', () => ({
 const { createApp } = await import('../src/proxy.js');
 
 describe('route fallback integration', () => {
-    beforeEach(() => {
-        jest.clearAllMocks();
-        sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [{ type: 'text', text: 'ok' }] } }));
-    });
+     beforeEach(() => {
+         jest.clearAllMocks();
+         sdkMocks.sessionCreate.mockReset();
+         sdkMocks.sessionCreate.mockImplementation(async () => ({ data: { id: 'fb-session' } }));
+         sdkMocks.sessionPrompt.mockReset();
+         sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [{ type: 'text', text: 'ok' }] } }));
+         sdkMocks.sessionMessages.mockReset();
+         sdkMocks.sessionMessages.mockImplementation(async () => ([
+             { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'recovered' }] }
+         ]));
+         sdkMocks.eventSubscribe.mockReset();
+         sdkMocks.eventSubscribe.mockImplementation(async () => ({ stream: (async function* () {})() }));
+     });
 
     test('messages non-stream retries via proxy after free-limit and reports engagement', async () => {
         sdkMocks.sessionPrompt.mockRejectedValueOnce(freeUsageError());
