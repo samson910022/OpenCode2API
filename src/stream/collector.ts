@@ -351,21 +351,26 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     // (the backend is executing the tool). Resolving early here is what previously
     // truncated streaming responses that relied on internal tool execution.
      const activeToolCallIds = new Set<string>();
-     let activeToolWithoutId = false;
-     const hasActiveTools = (): boolean => activeToolCallIds.size > 0 || activeToolWithoutId;
-     const trackToolState = (part: unknown): void => {
-       const pr = asRecord(part);
-       if (pr['type'] !== 'tool') return;
-       const status = toolPartStatus(pr);
-       const id = typeof pr['id'] === 'string' ? (pr['id'] as string) : null;
-       if (status === 'pending' || status === 'running') {
-         if (id) activeToolCallIds.add(id);
-         else activeToolWithoutId = true;
-       } else if (status === 'completed' || status === 'error') {
-         if (id) activeToolCallIds.delete(id);
-         else activeToolWithoutId = false;
-       }
-     };
+      let activeToolWithoutIdCount = 0;
+      const hasActiveTools = (): boolean => activeToolCallIds.size > 0 || activeToolWithoutIdCount > 0;
+      const trackToolState = (part: unknown): void => {
+        // Pairing assumption: each ID-less pending/running is later matched by one
+        // completed/error without an id; repeated snapshots of the same logical tool
+        // may inflate the count (id path dedupes via Set, ID-less path cannot), in
+        // which case idle exemption simply waits until timeout. Unknown statuses are
+        // ignored (neither active nor terminal) to avoid false idle exemption.
+        const pr = asRecord(part);
+        if (pr['type'] !== 'tool') return;
+        const status = toolPartStatus(pr);
+        const id = typeof pr['id'] === 'string' ? (pr['id'] as string) : null;
+        if (status === 'pending' || status === 'running') {
+          if (id) activeToolCallIds.add(id);
+          else activeToolWithoutIdCount += 1;
+        } else if (status === 'completed' || status === 'error') {
+          if (id) activeToolCallIds.delete(id);
+          else activeToolWithoutIdCount = Math.max(0, activeToolWithoutIdCount - 1);
+        }
+      };
      const startedAt = Date.now();
      let removeCollectAbortListener = (): void => {};
 
@@ -416,7 +421,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
             logDebug('Event idle while internal tool call is active, continuing to wait', {
               sessionId,
               ms: Date.now() - startedAt,
-              activeTools: activeToolCallIds.size,
+              activeTools: activeToolCallIds.size + activeToolWithoutIdCount,
             });
             scheduleIdleTimer();
             return;
@@ -573,7 +578,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                 if (hasActiveTools()) {
                   logDebug('Ignoring intermediate stop while tools are active', {
                     sessionId,
-                    activeTools: hasActiveTools() ? Math.max(1, activeToolCallIds.size) : 0,
+                    activeTools: activeToolCallIds.size + activeToolWithoutIdCount,
                   });
                   continue;
                 }
