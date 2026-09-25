@@ -787,32 +787,76 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
              [snapshotReasoning, snapshotContent],
              [rawReasoning, rawContent]
            ];
-           let parsedToolCalls: FinalToolCall[] = externalToolRegistry.length > 0
-             ? mergeToolCallArtifacts(
-                 streamedToolCalls,
-                 flushedReasoningCalls,
-                 flushedContentCalls,
-                 parseJoined(snapshotReasoning, snapshotContent),
-                 parseJoined(rawReasoning, rawContent),
-               )
-             : [];
-           assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource);
-           if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
-             const forcedResponse = await requestForcedMessagesToolCall();
-             if (forcedResponse) {
-               const forcedReasoning = typeof forcedResponse['reasoning'] === 'string' ? forcedResponse['reasoning'] as string : '';
-               const forcedContent = typeof forcedResponse['content'] === 'string' ? forcedResponse['content'] as string : '';
-               parsedToolCalls = mergeToolCallArtifacts(parsedToolCalls, parseJoined(forcedReasoning, forcedContent));
-               assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [forcedReasoning, forcedContent]);
-             }
-           }
-            const finalValidated = finalizeStreamToolCalls(
-              parsedToolCalls,
-              externalToolRegistry,
-              externalToolChoice,
-              streamSource,
-              parallelToolCalls,
-            );
+            let parsedToolCalls: FinalToolCall[] = externalToolRegistry.length > 0
+              ? mergeToolCallArtifacts(
+                  streamedToolCalls,
+                  flushedReasoningCalls,
+                  flushedContentCalls,
+                  parseJoined(snapshotReasoning, snapshotContent),
+                  parseJoined(rawReasoning, rawContent),
+                )
+              : [];
+            let finalValidated: FinalToolCall[];
+            try {
+              assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource);
+              if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                const forcedResponse = await requestForcedMessagesToolCall();
+                if (forcedResponse) {
+                  const forcedReasoning = typeof forcedResponse['reasoning'] === 'string' ? forcedResponse['reasoning'] as string : '';
+                  const forcedContent = typeof forcedResponse['content'] === 'string' ? forcedResponse['content'] as string : '';
+                  parsedToolCalls = mergeToolCallArtifacts(parsedToolCalls, parseJoined(forcedReasoning, forcedContent));
+                  assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [forcedReasoning, forcedContent]);
+                }
+              }
+              finalValidated = finalizeStreamToolCalls(
+                parsedToolCalls,
+                externalToolRegistry,
+                externalToolChoice,
+                streamSource,
+                parallelToolCalls,
+              ) as unknown as FinalToolCall[];
+            } catch (toolError) {
+              const toolCode = (toolError as Error & { code?: string }).code;
+              const failClosedCodes = [
+                'parallel_external_tool_calls',
+                'external_tool_choice_none',
+                'external_tool_choice_required',
+                'invalid_external_tool_call',
+                'external_tool_policy_blocked',
+                'external_tool_choice_mismatch',
+                'duplicate_external_tool_call_id',
+                'malformed_external_tool_call',
+              ];
+              if (toolCode && failClosedCodes.includes(toolCode)) {
+                try {
+                  if (sessionId) await activeClient.session.delete({ path: { id: sessionId } });
+                } catch (_cleanupError) {
+                  void _cleanupError;
+                }
+                if (keepaliveInterval) clearInterval(keepaliveInterval);
+                const toolMessage = toErrorMessage(toolError);
+                if (!res.headersSent) {
+                  res.status(502).json({
+                    type: 'error',
+                    error: { type: 'api_error', message: toolMessage, code: toolCode },
+                  });
+                } else if (!res.destroyed) {
+                  try {
+                    res.write(
+                      sseEvent('error', {
+                        type: 'error',
+                        error: { type: 'api_error', message: toolMessage, code: toolCode },
+                      }),
+                    );
+                  } catch {
+                    // ignore
+                  }
+                  res.end();
+                }
+                return;
+              }
+              throw toolError;
+            }
            if (!streamedText.trim() && !streamedReasoning.trim() && finalValidated.length === 0) {
              throw new Error('Upstream returned no assistant data');
            }

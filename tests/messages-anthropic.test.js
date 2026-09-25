@@ -629,6 +629,9 @@ describe('POST /v1/messages', () => {
         expect(res.statusCode).toBe(200);
         const frames = parseMessagesSseFrames(res.text);
         expect(frames.some((f) => f.event === 'error')).toBe(true);
+        const errFrame = frames.find((f) => f.event === 'error');
+        expect(errFrame.data.error.code).toBe('external_tool_choice_required');
+        expect(errFrame.data.error.type).toBe('api_error');
         expect(messagesToolStarts(frames)).toHaveLength(0);
         expect(messagesInputDeltas(frames)).toHaveLength(0);
         expect(res.text).not.toContain('[DONE]');

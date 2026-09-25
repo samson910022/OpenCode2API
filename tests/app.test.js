@@ -4074,6 +4074,7 @@ describe('Proxy Responses API previous_response_id', () => {
             expect(created.response.model).toBe('opencode/kimi-k2.5');
             expect(failed.response.model).toBe('opencode/kimi-k2.5');
             expect(failed.response.error.code).toBe('duplicate_external_tool_call_id');
+            expect(failed.response.error.type).toBe('server_error');
             expect(failed.response.error.message).toContain('duplicate external tool call id');
             expect(failed.response.output).toEqual([]);
             expect(frames.some((frame) => frame !== '[DONE]' && String(frame.type).startsWith('response.function_call'))).toBe(false);

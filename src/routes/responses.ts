@@ -1309,32 +1309,87 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
            [snapshotReasoning, snapshotContent],
            [rawReasoning, rawContent]
          ];
-         let parsedToolCalls: FinalToolCall[] = externalToolRegistry.length > 0
-           ? mergeToolCallArtifacts(
-               streamedToolCalls,
-               flushedReasoningCalls,
-               flushedContentCalls,
-               parseJoined(snapshotReasoning, snapshotContent),
-               parseJoined(rawReasoning, rawContent),
-             )
-           : [];
-         assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource);
-         if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
-           const forcedResponse = await requestForcedResponsesToolCall();
-           if (forcedResponse) {
-             const forcedReasoning = typeof forcedResponse['reasoning'] === 'string' ? forcedResponse['reasoning'] as string : '';
-             const forcedContent = typeof forcedResponse['content'] === 'string' ? forcedResponse['content'] as string : '';
-             parsedToolCalls = mergeToolCallArtifacts(parsedToolCalls, parseJoined(forcedReasoning, forcedContent));
-             assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [forcedReasoning, forcedContent]);
-           }
-         }
-          const validatedStreamedToolCalls = finalizeStreamToolCalls(
-            parsedToolCalls,
-            externalToolRegistry,
-            externalToolChoice,
-            streamSource,
-            parallelToolCalls,
-          );
+          let parsedToolCalls: FinalToolCall[] = externalToolRegistry.length > 0
+            ? mergeToolCallArtifacts(
+                streamedToolCalls,
+                flushedReasoningCalls,
+                flushedContentCalls,
+                parseJoined(snapshotReasoning, snapshotContent),
+                parseJoined(rawReasoning, rawContent),
+              )
+            : [];
+          let validatedStreamedToolCalls: FinalToolCall[];
+          try {
+            assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource);
+            if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+              const forcedResponse = await requestForcedResponsesToolCall();
+              if (forcedResponse) {
+                const forcedReasoning = typeof forcedResponse['reasoning'] === 'string' ? forcedResponse['reasoning'] as string : '';
+                const forcedContent = typeof forcedResponse['content'] === 'string' ? forcedResponse['content'] as string : '';
+                parsedToolCalls = mergeToolCallArtifacts(parsedToolCalls, parseJoined(forcedReasoning, forcedContent));
+                assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [forcedReasoning, forcedContent]);
+              }
+            }
+            validatedStreamedToolCalls = finalizeStreamToolCalls(
+              parsedToolCalls,
+              externalToolRegistry,
+              externalToolChoice,
+              streamSource,
+              parallelToolCalls,
+            ) as unknown as FinalToolCall[];
+          } catch (toolError) {
+            const toolCode = (toolError as Error & { code?: string }).code;
+            const failClosedCodes = [
+              'parallel_external_tool_calls',
+              'external_tool_choice_none',
+              'external_tool_choice_required',
+              'invalid_external_tool_call',
+              'external_tool_policy_blocked',
+              'external_tool_choice_mismatch',
+              'duplicate_external_tool_call_id',
+              'malformed_external_tool_call',
+            ];
+            if (toolCode && failClosedCodes.includes(toolCode)) {
+              await cleanupOwnedResponsesSession();
+              stopResponsesKeepalive();
+              const toolMessage = toErrorMessage(toolError);
+              const serverError = { message: toolMessage, type: 'server_error', code: toolCode };
+              if (responsesStreamState) {
+                try {
+                  const streamState = responsesStreamState;
+                  if (!streamState.createdEmitted) streamState.emitCreated();
+                  if (streamState.finalize) {
+                    try {
+                      streamState.finalize();
+                    } catch (finalizeError: unknown) {
+                      logDebug('Failed to finalize errored response stream', { error: toErrorMessage(finalizeError) });
+                    }
+                  }
+                  streamState.emit({
+                    type: 'response.failed',
+                    sequence_number: streamState.nextSequence(),
+                    response: {
+                      ...buildResponsesResponseEnvelope(streamState),
+                      completed_at: null,
+                      status: 'failed',
+                      output: streamState.output.output(),
+                      error: serverError,
+                      incomplete_details: null,
+                      usage: null,
+                    },
+                  });
+                  res.write('data: [DONE]\n\n');
+                } catch (writeError: unknown) {
+                  logDebug('Failed to report error on open response stream', { error: toErrorMessage(writeError) });
+                }
+                res.end();
+              } else if (!res.headersSent) {
+                res.status(502).json({ error: serverError });
+              }
+              return;
+            }
+            throw toolError;
+          }
          const joinedSafe = stripExternalToolCallMarkupFromJoinedText(
            externalToolRegistry,
            reasoning,
