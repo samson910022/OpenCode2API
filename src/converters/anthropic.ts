@@ -43,9 +43,6 @@ export interface ChatTool {
         description: string;
         parameters: unknown;
         enabled?: unknown;
-        x_proxy_side_effect?: unknown;
-        x_proxy_risk_level?: unknown;
-        x_proxy_requires_confirmation?: unknown;
         [key: string]: unknown;
     };
 }
@@ -317,7 +314,10 @@ export function anthropicToolsToChatTools(tools: unknown): ChatTool[] {
                 description: (definition['description'] || '') as string,
                 parameters: (definition['input_schema'] || { type: 'object', properties: {} }) as unknown,
             };
-            for (const key of ['enabled', 'x_proxy_side_effect', 'x_proxy_risk_level', 'x_proxy_requires_confirmation']) {
+            // `enabled` is a declaration field. The `__proxy_*`/`x_proxy_*` family
+            // is reserved for the proxy's own metadata and is dropped here: it
+            // must never travel from an Anthropic tool body into the registry.
+            for (const key of ['enabled']) {
                 if (Object.prototype.hasOwnProperty.call(definition, key)) {
                     functionDefinition[key] = definition[key];
                 }

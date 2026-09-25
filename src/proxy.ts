@@ -41,7 +41,7 @@ import type {
   InternalToolMetrics,
 } from './types/context.js';
 import type { ProxyClient, ProviderInfo, ModelInfo, ResolvedModel } from './types/client.js';
-import type { ResponseStateEntry } from './types/backend.js';
+import type { ResponseStateEntry, ResponseToolCallState } from './types/backend.js';
 import { asRecord, toErrorMessage } from './utils/guards.js';
 import { buildEffectiveApiKeys, createApiKeyVerifier } from './auth/keys.js';
 import { defaultTranslatorRegistry } from './converters/registry.js';
@@ -257,6 +257,26 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   const responseState = new Map<string, ResponseStateEntry>();
   const RESPONSE_STATE_TTL_MS = 30 * 60 * 1000;
   const RESPONSE_STATE_SWEEP_INTERVAL_MS = 60 * 1000;
+  const RESPONSE_TOOL_CALL_STATE_LIMIT = 128;
+  const normalizeResponseToolCallState = (value: unknown): ResponseToolCallState[] => {
+    if (!Array.isArray(value)) return [];
+    const calls: ResponseToolCallState[] = [];
+    for (const entry of value as unknown[]) {
+      const record = asRecord(entry);
+      const callId = typeof record['callId'] === 'string' ? (record['callId'] as string) : '';
+      const name = typeof record['name'] === 'string' ? (record['name'] as string) : '';
+      if (!callId || !name) continue;
+      calls.push({ callId, name });
+    }
+    if (calls.length <= RESPONSE_TOOL_CALL_STATE_LIMIT) return calls;
+    const dropped = calls.length - RESPONSE_TOOL_CALL_STATE_LIMIT;
+    logDebug('Dropped the oldest continuation tool call metadata past the cap', {
+      limit: RESPONSE_TOOL_CALL_STATE_LIMIT,
+      dropped,
+      kept: RESPONSE_TOOL_CALL_STATE_LIMIT
+    });
+    return calls.slice(-RESPONSE_TOOL_CALL_STATE_LIMIT);
+  };
   const getResponseState = (responseId: unknown): ResponseStateEntry | null => {
     if (typeof responseId !== 'string') return null;
     const state = responseState.get(responseId);
@@ -267,12 +287,13 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     }
     return state;
   };
-  const storeResponseState = (responseId: unknown, sessionId: unknown, model: unknown): void => {
+  const storeResponseState = (responseId: unknown, sessionId: unknown, model: unknown, toolCalls: unknown = []): void => {
     if (!responseId || !sessionId || typeof responseId !== 'string' || typeof sessionId !== 'string') return;
     responseState.set(responseId, {
       sessionId,
       model: typeof model === 'string' ? model : String(model ?? ''),
       expiresAt: Date.now() + RESPONSE_STATE_TTL_MS,
+      toolCalls: normalizeResponseToolCallState(toolCalls),
     });
   };
   const sweepResponseState = async (): Promise<void> => {

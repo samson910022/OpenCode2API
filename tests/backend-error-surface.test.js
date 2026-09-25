@@ -67,6 +67,59 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
 }));
 
 const { createApp } = await import('../src/proxy.js');
+const { createInvalidRequestError, transformUpstreamError } = await import('../src/errors/upstream.js');
+
+const BACKEND_BAD_REQUEST_ERROR = {
+    name: 'BadRequestError',
+    data: { message: '400: prompt rejected by the provider', statusCode: 400 }
+};
+
+describe('400 code passthrough', () => {
+    test('a proxy-authored 400 keeps its own code', () => {
+        expect(transformUpstreamError(createInvalidRequestError('bad tool', 'unsupported_tool_type'))).toEqual({
+            statusCode: 400,
+            error: { message: 'bad tool', type: 'invalid_request_error', code: 'unsupported_tool_type' }
+        });
+    });
+
+    test('a backend 400 never leaks the upstream class name as the wire code', () => {
+        expect(transformUpstreamError(BACKEND_BAD_REQUEST_ERROR)).toEqual({
+            statusCode: 400,
+            error: {
+                message: '400: prompt rejected by the provider',
+                type: 'invalid_request_error',
+                code: 'invalid_request_error'
+            }
+        });
+        // Same for an Error that merely *claims* a 400 without the proxy marker.
+        const unmarked = new Error('provider said no');
+        unmarked.statusCode = 400;
+        unmarked.code = 'BadRequestError';
+        expect(transformUpstreamError(unmarked).error.code).toBe('invalid_request_error');
+    });
+
+    test('responses surfaces a backend 400 as a generic invalid request', async () => {
+        const app = createApp({
+            PORT: 10000, API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000, DISABLE_TOOLS: true, DEBUG: false,
+            RETRY_MAX_RETRIES: 0
+        }).app;
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            { info: { role: 'assistant', finish: 'stop', error: BACKEND_BAD_REQUEST_ERROR }, parts: [] }
+        ]);
+
+        const res = await request(app).post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/kimi-k2.5', input: 'hi' });
+
+        expect(res.statusCode).toBe(400);
+        expect(res.body.type).toBe('invalid_request_error');
+        expect(res.body.code).toBe('invalid_request_error');
+        expect(res.body.message).toContain('prompt rejected by the provider');
+        expect(JSON.stringify(res.body)).not.toContain('BadRequestError');
+    });
+});
 
 describe('POST /v1/responses backend plain-object error', () => {
     let app;

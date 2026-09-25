@@ -52,6 +52,36 @@ function readResponseBodyText(error: unknown): string {
 }
 
 /**
+ * Marker for a 400 the proxy authored itself. `transformUpstreamError` only
+ * forwards a 400 `code` that carries it: the OpenCode backend reports failures
+ * as `{name:'BadRequestError', data:{...}}`, and forwarding that verbatim would
+ * put an internal class name on the client wire.
+ */
+const LOCAL_INVALID_REQUEST = Symbol.for('opencode2proxy.localInvalidRequest');
+
+export interface LocalInvalidRequestError extends Error {
+  statusCode: number;
+  code: string;
+}
+
+/** Author a client-facing 400 whose `code` is safe to put on the wire verbatim. */
+export function createInvalidRequestError(message: string, code: string): LocalInvalidRequestError {
+  const error = new Error(message) as LocalInvalidRequestError;
+  error.statusCode = 400;
+  error.code = code;
+  Object.defineProperty(error, LOCAL_INVALID_REQUEST, { value: true, enumerable: false });
+  return error;
+}
+
+/** The wire-safe 400 code of a proxy-authored error, or null for anything else. */
+function localInvalidRequestCode(error: unknown): string | null {
+  if (!error || typeof error !== 'object') return null;
+  if (Reflect.get(error as object, LOCAL_INVALID_REQUEST) !== true) return null;
+  const code: unknown = (error as Record<string, unknown>)['code'];
+  return typeof code === 'string' && code ? code : null;
+}
+
+/**
  * Classify free-tier/Go quota exhaustion that should trigger proxy fallback.
  *
  * Fingerprint (mirrors upstream `session/retry.ts` + Zen `zen/util/handler.ts`):
@@ -352,10 +382,13 @@ export function transformUpstreamError(error: unknown): TransformedUpstreamError
       code = 'model_not_found';
       message = upstreamMessage || 'Model not found';
     } else if (statusCode === 400 || upstreamType === 'BadRequestError') {
-      // Bad request - map to 400
+      // Bad request - map to 400. Only a locally authored error (see
+      // createInvalidRequestError) may name a specific code; anything that came
+      // back from the backend keeps the generic `invalid_request_error` so an
+      // upstream class name (BadRequestError, ...) never reaches the client.
       statusCode = 400;
       type = 'invalid_request_error';
-      code = 'invalid_request_error';
+      code = localInvalidRequestCode(normalized) ?? 'invalid_request_error';
       message = upstreamMessage || 'Invalid request';
     } else if (statusCode >= 500) {
       // Server errors from upstream - map to 502/503

@@ -111,7 +111,7 @@ export interface AppContext {
   logDebug: (...args: unknown[]) => void;
   responseState: Map<string, ResponseStateEntry>;
   getResponseState: (responseId: unknown) => ResponseStateEntry | null;
-  storeResponseState: (responseId: unknown, sessionId: unknown, model: unknown) => void;
+  storeResponseState: (responseId: unknown, sessionId: unknown, model: unknown, toolCalls?: unknown) => void;
   sweepResponseState: () => Promise<void>;
   TOOL_MODE: ToolModeSet;
   TOOL_GUARD_MESSAGE: string;

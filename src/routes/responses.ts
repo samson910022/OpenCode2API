@@ -1,6 +1,13 @@
 // P4 TS: POST /v1/responses (ported from P3 .js, behavior identical).
 import crypto from 'crypto';
-import { findExternalToolByName } from '../tool-runtime/registry.js';
+import {
+  ADDITIONAL_TOOLS_ITEM_TYPE,
+  collectAdditionalToolSources,
+  expandToolDeclarationSources,
+  findExternalToolByExactName,
+  resolveExternalToolName,
+} from '../tool-runtime/registry.js';
+import { qualifyToolName } from '../converters/chat-responses/request.js';
 import { EXTERNAL_TOOL_PREFIX } from '../tool-runtime/contracts.js';
 import { preflightExternalToolChoice } from '../tool-runtime/router.js';
 import { computeRetryDelay } from '../retry/policy.js';
@@ -13,7 +20,7 @@ import {
   createToolCallFilter,
   createExternalToolCallStreamParser,
 } from '../tool-runtime/parser.js';
-import { isTransientUpstreamError, normalizeBackendError, transformUpstreamError } from '../errors/upstream.js';
+import { isTransientUpstreamError, normalizeBackendError, transformUpstreamError, createInvalidRequestError } from '../errors/upstream.js';
 import { engageFallbackForFreeLimit } from '../upstream-proxy/fallback.js';
 import {
   buildCitationAnnotations,
@@ -21,7 +28,6 @@ import {
   detectHostedSearchTools,
   extractSearchEvidence,
   SEARCH_GROUNDING_INSTRUCTION,
-  stripHostedSearchTools,
 } from '../search/grounding.js';
 import {
   withTimeout,
@@ -32,6 +38,7 @@ import { sleep, ensureBackend } from '../backend/manager.js';
 import type { Application, Request, Response } from 'express';
 import type { AppContext } from '../types/context.js';
 import type { ExternalToolEntry } from '../tool-runtime/registry.js';
+import type { ResponseToolCallState } from '../types/backend.js';
 import type { FinalToolCall } from '../tool-runtime/parser.js';
 import { asRecord, toErrorMessage } from '../utils/guards.js';
 
@@ -149,7 +156,17 @@ function buildResponsesResponseEnvelope(identity: ResponsesResponseIdentity): Re
   };
 }
 
-const RESPONSES_OUTPUT_TYPE_ORDER = ['web_search_call', 'reasoning', 'message', 'function_call'];
+const RESPONSES_OUTPUT_TYPE_ORDER = ['web_search_call', 'reasoning', 'message', 'function_call', 'custom_tool_call'];
+
+/**
+ * Map a Responses input role onto the OpenCode channel it may use. `developer`
+ * has no system channel here: it rides the user channel and keeps its own
+ * `DEVELOPER:` label, so a developer turn is never mistaken for the user's.
+ */
+function responsesInputRole(role: unknown): string {
+  if (typeof role !== 'string' || !role) return 'user';
+  return role;
+}
 
 function orderResponsesOutputItems(items: Record<string, unknown>[]): Record<string, unknown>[] {
   const rank = (item: Record<string, unknown>): number => {
@@ -236,12 +253,6 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
     const engageProxyFallback = (err: unknown): boolean => {
       if (!engageFallbackForFreeLimit(err, proxyPool)) return false;
       return switchToProxyBundle();
-    };
-    const createInvalidRequestError = (message: string, code: string): Error & { statusCode: number; code: string } => {
-      const error = new Error(message) as Error & { statusCode: number; code: string };
-      error.statusCode = 400;
-      error.code = code;
-      return error;
     };
     const initializeResponsesStream = (
       requestedModel: unknown,
@@ -333,6 +344,10 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       const top_p: unknown = body['top_p'];
       const streamRaw: unknown = body['stream'];
       const stream = Boolean(streamRaw);
+      const rejectInvalidRequest = (message: string, code: string): void => {
+        if (stream) throw createInvalidRequestError(message, code);
+        res.status(400).json({ error: { message, type: 'invalid_request_error', code } });
+      };
       const chatMessages: unknown = body['messages'];
       const prompt: unknown = body['prompt'];
       const previousResponseId: unknown = body['previous_response_id'];
@@ -342,8 +357,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         typeof previousResponseId === 'string' && previousResponseId ? getResponseState(previousResponseId) : null;
       if (stream) responsesStreamState = initializeResponsesStream(model, previousState?.model, tools, parallelToolCalls);
       if (previousResponseId && !previousState) {
-        if (stream) throw createInvalidRequestError('Invalid or expired previous_response_id', 'invalid_previous_response_id');
-        res.status(400).json({ error: { message: 'Invalid or expired previous_response_id' } });
+        rejectInvalidRequest('Invalid or expired previous_response_id', 'invalid_previous_response_id');
         return;
       }
 
@@ -355,9 +369,28 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       // P4: hosted search tools (web_search/google_search) are explicit client
       // grants for server-side grounding: keep them out of the external
       // function registry and drive opencode `websearch` instead.
-      const hostedSearch = detectHostedSearchTools(tools);
-      const bridgeTools = stripHostedSearchTools(tools);
-      const requestToolContext = createRequestToolContext(bridgeTools, tool_choice, requestOpencodeConfig);
+      const fromChatMessages = Array.isArray(chatMessages) && (chatMessages as unknown[]).length;
+      const rawResponsesInput: unknown = fromChatMessages ? chatMessages : input;
+      const additionalToolSources = collectAdditionalToolSources(
+        rawResponsesInput,
+        fromChatMessages ? 'messages' : 'input',
+      );
+      const additionalToolDeclarations = additionalToolSources.flatMap((source) =>
+        Array.isArray(source.tools) ? (source.tools as unknown[]) : [],
+      );
+      const hostedSearch = detectHostedSearchTools([...tools, ...additionalToolDeclarations]);
+      const declarationExpansion = expandToolDeclarationSources([{ path: 'tools', tools }, ...additionalToolSources]);
+      const customToolNames = new Set(declarationExpansion.customToolNames);
+      if (declarationExpansion.issues.length) {
+        const issues = declarationExpansion.issues;
+        const message = issues
+          .slice(0, 5)
+          .map((issue) => issue.message)
+          .join(' ');
+        rejectInvalidRequest(message, issues[0].code);
+        return;
+      }
+      const requestToolContext = createRequestToolContext(declarationExpansion.tools, tool_choice, requestOpencodeConfig);
       let toolMode: string = requestToolContext.mode;
       let internalToolContext = requestToolContext.internal;
       if (hostedSearch.requested && toolMode === TOOL_MODE.DISABLED) {
@@ -414,17 +447,14 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       const externalToolRegistry: ExternalToolEntry[] = externalToolContext.registry;
       const toolChoicePreflight = preflightExternalToolChoice(tool_choice, externalToolRegistry);
       if (!toolChoicePreflight.ok) {
-        if (stream) throw createInvalidRequestError(toolChoicePreflight.message, toolChoicePreflight.code);
-        res.status(400).json({
-          error: {
-            message: toolChoicePreflight.message,
-            type: 'invalid_request_error',
-          },
-        });
+        rejectInvalidRequest(toolChoicePreflight.message, toolChoicePreflight.code);
         return;
       }
       const externalToolChoice = toolChoicePreflight.normalized;
       const assistantToolCalls = new Map<string, string>();
+      for (const entry of previousState?.toolCalls ?? []) {
+        if (entry.name) assistantToolCalls.set(entry.callId, entry.name);
+      }
 
       const rememberAssistantToolCall = (toolCallId: unknown, toolName: unknown): void => {
         if (!toolCallId || !toolName || typeof toolCallId !== 'string' || typeof toolName !== 'string') return;
@@ -437,13 +467,16 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           ir['content'] ?? ir['output'] ?? ir['result'] ?? ir['text'],
         );
         const callIdRaw: unknown = ir['call_id'] ?? ir['tool_call_id'];
+        const remembered = assistantToolCalls.get(String(callIdRaw ?? ''));
+        const declaredName = typeof ir['name'] === 'string' ? (ir['name'] as string).trim() : '';
         const mappedTool =
-          findExternalToolByName(externalToolRegistry, ir['name']) ||
-          findExternalToolByName(externalToolRegistry, assistantToolCalls.get(String(callIdRaw ?? '')));
+          (declaredName ? resolveExternalToolName(externalToolRegistry, declaredName, ir['namespace']) : null) ||
+          (remembered ? resolveExternalToolName(externalToolRegistry, remembered) : null);
         const toolName =
           mappedTool?.namespacedName ||
-          assistantToolCalls.get(String(callIdRaw ?? '')) ||
-          (typeof ir['name'] === 'string' ? (ir['name'] as string) : `${EXTERNAL_TOOL_PREFIX}unknown`);
+          remembered ||
+          declaredName ||
+          `${EXTERNAL_TOOL_PREFIX}unknown`;
         const toolCallId =
           typeof ir['call_id'] === 'string'
             ? (ir['call_id'] as string)
@@ -459,7 +492,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         const toolCallsRaw: unknown = ir['tool_calls'];
         let sourceCalls: unknown[];
         if (Array.isArray(toolCallsRaw)) sourceCalls = toolCallsRaw as unknown[];
-        else if (ir['type'] === 'function_call') sourceCalls = [item];
+        else if (ir['type'] === 'function_call' || ir['type'] === 'custom_tool_call') sourceCalls = [item];
         else sourceCalls = [];
         if (!sourceCalls.length) return null;
         const serializedToolCalls = sourceCalls
@@ -467,9 +500,11 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             const tcr = asRecord(toolCall);
             const fn = asRecord(tcr['function']);
             const rawName: unknown = fn['name'] ?? tcr['name'];
-            const mappedTool = findExternalToolByName(externalToolRegistry, rawName);
+            const namespace: unknown = tcr['namespace'] ?? ir['namespace'];
+            const mappedTool = resolveExternalToolName(externalToolRegistry, rawName, namespace);
             const namespacedName =
-              mappedTool?.namespacedName ?? (typeof rawName === 'string' ? rawName : null);
+              mappedTool?.namespacedName ??
+              (typeof rawName === 'string' ? qualifyToolName(namespace, rawName) : '');
             if (!namespacedName) return null;
             const toolCallId =
               typeof tcr['call_id'] === 'string'
@@ -477,16 +512,40 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
                 : typeof tcr['id'] === 'string'
                   ? (tcr['id'] as string)
                   : `call_${index + 1}`;
+            const argsJson =
+              tcr['type'] === 'custom_tool_call'
+                ? JSON.stringify({ input: typeof tcr['input'] === 'string' ? (tcr['input'] as string) : '' })
+                : normalizeToolArguments(fn['arguments'] ?? tcr['arguments']);
             rememberAssistantToolCall(toolCallId, namespacedName);
-            return {
-              id: toolCallId,
-              name: namespacedName,
-              arguments: normalizeToolArguments(fn['arguments'] ?? tcr['arguments']),
-            };
+            return { id: toolCallId, name: namespacedName, arguments: argsJson };
           })
           .filter((v): v is { id: string; name: string; arguments: string } => v !== null);
         if (!serializedToolCalls.length) return null;
         return `ASSISTANT: <function_calls>${JSON.stringify(serializedToolCalls)}</function_calls>`;
+      };
+
+      const buildResponsesToolCallState = (toolCalls: unknown): ResponseToolCallState[] => {
+        const calls: ResponseToolCallState[] = [];
+        if (!Array.isArray(toolCalls)) return calls;
+        for (const toolCall of toolCalls as unknown[]) {
+          const record = asRecord(toolCall);
+          const fn = asRecord(record['function']);
+          const clientName = typeof fn['name'] === 'string' ? (fn['name'] as string) : '';
+          const callId = typeof record['id'] === 'string' ? (record['id'] as string) : '';
+          if (!callId || !clientName) continue;
+          calls.push({
+            callId,
+            name: findExternalToolByExactName(externalToolRegistry, clientName)?.namespacedName ?? clientName,
+          });
+        }
+        return calls;
+      };
+
+      const buildStoredResponseToolCalls = (toolCalls: unknown): ResponseToolCallState[] => {
+        const merged = new Map<string, ResponseToolCallState>();
+        for (const entry of previousState?.toolCalls ?? []) merged.set(entry.callId, entry);
+        for (const entry of buildResponsesToolCallState(toolCalls)) merged.set(entry.callId, entry);
+        return [...merged.values()];
       };
 
       const buildResponsesInputMessages = (rawItems: unknown): NormalizedInputMessage[] => {
@@ -495,12 +554,18 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         for (const item of rawItems as unknown[]) {
           if (!item) continue;
           const ir = asRecord(item);
-          if (ir['type'] === 'function_call_output' || ir['type'] === 'tool_result' || ir['role'] === 'tool') {
+          if (ir['type'] === ADDITIONAL_TOOLS_ITEM_TYPE) continue;
+          if (
+            ir['type'] === 'function_call_output' ||
+            ir['type'] === 'custom_tool_call_output' ||
+            ir['type'] === 'tool_result' ||
+            ir['role'] === 'tool'
+          ) {
             const toolResultLine = buildResponsesToolResultLine(item);
             if (toolResultLine) normalized.push({ role: 'tool', content: toolResultLine });
             continue;
           }
-          if (ir['type'] === 'function_call') {
+          if (ir['type'] === 'function_call' || ir['type'] === 'custom_tool_call') {
             const line = buildResponsesAssistantToolCallsLine(item);
             if (line) normalized.push({ role: 'assistant', content: line, isToolCalls: true });
             continue;
@@ -511,9 +576,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             if (line) normalized.push({ role: 'assistant', content: line, isToolCalls: true });
           }
           if (ir['type'] === 'message') {
-            const role = typeof ir['role'] === 'string' ? (ir['role'] as string) : 'user';
             const content = normalizeTextContent(ir['content']);
-            if (content) normalized.push({ role, content });
+            if (content) normalized.push({ role: responsesInputRole(ir['role']), content });
             continue;
           }
           if (ir['type'] === 'input_text') {
@@ -521,7 +585,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             continue;
           }
           const text = normalizeTextContent(ir['content'] ?? ir['text']);
-          if (text) normalized.push({ role: typeof ir['role'] === 'string' ? (ir['role'] as string) : 'user', content: text });
+          if (text) normalized.push({ role: responsesInputRole(ir['role']), content: text });
         }
         return normalized;
       };
@@ -537,19 +601,18 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         messages = buildResponsesInputMessages(input);
       } else if (input && typeof input === 'object') {
         const ir = asRecord(input);
-        if (ir['type'] === 'message' || ir['type'] === 'function_call' || ir['type'] === 'function_call_output' || ir['type'] === 'tool_result') {
+        if (['message', 'function_call', 'function_call_output', 'custom_tool_call', 'custom_tool_call_output', 'tool_result'].includes(String(ir['type']))) {
           messages = buildResponsesInputMessages([input]);
         } else {
           const content = normalizeTextContent(ir['content'] ?? ir['text']);
           if (content) {
-            messages = [{ role: typeof ir['role'] === 'string' ? (ir['role'] as string) : 'user', content }];
+            messages = [{ role: responsesInputRole(ir['role']), content }];
           }
         }
       }
 
       if (!messages.length) {
-        if (stream) throw createInvalidRequestError('input is required', 'input_required');
-        res.status(400).json({ error: { message: 'input is required' } });
+        rejectInvalidRequest('input is required', 'input_required');
         return;
       }
 
@@ -694,6 +757,42 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         };
       };
 
+      /**
+       * Freeform payload of a custom tool call. A missing or non-string `input`
+       * is an argument error, not an empty string: the declared schema makes
+       * `input` required, and emitting `""` would hand the client a custom call
+       * the model never made.
+       */
+      const customToolInputOf = (args: unknown, callName: string): string => {
+        if (typeof args === 'string') {
+          try {
+            return customToolInputOf(JSON.parse(args), callName);
+          } catch {
+            return args;
+          }
+        }
+        const value = args && typeof args === 'object' && !Array.isArray(args) ? asRecord(args)['input'] : undefined;
+        if (typeof value === 'string') return value;
+        throw createInvalidRequestError(
+          `Custom tool call ${callName} requires a string "input" argument.`,
+          'invalid_custom_tool_input',
+        );
+      };
+
+      const buildResponsesCustomToolCallItem = (
+        callId: string,
+        name: string,
+        args: unknown,
+        status: string,
+      ): Record<string, unknown> => ({
+        id: callId,
+        type: 'custom_tool_call',
+        status,
+        call_id: callId,
+        name,
+        input: status === 'completed' ? customToolInputOf(args, name) : '',
+      });
+
       if (stream) {
         if (res.destroyed || res.writableEnded) {
           stopResponsesKeepalive();
@@ -796,6 +895,12 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
                   status: 'completed',
                   arguments: '',
                 });
+              } else if (entry.type === 'custom_tool_call') {
+                outputAssembler.complete(entry.type, entry.id, {
+                  ...entry.addedItem,
+                  status: 'completed',
+                  input: '',
+                });
               } else if (entry.type === 'web_search_call') {
                 outputAssembler.complete(entry.type, entry.id, {
                   ...entry.addedItem,
@@ -840,6 +945,14 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
                 output_index: entry.index,
                 item_id: entry.id,
                 arguments: String(doneItem['arguments'] ?? ''),
+              });
+            } else if (entry.type === 'custom_tool_call') {
+              emit({
+                type: 'response.custom_tool_call_input.done',
+                sequence_number: nextSeq(),
+                output_index: entry.index,
+                item_id: entry.id,
+                input: String(doneItem['input'] ?? ''),
               });
             }
             emit({
@@ -898,6 +1011,30 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             delta: args,
           });
           outputAssembler.complete('function_call', callId, doneItem);
+        };
+        const emitResponsesCustomToolCall = (toolCall: FinalToolCall): void => {
+          const record = toolCall as unknown as Record<string, unknown>;
+          const fn = asRecord(record['function']);
+          const callId = String(record['id'] ?? '');
+          const name = String(fn['name'] ?? '');
+          if (outputAssembler.has('custom_tool_call', callId)) throw createDuplicateToolCallIdError();
+          const addedItem = buildResponsesCustomToolCallItem(callId, name, '', 'in_progress');
+          const doneItem = buildResponsesCustomToolCallItem(callId, name, fn['arguments'], 'completed');
+          const entry = outputAssembler.announce(addedItem);
+          emit({
+            type: 'response.output_item.added',
+            sequence_number: nextSeq(),
+            output_index: entry.index,
+            item: addedItem,
+          });
+          emit({
+            type: 'response.custom_tool_call_input.delta',
+            sequence_number: nextSeq(),
+            output_index: entry.index,
+            item_id: callId,
+            delta: String(doneItem['input'] ?? ''),
+          });
+          outputAssembler.complete('custom_tool_call', callId, doneItem);
         };
         const appendVisibleDelta = (filtered: string, isReasoning: boolean): void => {
           if (!filtered) return;
@@ -1209,7 +1346,10 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           validatedStreamedToolCalls.forEach((toolCall) => {
             const record = toolCall as unknown as Record<string, unknown>;
             const fn = asRecord(record['function']);
-            emitResponsesFunctionCall({
+            const emitCall = customToolNames.has(String(fn['name'] ?? ''))
+              ? emitResponsesCustomToolCall
+              : emitResponsesFunctionCall;
+            emitCall({
               id: String(record['id']),
               type: 'function',
               function: { name: fn['name'], arguments: fn['arguments'] },
@@ -1241,7 +1381,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
          };
          emit({ type: 'response.completed', sequence_number: nextSeq(), response });
          res.write('data: [DONE]\n\n');
-         storeResponseState(responseId, sessionId, `${pID}/${mID}`);
+         storeResponseState(responseId, sessionId, `${pID}/${mID}`, buildStoredResponseToolCalls(validatedStreamedToolCalls));
          if (ownedResponsesSessionId === sessionId) ownedResponsesSessionId = null;
          stopResponsesKeepalive();
          res.end();
@@ -1432,11 +1572,17 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       validatedToolCalls.forEach((toolCall) => {
         const record = toolCall as unknown as Record<string, unknown>;
         const fn = asRecord(record['function']);
+        const callId = String(record['id']);
+        const name = String(fn['name'] ?? '');
+        if (customToolNames.has(name)) {
+          output.push(buildResponsesCustomToolCallItem(callId, name, fn['arguments'], 'completed'));
+          return;
+        }
         output.push({
-          id: String(record['id']),
+          id: callId,
           type: 'function_call',
           status: 'completed',
-          call_id: String(record['id']),
+          call_id: callId,
           name: fn['name'],
           arguments: fn['arguments'],
         });
@@ -1467,7 +1613,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         },
       };
 
-      storeResponseState(responseId, sessionId, `${pID}/${mID}`);
+      storeResponseState(responseId, sessionId, `${pID}/${mID}`, buildStoredResponseToolCalls(validatedToolCalls));
       if (ownedResponsesSessionId === sessionId) ownedResponsesSessionId = null;
 
       res.json(response);

@@ -89,7 +89,7 @@ describe('Anthropic /v1/messages converters', () => {
         expect(mapFinishToStopReason('stop', true)).toBe('tool_use');
     });
 
-    test('preserves enabled and proxy policy metadata in converted tools', () => {
+    test('preserves enabled but drops proxy-reserved metadata in converted tools', () => {
         const converted = anthropicToolsToChatTools([{
             name: 'w',
             input_schema: { type: 'object' },
@@ -99,12 +99,11 @@ describe('Anthropic /v1/messages converters', () => {
             x_proxy_requires_confirmation: true
         }]);
 
-        expect(converted[0].function).toMatchObject({
-            enabled: false,
-            x_proxy_side_effect: 'write',
-            x_proxy_risk_level: 'high',
-            x_proxy_requires_confirmation: true
-        });
+        expect(converted[0].function.enabled).toBe(false);
+        expect(converted[0].function.x_proxy_side_effect).toBeUndefined();
+        expect(converted[0].function.x_proxy_risk_level).toBeUndefined();
+        expect(converted[0].function.x_proxy_requires_confirmation).toBeUndefined();
+        expect(JSON.stringify(converted)).not.toContain('x_proxy_');
     });
 
     test('does not convert a tool choice without a name to required', () => {

@@ -1,3 +1,4 @@
+import { resolveExternalToolName } from './registry.js';
 import type { ExternalToolEntry } from './registry.js';
 
 /** String shorthand accepted by Chat Completions (`auto` / `none` / `required`). */
@@ -13,7 +14,7 @@ export interface ChatNestedFunctionToolChoice {
 
 /** Responses API object shape: `{ type:'function', name }` (flat). */
 export interface ChatFlatFunctionToolChoice {
-  type: 'function';
+  type: 'function' | 'custom';
   name?: unknown;
   function?: unknown;
   [key: string]: unknown;
@@ -101,9 +102,8 @@ function preflightFailure(code: string, message: string): ToolChoicePreflightFai
   return { ok: false, code, message };
 }
 
-function exactToolForName(registry: ExternalToolEntry[], name: unknown): ExternalToolEntry | null {
-  if (typeof name !== 'string' || !name) return null;
-  return registry.find((tool) => tool.originalName === name || tool.namespacedName === name) ?? null;
+function exactToolForName(registry: ExternalToolEntry[], name: unknown, namespace?: unknown): ExternalToolEntry | null {
+  return resolveExternalToolName(registry, name, namespace);
 }
 
 export function preflightExternalToolChoice(toolChoice: unknown, registry: unknown): ToolChoicePreflightResult {
@@ -143,7 +143,10 @@ export function preflightExternalToolChoice(toolChoice: unknown, registry: unkno
   let requestedName: unknown;
   if (type === 'tool') {
     requestedName = candidate['name'];
-  } else if (type === 'function') {
+  } else if (type === 'function' || type === 'custom') {
+    // `custom` names a freeform declaration, which the request converters expose
+    // as a function over the wrapped {input: string} schema — so it selects the
+    // same registry entry a `function` choice would.
     const hasFunction = Object.prototype.hasOwnProperty.call(candidate, 'function');
     const hasDirectName = Object.prototype.hasOwnProperty.call(candidate, 'name');
     if (hasFunction) {
@@ -170,7 +173,7 @@ export function preflightExternalToolChoice(toolChoice: unknown, registry: unkno
   if (typeof requestedName !== 'string' || !requestedName) {
     return preflightFailure('invalid_tool_choice', 'tool_choice.name is required for a specific tool choice.');
   }
-  const tool = exactToolForName(list, requestedName);
+  const tool = exactToolForName(list, requestedName, candidate['namespace']);
   if (!tool) {
     return preflightFailure('unknown_tool', `tool_choice references an unknown tool: ${requestedName}`);
   }

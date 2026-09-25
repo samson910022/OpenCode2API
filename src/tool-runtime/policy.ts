@@ -23,6 +23,7 @@ export interface PolicyContext {
 export interface PolicyToolLike {
   originalName?: unknown;
   namespacedName?: unknown;
+  declaredName?: unknown;
   requiresConfirmation?: unknown;
   sideEffect?: unknown;
   riskLevel?: unknown;
@@ -100,7 +101,7 @@ export function evaluateToolPolicy(tool: unknown, args: unknown, context: unknow
       : {};
   const policy = createPolicyContext(ctxRecord['config']);
   const candidate = tool as PolicyToolLike;
-  const toolNames: string[] = [candidate.originalName, candidate.namespacedName].filter(
+  const toolNames: string[] = [candidate.originalName, candidate.namespacedName, candidate.declaredName].filter(
     (name): name is string => typeof name === 'string' && Boolean(name)
   );
   const inAllowlist = toolNames.some((name) => policy.allowlist.has(name));

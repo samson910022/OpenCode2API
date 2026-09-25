@@ -7,11 +7,17 @@ export interface BackendState {
   jailRoot: string | null;
 }
 
+export interface ResponseToolCallState {
+  callId: string;
+  name: string;
+}
+
 /** Stateful Responses continuation entry (previous_response_id). */
 export interface SessionInfo {
   sessionId: string;
   model: string;
   expiresAt: number;
+  toolCalls?: ResponseToolCallState[];
 }
 
 /** Alias kept for task naming (SessionInfo == response-state entry). */
