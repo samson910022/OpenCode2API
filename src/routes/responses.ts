@@ -6,6 +6,7 @@ import { preflightExternalToolChoice } from '../tool-runtime/router.js';
 import { computeRetryDelay } from '../retry/policy.js';
 import {
   assertToolCallArtifactIntegrity,
+  createDuplicateToolCallIdError,
   stripExternalToolCallMarkupFromJoinedText,
   parseExternalToolCallsFromJoinedText,
   mergeToolCallArtifacts,
@@ -48,6 +49,117 @@ interface NormalizedInputMessage {
   role: string;
   content: string;
   isToolCalls?: boolean;
+}
+
+interface ResponsesOutputEntry {
+  index: number;
+  id: string;
+  type: string;
+  addedItem: Record<string, unknown>;
+  doneItem: Record<string, unknown> | null;
+  emittedDone: boolean;
+}
+
+class ResponsesOutputAssembler {
+  private readonly entries: ResponsesOutputEntry[] = [];
+  private readonly byKey = new Map<string, ResponsesOutputEntry>();
+
+  announce(item: Record<string, unknown>): ResponsesOutputEntry {
+    const id = String(item['id'] ?? '');
+    const type = String(item['type'] ?? '');
+    const key = `${type}:${id}`;
+    const existing = this.byKey.get(key);
+    if (existing) return existing;
+    const entry: ResponsesOutputEntry = {
+      index: this.entries.length,
+      id,
+      type,
+      addedItem: item,
+      doneItem: null,
+      emittedDone: false,
+    };
+    this.entries.push(entry);
+    this.byKey.set(key, entry);
+    return entry;
+  }
+
+  get(type: string, id: string): ResponsesOutputEntry | null {
+    return this.byKey.get(`${type}:${id}`) ?? null;
+  }
+
+  has(type: string, id: string): boolean {
+    return this.byKey.has(`${type}:${id}`);
+  }
+
+  complete(type: string, id: string, item: Record<string, unknown>): ResponsesOutputEntry | null {
+    const entry = this.get(type, id);
+    if (!entry) return null;
+    if (!entry.doneItem) entry.doneItem = item;
+    return entry;
+  }
+
+  markDone(entry: ResponsesOutputEntry): void {
+    entry.emittedDone = true;
+  }
+
+  list(): readonly ResponsesOutputEntry[] {
+    return this.entries;
+  }
+
+  output(): Record<string, unknown>[] {
+    return this.entries
+      .filter((entry) => entry.emittedDone && entry.doneItem !== null)
+      .map((entry) => entry.doneItem as Record<string, unknown>);
+  }
+}
+
+interface ResponsesStreamState {
+  id: string;
+  createdAt: number;
+  model: string;
+  tools: unknown[];
+  parallelToolCalls: boolean;
+  sequenceNumber: number;
+  output: ResponsesOutputAssembler;
+  nextSequence: () => number;
+  emit: (payload: unknown) => void;
+  emitCreated: () => void;
+  adoptResolvedModel: (resolvedModel: string) => void;
+  finalize: (() => void) | null;
+  createdEmitted: boolean;
+}
+
+interface ResponsesResponseIdentity {
+  id: string;
+  createdAt: number;
+  model: string;
+  tools: unknown[];
+  parallelToolCalls: boolean;
+}
+
+function buildResponsesResponseEnvelope(identity: ResponsesResponseIdentity): Record<string, unknown> {
+  return {
+    id: identity.id,
+    object: 'response',
+    created: identity.createdAt,
+    created_at: identity.createdAt,
+    model: identity.model,
+    tools: identity.tools,
+    parallel_tool_calls: identity.parallelToolCalls,
+  };
+}
+
+const RESPONSES_OUTPUT_TYPE_ORDER = ['web_search_call', 'reasoning', 'message', 'function_call'];
+
+function orderResponsesOutputItems(items: Record<string, unknown>[]): Record<string, unknown>[] {
+  const rank = (item: Record<string, unknown>): number => {
+    const index = RESPONSES_OUTPUT_TYPE_ORDER.indexOf(String(item['type']));
+    return index === -1 ? RESPONSES_OUTPUT_TYPE_ORDER.length : index;
+  };
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort((left, right) => rank(left.item) - rank(right.item) || left.index - right.index)
+    .map((entry) => entry.item);
 }
 
 export function registerResponsesRoutes(app: Application, ctx: AppContext): void {
@@ -102,12 +214,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
     let activePollForAssistantResponse = pollForAssistantResponse;
     let fallbackToProxy = false;
     let ownedResponsesSessionId: string | null = null;
-    let responsesStreamState: {
-      id: string;
-      createdAt: number;
-      model: string;
-      sequenceNumber: number;
-    } | null = null;
+    let responsesStreamState: ResponsesStreamState | null = null;
     const cleanupOwnedResponsesSession = async (): Promise<void> => {
       const ownedSessionId = ownedResponsesSessionId;
       ownedResponsesSessionId = null;
@@ -130,6 +237,84 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       if (!engageFallbackForFreeLimit(err, proxyPool)) return false;
       return switchToProxyBundle();
     };
+    const createInvalidRequestError = (message: string, code: string): Error & { statusCode: number; code: string } => {
+      const error = new Error(message) as Error & { statusCode: number; code: string };
+      error.statusCode = 400;
+      error.code = code;
+      return error;
+    };
+    const initializeResponsesStream = (
+      requestedModel: unknown,
+      previousModel: unknown,
+      requestTools: unknown[],
+      parallelToolCalls: boolean,
+    ): ResponsesStreamState => {
+      const initialModel =
+        typeof requestedModel === 'string' && requestedModel
+          ? requestedModel
+          : typeof previousModel === 'string' && previousModel
+            ? previousModel
+            : 'unknown';
+      const state: ResponsesStreamState = {
+        id: `resp_${crypto.randomUUID()}`,
+        createdAt: Math.floor(Date.now() / 1000),
+        model: initialModel,
+        tools: requestTools,
+        parallelToolCalls,
+        sequenceNumber: 0,
+        output: new ResponsesOutputAssembler(),
+        nextSequence: () => 0,
+        emit: () => undefined,
+        emitCreated: () => undefined,
+        adoptResolvedModel: () => undefined,
+        finalize: null,
+        createdEmitted: false,
+      };
+      const emit = (payload: unknown): void => {
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      };
+      state.nextSequence = () => state.sequenceNumber++;
+      state.emit = emit;
+      state.emitCreated = () => {
+        if (state.createdEmitted) return;
+        emit({
+          type: 'response.created',
+          sequence_number: state.nextSequence(),
+          response: {
+            ...buildResponsesResponseEnvelope(state),
+            status: 'in_progress',
+            output: [],
+            error: null,
+            incomplete_details: null,
+            usage: null,
+          },
+        });
+        state.createdEmitted = true;
+      };
+      state.adoptResolvedModel = (resolvedModel: string) => {
+        state.model = resolvedModel;
+        state.emitCreated();
+      };
+      responsesStreamState = state;
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      const flushHeaders = (res as unknown as { flushHeaders?: unknown }).flushHeaders;
+      if (typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
+      responsesKeepalive = setInterval(() => {
+        if (!res.destroyed && !res.writableEnded) res.write(': heartbeat\n\n');
+      }, 15000);
+      responsesResClosed = new Promise<boolean>((resolve) =>
+        res.once('close', () => {
+          if (!res.writableEnded) {
+            responsesAbortController.abort();
+            resolve(true);
+          }
+        }),
+      );
+      return state;
+    };
+    const getResponsesResClosed = (): Promise<boolean> | null => responsesResClosed;
     if (proxyPool.isEngaged()) switchToProxyBundle();
     try {
       const body = asRecord((req as unknown as { body: unknown }).body);
@@ -140,6 +325,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       const max_output_tokens: unknown = body['max_output_tokens'];
       const toolsRaw: unknown = body['tools'];
       const tools: unknown[] = Array.isArray(toolsRaw) ? (toolsRaw as unknown[]) : [];
+      const parallelToolCalls: boolean =
+        typeof body['parallel_tool_calls'] === 'boolean' ? body['parallel_tool_calls'] : true;
       const tool_choice: unknown = body['tool_choice'];
       const instructions: unknown = body['instructions'];
       const temperature: unknown = body['temperature'];
@@ -153,7 +340,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
 
       const previousState =
         typeof previousResponseId === 'string' && previousResponseId ? getResponseState(previousResponseId) : null;
+      if (stream) responsesStreamState = initializeResponsesStream(model, previousState?.model, tools, parallelToolCalls);
       if (previousResponseId && !previousState) {
+        if (stream) throw createInvalidRequestError('Invalid or expired previous_response_id', 'invalid_previous_response_id');
         res.status(400).json({ error: { message: 'Invalid or expired previous_response_id' } });
         return;
       }
@@ -225,6 +414,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       const externalToolRegistry: ExternalToolEntry[] = externalToolContext.registry;
       const toolChoicePreflight = preflightExternalToolChoice(tool_choice, externalToolRegistry);
       if (!toolChoicePreflight.ok) {
+        if (stream) throw createInvalidRequestError(toolChoicePreflight.message, toolChoicePreflight.code);
         res.status(400).json({
           error: {
             message: toolChoicePreflight.message,
@@ -358,28 +548,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       }
 
       if (!messages.length) {
+        if (stream) throw createInvalidRequestError('input is required', 'input_required');
         res.status(400).json({ error: { message: 'input is required' } });
         return;
-      }
-
-      if (stream) {
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        const flushHeaders = (res as unknown as { flushHeaders?: unknown }).flushHeaders;
-        if (typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
-        responsesKeepalive = setInterval(() => {
-          if (!res.destroyed && !res.writableEnded) res.write(': heartbeat\n\n');
-        }, 15000);
-         responsesResClosed = new Promise<boolean>((resolve) =>
-           res.once('close', () => {
-             if (!res.writableEnded) {
-               responsesAbortController.abort();
-               resolve(true);
-             }
-           }),
-         );
-
       }
 
       const resolvedModel = (await withTimeout(
@@ -389,6 +560,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       )) as unknown as { providerID: string; modelID: string };
       const pID = String(asRecord(resolvedModel)['providerID']);
       const mID = String(asRecord(resolvedModel)['modelID']);
+      if (responsesStreamState) responsesStreamState.adoptResolvedModel(`${pID}/${mID}`);
 
       await ensureBackend(config);
 
@@ -499,15 +671,6 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
 
       let content = '';
       let reasoning = '';
-      const buildResponsesFunctionCallOutputItem = (toolCall: FinalToolCall): Record<string, unknown> => ({
-        id: toolCall.id,
-        type: 'function_call',
-        status: 'completed',
-        call_id: toolCall.id,
-        name: (toolCall.function as Record<string, unknown>)['name'],
-        arguments: (toolCall.function as Record<string, unknown>)['arguments'],
-      });
-
       const buildResponsesMessageOutputItem = (
         text: unknown,
         messageId: string = `msg_${crypto.randomUUID()}`,
@@ -541,146 +704,241 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           }
           return;
         }
-        const createdAt = Math.floor(Date.now() / 1000);
-        const responseState = {
-          id: `resp_${crypto.randomUUID()}`,
-          createdAt,
-          model: `${pID}/${mID}`,
-          sequenceNumber: 0,
-        };
-        responsesStreamState = responseState;
+        const responseState = responsesStreamState;
+        if (!responseState) throw new Error('Responses stream state was not initialized');
         const responseId = responseState.id;
-        const messageOutputIndex = 0;
-        const reasoningOutputIndex = 1;
         const contentIndex = 0;
         const outputItemId = `msg_${crypto.randomUUID()}`;
         const reasoningItemId = 'reasoning-0';
-        let nextOutputIndex = 2;
-        let announcedOutput = false;
+        const nextSeq = (): number => responseState.nextSequence();
+        const emit = (payload: unknown): void => responseState.emit(payload);
+
+        const outputAssembler = responseState.output;
         let announcedContent = false;
-        let announcedReasoning = false;
-        const nextSeq = (): number => responseState.sequenceNumber++;
-        const emit = (payload: unknown): void => {
-          res.write(`data: ${JSON.stringify(payload)}\n\n`);
-        };
-
-        emit({
-          type: 'response.created',
-          sequence_number: nextSeq(),
-          response: { id: responseId, object: 'response', created: createdAt, created_at: createdAt, status: 'in_progress', model: responseState.model },
-        });
-
-         const shouldBufferExternalStream = externalToolRegistry.length > 0;
-         let filterContentDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
-         let filterReasoningDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
-         let parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
-         let parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
-         const streamedToolCalls: FinalToolCall[] = [];
-        let rawContent = '';
-        let rawReasoning = '';
-        const ensureOutputScaffold = (): void => {
-          if (!announcedOutput) {
+        const ensureOutputScaffold = (): ResponsesOutputEntry => {
+          let entry = outputAssembler.get('message', outputItemId);
+          if (!entry) {
+            entry = outputAssembler.announce({
+              id: outputItemId,
+              type: 'message',
+              status: 'in_progress',
+              role: 'assistant',
+              content: [],
+            });
             emit({
               type: 'response.output_item.added',
               sequence_number: nextSeq(),
-              output_index: messageOutputIndex,
-              item: { id: outputItemId, type: 'message', status: 'in_progress', role: 'assistant', content: [] },
+              output_index: entry.index,
+              item: entry.addedItem,
             });
-            announcedOutput = true;
           }
           if (!announcedContent) {
             emit({
               type: 'response.content_part.added',
               sequence_number: nextSeq(),
-              output_index: messageOutputIndex,
+              output_index: entry.index,
               content_index: contentIndex,
               item_id: outputItemId,
               part: { type: 'output_text', text: '', annotations: [] },
             });
             announcedContent = true;
           }
+          return entry;
         };
-        const ensureReasoningScaffold = (): void => {
-          if (!announcedReasoning) {
-            emit({
-              type: 'response.output_item.added',
-              sequence_number: nextSeq(),
-              output_index: reasoningOutputIndex,
-              item: { id: reasoningItemId, type: 'reasoning', status: 'in_progress', summary: [{ type: 'summary_text', text: '' }] },
-            });
-            announcedReasoning = true;
-          }
-        };
-        const emitResponsesFunctionCall = (toolCall: FinalToolCall): void => {
-          const outputIndex = nextOutputIndex++;
-           const functionCallItem = buildResponsesFunctionCallOutputItem(toolCall);
+        const ensureReasoningScaffold = (): ResponsesOutputEntry => {
+          let entry = outputAssembler.get('reasoning', reasoningItemId);
+          if (entry) return entry;
+          entry = outputAssembler.announce({
+            id: reasoningItemId,
+            type: 'reasoning',
+            status: 'in_progress',
+            summary: [{ type: 'summary_text', text: '' }],
+          });
           emit({
             type: 'response.output_item.added',
             sequence_number: nextSeq(),
-            output_index: outputIndex,
-            item: { ...functionCallItem, status: 'in_progress' },
+            output_index: entry.index,
+            item: entry.addedItem,
+          });
+          return entry;
+        };
+        const finalizeOutputItems = (
+          finalContent: string = content,
+          finalReasoning: string = reasoning,
+          annotations: unknown[] = [],
+        ): void => {
+          const messageEntry = outputAssembler.get('message', outputItemId);
+          if (messageEntry) {
+            const messageItem = buildResponsesMessageOutputItem(finalContent, outputItemId, annotations) ?? {
+              id: outputItemId,
+              type: 'message',
+              role: 'assistant',
+              status: 'completed',
+              content: [{ type: 'output_text', text: finalContent, annotations }],
+            };
+            outputAssembler.complete('message', outputItemId, messageItem);
+          }
+          const reasoningEntry = outputAssembler.get('reasoning', reasoningItemId);
+          if (reasoningEntry) {
+            outputAssembler.complete('reasoning', reasoningItemId, {
+              id: reasoningItemId,
+              type: 'reasoning',
+              status: 'completed',
+              summary: [{ type: 'summary_text', text: finalReasoning }],
+            });
+          }
+          for (const entry of outputAssembler.list()) {
+            if (entry.emittedDone) continue;
+            if (!entry.doneItem) {
+              if (entry.type === 'function_call') {
+                outputAssembler.complete(entry.type, entry.id, {
+                  ...entry.addedItem,
+                  status: 'completed',
+                  arguments: '',
+                });
+              } else if (entry.type === 'web_search_call') {
+                outputAssembler.complete(entry.type, entry.id, {
+                  ...entry.addedItem,
+                  status: 'completed',
+                });
+              }
+            }
+            const doneItem = entry.doneItem;
+            if (!doneItem) continue;
+            if (entry.type === 'message' && announcedContent) {
+              const doneContent = Array.isArray(doneItem['content']) ? doneItem['content'] : [];
+              const part = asRecord(doneContent[0]);
+              emit({
+                type: 'response.output_text.done',
+                sequence_number: nextSeq(),
+                output_index: entry.index,
+                content_index: contentIndex,
+                item_id: entry.id,
+                text: String(part['text'] ?? ''),
+              });
+              emit({
+                type: 'response.content_part.done',
+                sequence_number: nextSeq(),
+                output_index: entry.index,
+                content_index: contentIndex,
+                item_id: entry.id,
+                part,
+              });
+            } else if (entry.type === 'reasoning') {
+              emit({
+                type: 'response.reasoning_summary_text.done',
+                sequence_number: nextSeq(),
+                output_index: entry.index,
+                item_id: entry.id,
+                summary_index: 0,
+                text: finalReasoning,
+              });
+            } else if (entry.type === 'function_call') {
+              emit({
+                type: 'response.function_call_arguments.done',
+                sequence_number: nextSeq(),
+                output_index: entry.index,
+                item_id: entry.id,
+                arguments: String(doneItem['arguments'] ?? ''),
+              });
+            }
+            emit({
+              type: 'response.output_item.done',
+              sequence_number: nextSeq(),
+              output_index: entry.index,
+              item: doneItem,
+            });
+            outputAssembler.markDone(entry);
+          }
+        };
+        responseState.finalize = () => finalizeOutputItems();
+        const shouldBufferExternalStream = externalToolRegistry.length > 0;
+        const deferVisibleOutput = shouldBufferExternalStream || hostedSearch.requested;
+        let filterContentDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
+        let filterReasoningDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
+        let parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+        let parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+        const streamedToolCalls: FinalToolCall[] = [];
+        let rawContent = '';
+        let rawReasoning = '';
+        const emitResponsesFunctionCall = (toolCall: FinalToolCall): void => {
+          const record = toolCall as unknown as Record<string, unknown>;
+          const fn = asRecord(record['function']);
+          const callId = String(record['id'] ?? '');
+          const args = typeof fn['arguments'] === 'string' ? fn['arguments'] : '';
+          if (outputAssembler.has('function_call', callId)) throw createDuplicateToolCallIdError();
+          const doneItem = {
+            id: callId,
+            type: 'function_call',
+            status: 'completed',
+            call_id: callId,
+            name: fn['name'],
+            arguments: args,
+          };
+          const addedItem = {
+            id: callId,
+            type: 'function_call',
+            status: 'in_progress',
+            call_id: callId,
+            name: fn['name'],
+            arguments: '',
+          };
+          const entry = outputAssembler.announce(addedItem);
+          emit({
+            type: 'response.output_item.added',
+            sequence_number: nextSeq(),
+            output_index: entry.index,
+            item: addedItem,
           });
           emit({
             type: 'response.function_call_arguments.delta',
             sequence_number: nextSeq(),
-            output_index: outputIndex,
-            item_id: toolCall.id,
-            delta: (toolCall.function as Record<string, unknown>)['arguments'],
+            output_index: entry.index,
+            item_id: callId,
+            delta: args,
           });
-          emit({
-            type: 'response.function_call_arguments.done',
-            sequence_number: nextSeq(),
-            output_index: outputIndex,
-            item_id: toolCall.id,
-            arguments: (toolCall.function as Record<string, unknown>)['arguments'],
-          });
-          emit({
-            type: 'response.output_item.done',
-            sequence_number: nextSeq(),
-            output_index: outputIndex,
-            item: functionCallItem,
-          });
+          outputAssembler.complete('function_call', callId, doneItem);
         };
-         const appendVisibleDelta = (filtered: string, isReasoning: boolean): void => {
-           if (!filtered) return;
-           if (isReasoning) reasoning += filtered;
-           else content += filtered;
-         };
-         const writeVisibleDelta = (filtered: string, isReasoning: boolean): void => {
-           if (!filtered) return;
-           if (isReasoning) {
-             ensureReasoningScaffold();
-             emit({
-               type: 'response.reasoning_summary_text.delta',
-               sequence_number: nextSeq(),
-               output_index: reasoningOutputIndex,
-               item_id: reasoningItemId,
-               summary_index: 0,
-               delta: filtered,
-             });
-           } else if (filtered.trim()) {
-             ensureOutputScaffold();
-             emit({
-               type: 'response.output_text.delta',
-               sequence_number: nextSeq(),
-               output_index: messageOutputIndex,
-               content_index: contentIndex,
-               item_id: outputItemId,
-               delta: filtered,
-             });
-           }
-         };
-         const sendResponsesDelta = (delta: string, isReasoning: boolean = false): void => {
-           if (!delta) return;
-           if (isReasoning) rawReasoning += delta;
-           else rawContent += delta;
-           const parsedDeltaToolCalls = isReasoning ? parseReasoningToolCalls(delta) : parseContentToolCalls(delta);
-           parsedDeltaToolCalls.forEach((toolCall) => streamedToolCalls.push(toolCall));
-           const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
-           if (!filtered) return;
-           appendVisibleDelta(filtered, isReasoning);
-           if (!shouldBufferExternalStream) writeVisibleDelta(filtered, isReasoning);
-         };
+        const appendVisibleDelta = (filtered: string, isReasoning: boolean): void => {
+          if (!filtered) return;
+          if (isReasoning) reasoning += filtered;
+          else content += filtered;
+        };
+        const writeVisibleDelta = (filtered: string, isReasoning: boolean): void => {
+          if (!filtered) return;
+          if (isReasoning) {
+            const entry = ensureReasoningScaffold();
+            emit({
+              type: 'response.reasoning_summary_text.delta',
+              sequence_number: nextSeq(),
+              output_index: entry.index,
+              item_id: reasoningItemId,
+              summary_index: 0,
+              delta: filtered,
+            });
+          } else if (filtered.trim()) {
+            const entry = ensureOutputScaffold();
+            emit({
+              type: 'response.output_text.delta',
+              sequence_number: nextSeq(),
+              output_index: entry.index,
+              content_index: contentIndex,
+              item_id: outputItemId,
+              delta: filtered,
+            });
+          }
+        };
+        const sendResponsesDelta = (delta: string, isReasoning: boolean = false): void => {
+          if (!delta) return;
+          if (isReasoning) rawReasoning += delta;
+          else rawContent += delta;
+          const parsedDeltaToolCalls = isReasoning ? parseReasoningToolCalls(delta) : parseContentToolCalls(delta);
+          parsedDeltaToolCalls.forEach((toolCall) => streamedToolCalls.push(toolCall));
+          const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
+          if (!filtered) return;
+          appendVisibleDelta(filtered, isReasoning);
+          if (!deferVisibleOutput) writeVisibleDelta(filtered, isReasoning);
+        };
          const unsentSuffix = (full: unknown, raw: string): string => {
            const text = typeof full === 'string' ? full : '';
            if (!text) return '';
@@ -704,11 +962,12 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
                responsesAbortController.signal,
              );
 
-            const safeCollect = collectPromise.catch((err: unknown) => ({ __error: err }));
-            activeClient.session.prompt(promptParams).catch((err: unknown) => logDebug('Responses prompt error:', toErrorMessage(err)));
-            const raced = responsesResClosed
-              ? await Promise.race([safeCollect, responsesResClosed.then(() => ({ __cancelled: true }))])
-              : await safeCollect;
+             const safeCollect = collectPromise.catch((err: unknown) => ({ __error: err }));
+             activeClient.session.prompt(promptParams).catch((err: unknown) => logDebug('Responses prompt error:', toErrorMessage(err)));
+             const closePromise = getResponsesResClosed();
+             const raced = closePromise
+               ? await Promise.race([safeCollect, closePromise.then(() => ({ __cancelled: true }))])
+               : await safeCollect;
             const racedRecord = asRecord(raced);
             if (racedRecord['__cancelled']) {
               stopResponsesKeepalive();
@@ -844,12 +1103,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
          const flushedContentCalls = parseContentToolCalls.flush ? parseContentToolCalls.flush() : [];
          const flushedReasoningText = filterReasoningDelta.flush ? filterReasoningDelta.flush() : '';
          const flushedContentText = filterContentDelta.flush ? filterContentDelta.flush() : '';
-         if (!shouldBufferExternalStream) {
-           appendVisibleDelta(flushedReasoningText, true);
-           appendVisibleDelta(flushedContentText, false);
-           writeVisibleDelta(flushedReasoningText, true);
-           writeVisibleDelta(flushedContentText, false);
-         } else {
+         appendVisibleDelta(flushedReasoningText, true);
+         appendVisibleDelta(flushedContentText, false);
+         if (shouldBufferExternalStream) {
            const visible = stripExternalToolCallMarkupFromJoinedText(
              externalToolRegistry,
              rawReasoning,
@@ -857,6 +1113,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
            );
            reasoning = visible.reasoning;
            content = visible.content;
+         } else if (!deferVisibleOutput) {
+           writeVisibleDelta(flushedReasoningText, true);
+           writeVisibleDelta(flushedContentText, false);
          }
 
           const recoveryForParse = recoverySnapshot as { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null;
@@ -907,132 +1166,67 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
          if (!safeContent.trim() && !safeReasoning.trim() && validatedStreamedToolCalls.length === 0) {
            throw new Error('Upstream returned no assistant data');
          }
-         if (shouldBufferExternalStream) {
-           writeVisibleDelta(safeReasoning, true);
-           writeVisibleDelta(safeContent, false);
-         }
-         validatedStreamedToolCalls.forEach((toolCall) => {
-           const record = toolCall as unknown as Record<string, unknown>;
-           const fn = asRecord(record['function']);
-           emitResponsesFunctionCall({
-             id: String(record['id']),
-             type: 'function',
-             function: { name: fn['name'], arguments: fn['arguments'] },
-           } as unknown as FinalToolCall);
-         });
+          const streamEvidence = hostedSearch.requested
+            ? extractSearchEvidence(streamSearchToolParts)
+            : { queries: [] as string[], sources: [] as { url: string; title: string }[] };
+          const streamSearchCallItems = buildWebSearchCallItems(streamEvidence);
+          const emitWebSearchCallItem = (item: { id: string; type: string; status: string; action: unknown }): void => {
+            const callId = String(item.id);
+            if (outputAssembler.has('web_search_call', callId)) return;
+            const addedItem = {
+              id: callId,
+              type: 'web_search_call',
+              status: 'in_progress',
+            };
+            const entry = outputAssembler.announce(addedItem);
+            emit({
+              type: 'response.output_item.added',
+              sequence_number: nextSeq(),
+              output_index: entry.index,
+              item: addedItem,
+            });
+            emit({
+              type: 'response.web_search_call.searching',
+              sequence_number: nextSeq(),
+              output_index: entry.index,
+              item_id: callId,
+            });
+            emit({
+              type: 'response.web_search_call.completed',
+              sequence_number: nextSeq(),
+              output_index: entry.index,
+              item_id: callId,
+            });
+            outputAssembler.complete('web_search_call', callId, { ...item });
+          };
+          streamSearchCallItems.forEach((item) => emitWebSearchCallItem(item));
 
-         const streamEvidence = hostedSearch.requested
-           ? extractSearchEvidence(streamSearchToolParts)
-           : { queries: [] as string[], sources: [] as { url: string; title: string }[] };
-         const streamSearchCallItems = buildWebSearchCallItems(streamEvidence);
-         const emitWebSearchCallItem = (item: { id: string }): void => {
-           const outputIndex = nextOutputIndex++;
-           emit({
-             type: 'response.output_item.added',
-             sequence_number: nextSeq(),
-             output_index: outputIndex,
-             item: { id: item.id, type: 'web_search_call', status: 'in_progress' },
-           });
-           emit({
-             type: 'response.web_search_call.searching',
-             sequence_number: nextSeq(),
-             output_index: outputIndex,
-             item_id: item.id,
-           });
-           emit({
-             type: 'response.web_search_call.completed',
-             sequence_number: nextSeq(),
-             output_index: outputIndex,
-             item_id: item.id,
-           });
-         };
-         streamSearchCallItems.forEach((item) => {
-           emitWebSearchCallItem(item);
-           emit({
-             type: 'response.output_item.done',
-             sequence_number: nextSeq(),
-             output_index: nextOutputIndex - 1,
-             item: { ...item },
-           });
-         });
+          if (deferVisibleOutput) {
+            writeVisibleDelta(safeReasoning, true);
+            writeVisibleDelta(safeContent, false);
+          }
 
-         if (announcedReasoning) {
-           emit({
-             type: 'response.reasoning_summary_text.done',
-             sequence_number: nextSeq(),
-             output_index: reasoningOutputIndex,
-             item_id: reasoningItemId,
-             summary_index: 0,
-             text: safeReasoning,
-           });
-           emit({
-             type: 'response.output_item.done',
-             sequence_number: nextSeq(),
-             output_index: reasoningOutputIndex,
-             item: { id: reasoningItemId, type: 'reasoning', status: 'completed', summary: [{ type: 'summary_text', text: safeReasoning }] },
-           });
-         }
+          validatedStreamedToolCalls.forEach((toolCall) => {
+            const record = toolCall as unknown as Record<string, unknown>;
+            const fn = asRecord(record['function']);
+            emitResponsesFunctionCall({
+              id: String(record['id']),
+              type: 'function',
+              function: { name: fn['name'], arguments: fn['arguments'] },
+            } as unknown as FinalToolCall);
+          });
 
-         const hasMeaningfulContent = Boolean(safeContent && safeContent.trim());
-         if (announcedContent && hasMeaningfulContent) {
-           const contentAnnotations = buildCitationAnnotations(safeContent, streamEvidence.sources);
-           emit({
-             type: 'response.output_text.done',
-             sequence_number: nextSeq(),
-             output_index: messageOutputIndex,
-             content_index: contentIndex,
-             item_id: outputItemId,
-             text: safeContent,
-           });
-           emit({
-             type: 'response.content_part.done',
-             sequence_number: nextSeq(),
-             output_index: messageOutputIndex,
-             content_index: contentIndex,
-             item_id: outputItemId,
-             part: { type: 'output_text', text: safeContent, annotations: contentAnnotations },
-           });
-           emit({
-             type: 'response.output_item.done',
-             sequence_number: nextSeq(),
-             output_index: messageOutputIndex,
-             item: { id: outputItemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: safeContent, annotations: contentAnnotations }] },
-           });
-         }
-
-         const streamOutput: Record<string, unknown>[] = [];
-         streamSearchCallItems.forEach((item) => streamOutput.push({ ...item }));
-         const streamAnnotations = buildCitationAnnotations(safeContent, streamEvidence.sources);
-         const streamMessageOutputItem = buildResponsesMessageOutputItem(
-           safeContent && safeContent.trim() ? safeContent : '',
-           outputItemId,
-           streamAnnotations,
-         );
-         if (streamMessageOutputItem) streamOutput.push(streamMessageOutputItem);
-         validatedStreamedToolCalls.forEach((toolCall) => {
-           const record = toolCall as unknown as Record<string, unknown>;
-           const fn = asRecord(record['function']);
-           streamOutput.push({
-             id: String(record['id']),
-             type: 'function_call',
-             status: 'completed',
-             call_id: String(record['id']),
-             name: fn['name'],
-             arguments: fn['arguments'],
-           });
-         });
-         const promptTokens = Math.ceil(fullPromptText.length / 4);
+          const streamAnnotations = buildCitationAnnotations(safeContent, streamEvidence.sources);
+          finalizeOutputItems(safeContent, safeReasoning, streamAnnotations);
+          const streamOutput = outputAssembler.output();
+          const promptTokens = Math.ceil(fullPromptText.length / 4);
          const completionTokens = Math.ceil(content.length / 4);
          const reasoningTokens = Math.ceil(reasoning.length / 4);
          const completedAt = Math.floor(Date.now() / 1000);
          const response = {
-           id: responseState.id,
-           object: 'response',
-           created: responseState.createdAt,
-           created_at: responseState.createdAt,
+           ...buildResponsesResponseEnvelope(responseState),
            completed_at: completedAt,
            status: 'completed',
-           model: responseState.model,
            reasoning: safeReasoning ? { effort: reasoningLevel, summary: safeReasoning.substring(0, 100) } : undefined,
            output: streamOutput,
            error: null,
@@ -1247,18 +1441,21 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           arguments: fn['arguments'],
         });
       });
+      const orderedOutput = orderResponsesOutputItems(output);
 
       const responseId = `resp_${crypto.randomUUID()}`;
       const createdAt = Math.floor(Date.now() / 1000);
       const response = {
-        id: responseId,
-        object: 'response',
-        created: createdAt,
-        created_at: createdAt,
+        ...buildResponsesResponseEnvelope({
+          id: responseId,
+          createdAt,
+          model: `${pID}/${mID}`,
+          tools,
+          parallelToolCalls,
+        }),
         status: 'completed',
-        model: `${pID}/${mID}`,
         reasoning: safeReasoning ? { effort: reasoningLevel, summary: safeReasoning.substring(0, 100) } : undefined,
-        output,
+        output: orderedOutput,
         error: null,
         incomplete_details: null,
         usage: {
@@ -1280,25 +1477,31 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       console.error('[Proxy] Responses API Error:', toErrorMessage(error));
       if (!fallbackToProxy) engageProxyFallback(error);
       const transformed = transformUpstreamError(error);
-      if (res.headersSent) {
+      if (responsesStreamState) {
         try {
-          const failedAt = Math.floor(Date.now() / 1000);
           const streamState = responsesStreamState;
-          res.write(
-            `data: ${JSON.stringify({
-              type: 'response.failed',
-              sequence_number: streamState ? streamState.sequenceNumber++ : 0,
-              response: {
-                id: streamState?.id ?? `resp_${crypto.randomUUID()}`,
-                object: 'response',
-                created: streamState?.createdAt ?? failedAt,
-                created_at: streamState?.createdAt ?? failedAt,
-                status: 'failed',
-                ...(streamState ? { model: streamState.model } : {}),
-                error: transformed.error,
-              },
-            })}\n\n`,
-          );
+          if (!streamState.createdEmitted) streamState.emitCreated();
+          if (streamState.finalize) {
+            try {
+              streamState.finalize();
+            } catch (finalizeError: unknown) {
+              logDebug('Failed to finalize errored response stream', { error: toErrorMessage(finalizeError) });
+            }
+          }
+          const failedPayload = {
+            type: 'response.failed',
+            sequence_number: streamState.nextSequence(),
+            response: {
+              ...buildResponsesResponseEnvelope(streamState),
+              completed_at: null,
+              status: 'failed',
+              output: streamState.output.output(),
+              error: transformed.error,
+              incomplete_details: null,
+              usage: null,
+            },
+          };
+          streamState.emit(failedPayload);
           res.write('data: [DONE]\n\n');
         } catch (writeError: unknown) {
           logDebug('Failed to report error on open response stream', { error: toErrorMessage(writeError) });

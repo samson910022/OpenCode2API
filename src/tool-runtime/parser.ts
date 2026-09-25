@@ -1659,6 +1659,12 @@ function hasMalformedToolSource(registry: unknown, source: string): boolean {
   return false;
 }
 
+export function createDuplicateToolCallIdError(): Error & { code?: string } {
+  const error = new Error('The model emitted conflicting arguments for a duplicate external tool call id.') as Error & { code?: string };
+  error.code = 'duplicate_external_tool_call_id';
+  return error;
+}
+
 export function assertToolCallArtifactIntegrity(calls: unknown, registry: unknown, sourceText: unknown): void {
   const ids = new Map<string, string>();
   if (Array.isArray(calls)) {
@@ -1673,9 +1679,7 @@ export function assertToolCallArtifactIntegrity(calls: unknown, registry: unknow
       const semanticKey = toolCallKey(String(fnRecord['name'] ?? ''), fnRecord['arguments'] ?? {});
       const previous = ids.get(id);
       if (previous !== undefined && previous !== semanticKey) {
-        const error = new Error('The model emitted conflicting arguments for a duplicate external tool call id.') as Error & { code?: string };
-        error.code = 'duplicate_external_tool_call_id';
-        throw error;
+        throw createDuplicateToolCallIdError();
       }
       ids.set(id, semanticKey);
     }

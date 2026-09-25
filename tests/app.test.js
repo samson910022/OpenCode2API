@@ -14,6 +14,7 @@ const sdkMockDefaults = {
                     models: {
                         'kimi-k2.5': { name: 'Kimi k2.5', release_date: '2024-01-15' },
                         'gpt-5-nano': { name: 'GPT-5 Nano', release_date: '2025-01-15' },
+                        'gpt-4': { name: 'GPT-4', release_date: '2024-06-01' },
                         'muse-spark-1.3-contributor-free': { name: 'Muse Spark', release_date: '2026-01-15' }
                     }
                 }
@@ -2245,7 +2246,13 @@ describe('Proxy OpenAI API', () => {
             });
 
         expect(res.statusCode).toEqual(200);
-         expect(res.text).not.toContain('"name":"delete_ticket"');
+        const events = res.text
+            .split('\n')
+            .filter((line) => line.startsWith('data: ') && line !== 'data: [DONE]')
+            .map((line) => JSON.parse(line.slice(6)));
+        expect(events.map((event) => event.type)).toEqual(['response.created', 'response.failed']);
+        expect(events.every((event) => event.response.output.length === 0)).toBe(true);
+        expect(res.text).not.toContain('external__delete_ticket');
          expect(res.text).toContain('response.failed');
          expect(res.text).not.toContain('response.completed');
     });
@@ -2772,15 +2779,23 @@ describe('Proxy Responses API previous_response_id', () => {
                 .set('Authorization', 'Bearer test-key')
                 .send({ model: 'opencode/kimi-k2.5', input: 'Read a.txt', stream: true, tools: [{ type: 'function', name: 'read', parameters: readTool.function.parameters }] });
             expect(res.statusCode).toBe(200);
-            expect(res.text).toContain('response.failed');
-            expect(res.text).not.toContain('response.completed');
-            expect(res.text).not.toContain('"name":"read"');
-            const events = readSseData(res.text);
-            const created = events.find((event) => event.type === 'response.created');
-            const failed = events.find((event) => event.type === 'response.failed');
+            const frames = readSseFrames(res.text);
+            expect(frames).toHaveLength(3);
+            expect(frames[0].type).toBe('response.created');
+            expect(frames[1].type).toBe('response.failed');
+            expect(frames[2]).toBe('[DONE]');
+            const created = frames[0];
+            const failed = frames[1];
             expect(failed.response.id).toBe(created.response.id);
+            expect(failed.response.created).toBe(created.response.created);
+            expect(failed.response.created_at).toBe(created.response.created_at);
             expect(failed.response.model).toBe(created.response.model);
-            expect(failed.sequence_number).toBeGreaterThan(created.sequence_number);
+            expect(created.response.output).toEqual([]);
+            expect(failed.response.output).toEqual([]);
+            expect(failed.response.completed_at).toBeNull();
+            expect([created.sequence_number, failed.sequence_number]).toEqual([0, 1]);
+            expect(frames.some((frame) => frame && frame.type === 'response.output_item.added')).toBe(false);
+            expect(created.response.tools).toEqual([{ type: 'function', name: 'read', parameters: readTool.function.parameters }]);
             expect(sdkMocks.sessionDelete).toHaveBeenCalledWith({ path: { id: 'test-session-id' } });
         });
 
@@ -2904,12 +2919,19 @@ describe('Proxy Responses API previous_response_id', () => {
                     tools: [{ type: 'function', name: 'read', parameters: readTool.function.parameters }],
                     tool_choice: { type: 'function', name: 'read' }
                 });
-            const events = readSseData(res.text);
-            const created = events.find((event) => event.type === 'response.created');
-            const failed = events.find((event) => event.type === 'response.failed');
+            const frames = readSseFrames(res.text);
+            expect(frames).toHaveLength(3);
+            expect(frames[0].type).toBe('response.created');
+            expect(frames[1].type).toBe('response.failed');
+            expect(frames[2]).toBe('[DONE]');
+            const created = frames[0];
+            const failed = frames[1];
             expect(failed.response.id).toBe(created.response.id);
+            expect(failed.response.created).toBe(created.response.created);
+            expect(failed.response.created_at).toBe(created.response.created_at);
             expect(failed.response.model).toBe(created.response.model);
-            expect(failed.sequence_number).toBeGreaterThan(created.sequence_number);
+            expect(failed.response.completed_at).toBeNull();
+            expect([created.sequence_number, failed.sequence_number]).toEqual([0, 1]);
             expect(sdkMocks.sessionDelete).toHaveBeenCalledWith({ path: { id: 'test-session-id' } });
         });
 
@@ -3097,7 +3119,11 @@ describe('Proxy Responses API previous_response_id', () => {
             expect(sdkMocks.sessionCreate).toHaveBeenCalledTimes(1);
             expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
 
-            const completed = readSseData(res.text).find((event) => event.type === 'response.completed');
+            const frames = readSseFrames(res.text);
+            expect(frames[0].type).toBe('response.created');
+            expect(frames[frames.length - 2].type).toBe('response.completed');
+            expect(frames[frames.length - 1]).toBe('[DONE]');
+            const completed = frames[frames.length - 2];
             const followUp = await request(app)
                 .post('/v1/responses')
                 .set('Authorization', 'Bearer test-key')
@@ -3199,6 +3225,793 @@ describe('Proxy Responses API previous_response_id', () => {
             expect(res.text).not.toContain(successMarker);
             expect(visibleTextFor(path, res.text)).toEqual([]);
         });
+        const readSseFrames = (text) => {
+            const frames = [];
+            for (const block of text.split(/\r?\n\r?\n/)) {
+                const dataLines = block.split(/\r?\n/).filter((line) => line.startsWith('data:'));
+                if (dataLines.length === 0) continue;
+                const data = dataLines.map((line) => line.slice(5).replace(/^ /, '')).join('\n');
+                frames.push(data === '[DONE]' ? '[DONE]' : JSON.parse(data));
+            }
+            return frames;
+        };
+
+        const optionalReasoningSummaryEvents = [
+            'response.reasoning_summary_part.added',
+            'response.reasoning_summary_part.done',
+            'response.reasoning_summary_text.part.added'
+        ];
+
+        const assertPhase2SseContract = (text, expectation = {}) => {
+            const frames = readSseFrames(text);
+            const doneIndexes = frames.reduce((indexes, frame, index) => {
+                if (frame === '[DONE]') indexes.push(index);
+                return indexes;
+            }, []);
+            expect(doneIndexes).toEqual([frames.length - 1]);
+            const events = frames.slice(0, -1);
+            expect(events.length).toBeGreaterThan(0);
+            expect(events[0].type).toBe('response.created');
+            const created = events[0];
+            expect(created.response.status).toBe('in_progress');
+            expect(created.response.output).toEqual([]);
+            expect(typeof created.response.id).toBe('string');
+            expect(typeof created.response.created).toBe('number');
+            expect(created.response.created_at).toBe(created.response.created);
+            expect(typeof created.response.model).toBe('string');
+            expect(Array.isArray(created.response.tools)).toBe(true);
+            expect(typeof created.response.parallel_tool_calls).toBe('boolean');
+            if (expectation.tools !== undefined) {
+                expect(created.response.tools).toEqual(expectation.tools);
+                expect(created.response.tools).not.toContainEqual(expect.objectContaining({ name: expect.stringMatching(/^external__/) }));
+            }
+            if (expectation.parallelToolCalls !== undefined) {
+                expect(created.response.parallel_tool_calls).toBe(expectation.parallelToolCalls);
+            }
+            const terminalTypes = events
+                .filter((event) => event.type === 'response.completed' || event.type === 'response.failed')
+                .map((event) => event.type);
+            expect(terminalTypes).toHaveLength(1);
+            const terminal = events[events.length - 1];
+            expect(terminal.type).toBe(terminalTypes[0]);
+            expect(terminal.response.id).toBe(created.response.id);
+            expect(terminal.response.created).toBe(created.response.created);
+            expect(terminal.response.created_at).toBe(created.response.created_at);
+            expect(terminal.response.model).toBe(created.response.model);
+            expect(terminal.response.tools).toEqual(created.response.tools);
+            expect(terminal.response.parallel_tool_calls).toBe(created.response.parallel_tool_calls);
+            const required = events.filter((event) => !optionalReasoningSummaryEvents.includes(event.type));
+            const sequenceNumbers = required.map((event) => event.sequence_number);
+            expect(sequenceNumbers).toEqual(required.map((_, index) => index));
+            expect(new Set(sequenceNumbers).size).toBe(sequenceNumbers.length);
+            const added = events.filter((event) => event.type === 'response.output_item.added');
+            const done = events.filter((event) => event.type === 'response.output_item.done');
+            expect(added.length).toBeGreaterThan(0);
+            const addedKeys = added.map((event) => `${event.output_index}:${event.item.type}:${event.item.id}`);
+            expect(new Set(addedKeys).size).toBe(addedKeys.length);
+            expect(added.map((event) => event.output_index)).toEqual(added.map((_, index) => index));
+            expect(done.map((event) => event.output_index)).toEqual(added.map((event) => event.output_index));
+            expect(done.map((event) => event.item.id)).toEqual(added.map((event) => event.item.id));
+            expect(done.map((event) => event.item.type)).toEqual(added.map((event) => event.item.type));
+            expect(terminal.response.output).toEqual(done.map((event) => event.item));
+            const addedPositions = added.map((event) => events.indexOf(event));
+            const donePositions = done.map((event) => events.indexOf(event));
+            expect(donePositions.every((position, index) => position > addedPositions[index])).toBe(true);
+            const deltaTypes = [
+                'response.output_text.delta',
+                'response.reasoning_summary_text.delta',
+                'response.function_call_arguments.delta'
+            ];
+            const deltaKeys = events
+                .filter((event) => deltaTypes.includes(event.type))
+                .map((event) => `${event.output_index}:${event.item_id}:${event.type}`);
+            expect(new Set(deltaKeys).size).toBe(deltaKeys.length);
+            return { frames, events, created, terminal, added, done };
+        };
+
+        const setToolStream = (parts) => {
+            sdkMocks.eventSubscribe.mockImplementationOnce(eventStream(parts));
+        };
+
+        test('Phase 2A tool-only output starts at zero and keeps function arguments in delta and done', async () => {
+            setToolStream([
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: '<function_calls>{"id":"call_phase2","name":"read","arguments":{"path":"a.txt"}}</function_calls>' } },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } },
+            ]);
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', input: 'Read a.txt', stream: true, tools: [readTool] });
+            expect(res.statusCode).toBe(200);
+            const contract = assertPhase2SseContract(res.text);
+            expect(contract.events.map((event) => event.type)).toEqual([
+                'response.created',
+                'response.output_item.added',
+                'response.function_call_arguments.delta',
+                'response.function_call_arguments.done',
+                'response.output_item.done',
+                'response.completed'
+            ]);
+            expect(contract.added.map((event) => event.item)).toEqual([
+                { id: 'call_phase2', type: 'function_call', status: 'in_progress', call_id: 'call_phase2', name: 'read', arguments: '' }
+            ]);
+            expect(contract.events.filter((event) => event.type === 'response.function_call_arguments.delta').map((event) => [event.item_id, event.output_index, event.delta])).toEqual([
+                ['call_phase2', 0, '{"path":"a.txt"}']
+            ]);
+            expect(contract.events.filter((event) => event.type === 'response.function_call_arguments.done').map((event) => [event.item_id, event.output_index, event.arguments])).toEqual([
+                ['call_phase2', 0, '{"path":"a.txt"}']
+            ]);
+            expect(contract.done.map((event) => event.item)).toEqual([
+                { id: 'call_phase2', type: 'function_call', status: 'completed', call_id: 'call_phase2', name: 'read', arguments: '{"path":"a.txt"}' }
+            ]);
+            expect(contract.terminal.response.output).toEqual(contract.done.map((event) => event.item));
+        });
+
+        test('Phase 2A reasoning-first output indexes follow added order', async () => {
+            setToolStream([
+                { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: 'test-session-id' }, delta: 'Think first.' } },
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: '<function_calls>{"id":"call_reasoning_phase2","name":"read","arguments":{"path":"b.txt"}}</function_calls>' } },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } },
+            ]);
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', input: 'Read b.txt', stream: true, tools: [readTool] });
+            expect(res.statusCode).toBe(200);
+            const contract = assertPhase2SseContract(res.text);
+            expect(contract.events.map((event) => event.type)).toEqual([
+                'response.created',
+                'response.output_item.added',
+                'response.reasoning_summary_text.delta',
+                'response.output_item.added',
+                'response.function_call_arguments.delta',
+                'response.reasoning_summary_text.done',
+                'response.output_item.done',
+                'response.function_call_arguments.done',
+                'response.output_item.done',
+                'response.completed'
+            ]);
+            expect(contract.added.map((event) => [event.output_index, event.item])).toEqual([
+                [0, { id: 'reasoning-0', type: 'reasoning', status: 'in_progress', summary: [{ type: 'summary_text', text: '' }] }],
+                [1, { id: 'call_reasoning_phase2', type: 'function_call', status: 'in_progress', call_id: 'call_reasoning_phase2', name: 'read', arguments: '' }]
+            ]);
+            expect(contract.events.filter((event) => event.type === 'response.reasoning_summary_text.delta').map((event) => [event.item_id, event.output_index, event.delta])).toEqual([
+                ['reasoning-0', 0, 'Think first.']
+            ]);
+            expect(contract.done.map((event) => event.item)).toEqual([
+                { id: 'reasoning-0', type: 'reasoning', status: 'completed', summary: [{ type: 'summary_text', text: 'Think first.' }] },
+                { id: 'call_reasoning_phase2', type: 'function_call', status: 'completed', call_id: 'call_reasoning_phase2', name: 'read', arguments: '{"path":"b.txt"}' }
+            ]);
+            expect(contract.terminal.response.output).toEqual(contract.done.map((event) => event.item));
+        });
+
+        test('Phase 2A text-plus-tool output indexes follow added order', async () => {
+            setToolStream([
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: 'Visible text.' } },
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: '<function_calls>{"id":"call_text_phase2","name":"read","arguments":{"path":"b.txt"}}</function_calls>' } },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } },
+            ]);
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', input: 'Read b.txt', stream: true, tools: [readTool] });
+            expect(res.statusCode).toBe(200);
+            const contract = assertPhase2SseContract(res.text);
+            expect(contract.events.map((event) => event.type)).toEqual([
+                'response.created',
+                'response.output_item.added',
+                'response.content_part.added',
+                'response.output_text.delta',
+                'response.output_item.added',
+                'response.function_call_arguments.delta',
+                'response.output_text.done',
+                'response.content_part.done',
+                'response.output_item.done',
+                'response.function_call_arguments.done',
+                'response.output_item.done',
+                'response.completed'
+            ]);
+            const messageId = contract.added[0].item.id;
+            expect(contract.added.map((event) => event.item)).toEqual([
+                { id: messageId, type: 'message', status: 'in_progress', role: 'assistant', content: [] },
+                { id: 'call_text_phase2', type: 'function_call', status: 'in_progress', call_id: 'call_text_phase2', name: 'read', arguments: '' }
+            ]);
+            expect(contract.events.filter((event) => event.type === 'response.output_text.delta').map((event) => [event.item_id, event.output_index, event.delta])).toEqual([
+                [messageId, 0, 'Visible text.']
+            ]);
+            expect(contract.done.map((event) => event.item)).toEqual([
+                { id: messageId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Visible text.', annotations: [] }] },
+                { id: 'call_text_phase2', type: 'function_call', status: 'completed', call_id: 'call_text_phase2', name: 'read', arguments: '{"path":"b.txt"}' }
+            ]);
+            expect(contract.terminal.response.output).toEqual(contract.done.map((event) => event.item));
+        });
+
+        test('Phase 2A search-plus-tool output uses contiguous search and function indexes', async () => {
+            sdkMocks.sessionMessages.mockResolvedValue([{
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'tool', tool: 'websearch', state: { status: 'completed', input: { query: 'phase2 query' }, output: 'source https://example.com/phase2' } }],
+            }]);
+            setToolStream([
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: '<function_calls>{"id":"call_search_phase2","name":"read","arguments":{"path":"c.txt"}}</function_calls>' } },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } },
+            ]);
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', input: 'Search and read', stream: true, tools: [{ type: 'web_search' }, readTool] });
+            expect(res.statusCode).toBe(200);
+            const contract = assertPhase2SseContract(res.text);
+            expect(contract.events.map((event) => event.type)).toEqual([
+                'response.created',
+                'response.output_item.added',
+                'response.web_search_call.searching',
+                'response.web_search_call.completed',
+                'response.output_item.added',
+                'response.function_call_arguments.delta',
+                'response.output_item.done',
+                'response.function_call_arguments.done',
+                'response.output_item.done',
+                'response.completed'
+            ]);
+            expect(contract.added.map((event) => event.item)).toEqual([
+                { id: 'ws_1', type: 'web_search_call', status: 'in_progress' },
+                { id: 'call_search_phase2', type: 'function_call', status: 'in_progress', call_id: 'call_search_phase2', name: 'read', arguments: '' }
+            ]);
+            expect(contract.done.map((event) => event.item)).toEqual([
+                { id: 'ws_1', type: 'web_search_call', status: 'completed', action: { type: 'search', query: 'phase2 query' } },
+                { id: 'call_search_phase2', type: 'function_call', status: 'completed', call_id: 'call_search_phase2', name: 'read', arguments: '{"path":"c.txt"}' }
+            ]);
+            expect(contract.terminal.response.output).toEqual(contract.done.map((event) => event.item));
+        });
+
+        test('Phase 2A search-plus-text output announces the search call first in stream and non-stream', async () => {
+            const answer = 'Search result at https://example.com/phase2';
+            const expectedAnnotations = [{
+                type: 'url_citation',
+                start_index: 17,
+                end_index: 43,
+                url: 'https://example.com/phase2',
+                title: 'example.com'
+            }];
+            const expectedSearchItem = {
+                id: 'ws_1',
+                type: 'web_search_call',
+                status: 'completed',
+                action: { type: 'search', query: 'phase2 query' }
+            };
+            const withFixedMessageId = (items) => items.map((item) => (
+                item.type === 'message' ? { ...item, id: '<message-id>' } : item
+            ));
+            const searchAnswerMessages = [{
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    { type: 'text', text: answer },
+                    { type: 'tool', tool: 'websearch', state: { status: 'completed', input: { query: 'phase2 query' }, output: 'source https://example.com/phase2' } },
+                ],
+            }];
+
+            sdkMocks.sessionMessages.mockResolvedValue(searchAnswerMessages);
+            setToolStream([
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: answer } },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } },
+            ]);
+            const streamed = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', input: 'Search for phase 2', stream: true, tools: [{ type: 'web_search' }, readTool] });
+            expect(streamed.statusCode).toBe(200);
+            const contract = assertPhase2SseContract(streamed.text, { tools: [{ type: 'web_search' }, readTool], parallelToolCalls: true });
+            expect(contract.events.map((event) => event.type)).toEqual([
+                'response.created',
+                'response.output_item.added',
+                'response.web_search_call.searching',
+                'response.web_search_call.completed',
+                'response.output_item.added',
+                'response.content_part.added',
+                'response.output_text.delta',
+                'response.output_item.done',
+                'response.output_text.done',
+                'response.content_part.done',
+                'response.output_item.done',
+                'response.completed'
+            ]);
+            expect(contract.added.map((event) => [event.output_index, event.item.type, event.item.id])).toEqual([
+                [0, 'web_search_call', 'ws_1'],
+                [1, 'message', contract.added[1].item.id]
+            ]);
+            expect(contract.added[1].item.id).toMatch(/^msg_/);
+            expect(contract.done.map((event) => [event.output_index, event.item.type, event.item.id])).toEqual([
+                [0, 'web_search_call', 'ws_1'],
+                [1, 'message', contract.added[1].item.id]
+            ]);
+            expect(contract.events.filter((event) => event.type === 'response.output_text.delta').map((event) => [event.output_index, event.delta])).toEqual([[1, answer]]);
+            expect(contract.events.filter((event) => event.type === 'response.output_text.done').map((event) => [event.output_index, event.text])).toEqual([[1, answer]]);
+            expect(contract.terminal.type).toBe('response.completed');
+            expect(withFixedMessageId(contract.terminal.response.output)).toEqual([
+                expectedSearchItem,
+                {
+                    id: '<message-id>',
+                    type: 'message',
+                    role: 'assistant',
+                    status: 'completed',
+                    content: [{ type: 'output_text', text: answer, annotations: expectedAnnotations }]
+                }
+            ]);
+
+            sdkMocks.sessionMessages.mockResolvedValue(searchAnswerMessages);
+            sdkMocks.sessionPrompt.mockResolvedValueOnce({ data: { parts: [] } });
+            const nonStreamed = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', input: 'Search for phase 2', tools: [{ type: 'web_search' }, readTool] });
+            expect(nonStreamed.statusCode).toBe(200);
+            expect(nonStreamed.body.status).toBe('completed');
+            expect(nonStreamed.body.output.map((item) => item.type)).toEqual(['web_search_call', 'message']);
+            expect(nonStreamed.body.output[1].id).toMatch(/^msg_/);
+            expect(withFixedMessageId(nonStreamed.body.output)).toEqual(withFixedMessageId(contract.terminal.response.output));
+        });
+
+        test('Phase 2A hosted search without external tools defers reasoning and text behind the search call', async () => {
+            const reasoningText = 'Look up the docs first.';
+            const answer = 'Grounded at https://example.com/phase2';
+            const expectedAnnotations = [{
+                type: 'url_citation',
+                start_index: 12,
+                end_index: 38,
+                url: 'https://example.com/phase2',
+                title: 'example.com'
+            }];
+            const expectedSearchItem = {
+                id: 'ws_1',
+                type: 'web_search_call',
+                status: 'completed',
+                action: { type: 'search', query: 'phase2 query' }
+            };
+            const withFixedMessageId = (items) => items.map((item) => (
+                item.type === 'message' ? { ...item, id: '<message-id>' } : item
+            ));
+            const searchReasoningAnswerMessages = [{
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    { type: 'reasoning', text: reasoningText },
+                    { type: 'text', text: answer },
+                    { type: 'tool', tool: 'websearch', state: { status: 'completed', input: { query: 'phase2 query' }, output: 'source https://example.com/phase2' } },
+                ],
+            }];
+
+            sdkMocks.sessionMessages.mockResolvedValue(searchReasoningAnswerMessages);
+            setToolStream([
+                { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: 'test-session-id' }, delta: reasoningText } },
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: answer } },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } },
+            ]);
+            const streamed = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', input: 'Search for phase 2', stream: true, tools: [{ type: 'web_search' }] });
+            expect(streamed.statusCode).toBe(200);
+            const contract = assertPhase2SseContract(streamed.text, { tools: [{ type: 'web_search' }], parallelToolCalls: true });
+            expect(contract.events.map((event) => event.type)).toEqual([
+                'response.created',
+                'response.output_item.added',
+                'response.web_search_call.searching',
+                'response.web_search_call.completed',
+                'response.output_item.added',
+                'response.reasoning_summary_text.delta',
+                'response.output_item.added',
+                'response.content_part.added',
+                'response.output_text.delta',
+                'response.output_item.done',
+                'response.reasoning_summary_text.done',
+                'response.output_item.done',
+                'response.output_text.done',
+                'response.content_part.done',
+                'response.output_item.done',
+                'response.completed'
+            ]);
+            const messageId = contract.added[2].item.id;
+            expect(contract.added.map((event) => [event.output_index, event.item.type, event.item.id])).toEqual([
+                [0, 'web_search_call', 'ws_1'],
+                [1, 'reasoning', 'reasoning-0'],
+                [2, 'message', messageId]
+            ]);
+            expect(messageId).toMatch(/^msg_/);
+            expect(contract.done.map((event) => [event.output_index, event.item.type, event.item.id])).toEqual([
+                [0, 'web_search_call', 'ws_1'],
+                [1, 'reasoning', 'reasoning-0'],
+                [2, 'message', messageId]
+            ]);
+            expect(contract.events.filter((event) => event.type === 'response.reasoning_summary_text.delta').map((event) => [event.output_index, event.item_id, event.delta])).toEqual([
+                [1, 'reasoning-0', reasoningText]
+            ]);
+            expect(contract.events.filter((event) => event.type === 'response.output_text.delta').map((event) => [event.output_index, event.item_id, event.delta])).toEqual([
+                [2, messageId, answer]
+            ]);
+            const searchAnnouncedFirst = contract.events
+                .filter((event) => event.type === 'response.output_item.added')
+                .map((event) => event.item.type);
+            expect(searchAnnouncedFirst.indexOf('web_search_call')).toBe(0);
+            expect(contract.events.findIndex((event) => event.type === 'response.output_text.delta')).toBeGreaterThan(
+                contract.events.findIndex((event) => event.type === 'response.web_search_call.completed')
+            );
+            expect(contract.terminal.type).toBe('response.completed');
+            expect(contract.terminal.response.output).toEqual(contract.done.map((event) => event.item));
+            expect(withFixedMessageId(contract.terminal.response.output)).toEqual([
+                expectedSearchItem,
+                { id: 'reasoning-0', type: 'reasoning', status: 'completed', summary: [{ type: 'summary_text', text: reasoningText }] },
+                {
+                    id: '<message-id>',
+                    type: 'message',
+                    role: 'assistant',
+                    status: 'completed',
+                    content: [{ type: 'output_text', text: answer, annotations: expectedAnnotations }]
+                }
+            ]);
+
+            sdkMocks.sessionMessages.mockResolvedValue(searchReasoningAnswerMessages);
+            sdkMocks.sessionPrompt.mockResolvedValueOnce({ data: { parts: [] } });
+            const nonStreamed = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', input: 'Search for phase 2', tools: [{ type: 'web_search' }] });
+            expect(nonStreamed.statusCode).toBe(200);
+            expect(nonStreamed.body.status).toBe('completed');
+            expect(nonStreamed.body.output.map((item) => item.type)).toEqual(['web_search_call', 'message']);
+            expect(nonStreamed.body.output[0]).toEqual(expectedSearchItem);
+            expect(nonStreamed.body.output[1].id).toMatch(/^msg_/);
+            expect(withFixedMessageId(nonStreamed.body.output)).toEqual([
+                expectedSearchItem,
+                {
+                    id: '<message-id>',
+                    type: 'message',
+                    role: 'assistant',
+                    status: 'completed',
+                    content: [{ type: 'output_text', text: answer, annotations: expectedAnnotations }]
+                }
+            ]);
+            const withoutReasoning = contract.terminal.response.output.filter((item) => item.type !== 'reasoning');
+            expect(withFixedMessageId(withoutReasoning)).toEqual(withFixedMessageId(nonStreamed.body.output));
+        });
+
+        test('Phase 2A mid-stream failure finalizes the announced item and reports it as partial failed output', async () => {
+            setToolStream([
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: 'Partial answer' } },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', error: { name: 'MessageAbortedError', data: { message: 'upstream aborted mid-turn' } } } } },
+            ]);
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', input: 'Hello', stream: true });
+            expect(res.statusCode).toBe(200);
+            const contract = assertPhase2SseContract(res.text, { tools: [], parallelToolCalls: true });
+            expect(contract.events.map((event) => event.type)).toEqual([
+                'response.created',
+                'response.output_item.added',
+                'response.content_part.added',
+                'response.output_text.delta',
+                'response.output_text.done',
+                'response.content_part.done',
+                'response.output_item.done',
+                'response.failed'
+            ]);
+            const messageId = contract.added[0].item.id;
+            expect(messageId).toMatch(/^msg_/);
+            expect(contract.added.map((event) => [event.output_index, event.item.type, event.item.id])).toEqual([
+                [0, 'message', messageId]
+            ]);
+            expect(contract.events.filter((event) => event.type === 'response.output_text.done').map((event) => [event.output_index, event.content_index, event.item_id, event.text])).toEqual([
+                [0, 0, messageId, 'Partial answer']
+            ]);
+            expect(contract.events.filter((event) => event.type === 'response.content_part.done').map((event) => [event.output_index, event.content_index, event.part])).toEqual([
+                [0, 0, { type: 'output_text', text: 'Partial answer', annotations: [] }]
+            ]);
+            const partialMessageItem = {
+                id: messageId,
+                type: 'message',
+                role: 'assistant',
+                status: 'completed',
+                content: [{ type: 'output_text', text: 'Partial answer', annotations: [] }]
+            };
+            expect(contract.done.map((event) => [event.output_index, event.item])).toEqual([
+                [0, partialMessageItem]
+            ]);
+            expect(contract.terminal.type).toBe('response.failed');
+            expect(contract.terminal.response.status).toBe('failed');
+            expect(contract.terminal.response.completed_at).toBeNull();
+            expect(contract.terminal.response.incomplete_details).toBeNull();
+            expect(contract.terminal.response.usage).toBeNull();
+            expect(contract.terminal.response.output).toEqual([partialMessageItem]);
+            expect(contract.terminal.response.error).toEqual({
+                message: 'upstream aborted mid-turn',
+                type: 'internal_error',
+                code: 'MessageAbortedError'
+            });
+        });
+
+        test.each([
+            [
+                'missing input',
+                { model: 'opencode/kimi-k2.5', stream: true, tools: [readTool] },
+                'input is required'
+            ],
+            [
+                'empty input array',
+                { model: 'opencode/kimi-k2.5', input: [], stream: true, tools: [readTool] },
+                'input is required'
+            ],
+            [
+                'unknown tool_choice',
+                {
+                    model: 'opencode/kimi-k2.5',
+                    input: 'Use a missing tool',
+                    stream: true,
+                    tools: [readTool],
+                    tool_choice: { type: 'function', name: 'missing' }
+                },
+                'tool_choice references an unknown tool: missing'
+            ],
+            [
+                'unknown previous_response_id',
+                {
+                    model: 'opencode/kimi-k2.5',
+                    input: 'Hello',
+                    stream: true,
+                    tools: [readTool],
+                    previous_response_id: 'resp_phase2_missing'
+                },
+                'Invalid or expired previous_response_id'
+            ]
+        ])('Phase 2A preflight %s stays a 200 SSE created then failed then done lifecycle', async (_label, payload, errorMessage) => {
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send(payload);
+            expect(res.statusCode).toBe(200);
+            expect(res.headers['content-type']).toBe('text/event-stream');
+            const frames = readSseFrames(res.text);
+            expect(frames).toHaveLength(3);
+            expect(frames[0].type).toBe('response.created');
+            expect(frames[1].type).toBe('response.failed');
+            expect(frames[2]).toBe('[DONE]');
+            const created = frames[0];
+            const failed = frames[1];
+            expect(created.response.status).toBe('in_progress');
+            expect(created.response.output).toEqual([]);
+            expect(created.response.model).toBe('opencode/kimi-k2.5');
+            expect(failed.response.id).toBe(created.response.id);
+            expect(failed.response.created).toBe(created.response.created);
+            expect(failed.response.created_at).toBe(created.response.created_at);
+            expect(failed.response.model).toBe(created.response.model);
+            expect(failed.response.completed_at).toBeNull();
+            expect(failed.response.status).toBe('failed');
+            expect(failed.response.output).toEqual([]);
+            expect(failed.response.usage).toBeNull();
+            expect(failed.response.incomplete_details).toBeNull();
+            expect(failed.response.error).toEqual({
+                message: errorMessage,
+                type: 'invalid_request_error',
+                code: 'invalid_request_error'
+            });
+            expect([created.sequence_number, failed.sequence_number]).toEqual([0, 1]);
+            expect(created.response.tools).toEqual([readTool]);
+            expect(failed.response.tools).toEqual([readTool]);
+            expect(created.response.parallel_tool_calls).toBe(true);
+            expect(failed.response.parallel_tool_calls).toBe(true);
+            expect(frames.some((frame) => frame !== '[DONE]' && frame.type === 'response.output_item.added')).toBe(false);
+            expect(res.text).not.toContain('response.completed');
+            expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
+            expect(sdkMocks.eventSubscribe).not.toHaveBeenCalled();
+        });
+
+        test.each([
+            ['provider qualified', { model: 'opencode/kimi-k2.5' }, 'opencode/kimi-k2.5'],
+            ['bare alias', { model: 'kimi-k2.5' }, 'opencode/kimi-k2.5'],
+            ['gpt4 alias', { model: 'gpt4' }, 'opencode/gpt-4'],
+            ['no model', {}, 'opencode/kimi-k2.5']
+        ])('Phase 2A %s request announces the resolved model in created and completed', async (_label, modelField, resolved) => {
+            setToolStream([
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: 'Plain answer.' } },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
+            ]);
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ ...modelField, input: 'Hello', stream: true });
+            expect(res.statusCode).toBe(200);
+            const contract = assertPhase2SseContract(res.text, { tools: [], parallelToolCalls: true });
+            expect(contract.created.response.model).toBe(resolved);
+            expect(contract.terminal.response.model).toBe(resolved);
+            expect(contract.terminal.type).toBe('response.completed');
+            expect(contract.terminal.response.output.map((item) => item.content[0].text)).toEqual(['Plain answer.']);
+        });
+
+        test('Phase 2A pre-resolve failure keeps the request model in created and failed', async () => {
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({
+                    model: 'kimi-k2.5',
+                    input: 'Use a missing tool',
+                    stream: true,
+                    tools: [readTool],
+                    tool_choice: { type: 'function', name: 'missing' }
+                });
+            expect(res.statusCode).toBe(200);
+            const frames = readSseFrames(res.text);
+            expect(frames.map((frame) => (frame === '[DONE]' ? frame : frame.type))).toEqual([
+                'response.created',
+                'response.failed',
+                '[DONE]'
+            ]);
+            expect(frames[0].response.model).toBe('kimi-k2.5');
+            expect(frames[1].response.model).toBe('kimi-k2.5');
+        });
+
+        test('Phase 2A pre-resolve failure without a model announces unknown', async () => {
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({
+                    input: 'Use a missing tool',
+                    stream: true,
+                    tools: [readTool],
+                    tool_choice: { type: 'function', name: 'missing' }
+                });
+            expect(res.statusCode).toBe(200);
+            const frames = readSseFrames(res.text);
+            expect(frames.map((frame) => (frame === '[DONE]' ? frame : frame.type))).toEqual([
+                'response.created',
+                'response.failed',
+                '[DONE]'
+            ]);
+            expect(frames[0].response.model).toBe('unknown');
+            expect(frames[1].response.model).toBe('unknown');
+        });
+
+        test('Phase 2A post-resolve failure keeps the resolved model in created and failed', async () => {
+            sdkMocks.sessionCreate.mockRejectedValueOnce(new Error('backend refused the session'));
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'gpt4', input: 'Hello', stream: true });
+            expect(res.statusCode).toBe(200);
+            const frames = readSseFrames(res.text);
+            expect(frames.map((frame) => (frame === '[DONE]' ? frame : frame.type))).toEqual([
+                'response.created',
+                'response.failed',
+                '[DONE]'
+            ]);
+            expect(frames[0].response.model).toBe('opencode/gpt-4');
+            expect(frames[1].response.model).toBe('opencode/gpt-4');
+        });
+
+        test('Phase 2A stream echoes request tools and parallel setting without internal metadata', async () => {
+            const requestedTools = [{ type: 'web_search' }, readTool];
+            setToolStream([
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: '<function_calls>{"id":"call_echo","name":"read","arguments":{"path":"a.txt"}}</function_calls>' } },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
+            ]);
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({
+                    model: 'opencode/kimi-k2.5',
+                    input: 'Read a.txt',
+                    stream: true,
+                    tools: requestedTools,
+                    parallel_tool_calls: false,
+                    opencode: { internal_allowed_tools: ['bash'] }
+                });
+            expect(res.statusCode).toBe(200);
+            const contract = assertPhase2SseContract(res.text, { tools: requestedTools, parallelToolCalls: false });
+            expect(contract.terminal.response.tools).toEqual(requestedTools);
+            expect(res.text).not.toContain('internal_allowed_tools');
+            expect(res.text).not.toContain('external__');
+            expect(res.text).not.toContain('"websearch"');
+        });
+
+        test('Phase 2A stream defaults parallel tool calls to true when the request omits it', async () => {
+            setToolStream([
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: '<function_calls>{"id":"call_parallel_default","name":"read","arguments":{"path":"a.txt"}}</function_calls>' } },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
+            ]);
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', input: 'Read a.txt', stream: true, tools: [readTool] });
+            expect(res.statusCode).toBe(200);
+            const contract = assertPhase2SseContract(res.text, { tools: [readTool], parallelToolCalls: true });
+            expect(contract.terminal.response.parallel_tool_calls).toBe(true);
+        });
+
+        test('Phase 2A non-stream response echoes request tools and parallel setting', async () => {
+            sdkMocks.sessionPrompt.mockResolvedValueOnce({
+                data: {
+                    parts: [{ type: 'text', text: '<function_calls>{"id":"call_ns_echo","name":"read","arguments":{"path":"a.txt"}}</function_calls>' }]
+                }
+            });
+            const requestedTools = [{ type: 'web_search' }, readTool];
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({
+                    model: 'opencode/kimi-k2.5',
+                    input: 'Read a.txt',
+                    tools: requestedTools,
+                    parallel_tool_calls: false,
+                    opencode: { internal_allowed_tools: ['bash'] }
+                });
+            expect(res.statusCode).toBe(200);
+            expect(res.body.object).toBe('response');
+            expect(res.body.model).toBe('opencode/kimi-k2.5');
+            expect(res.body.tools).toEqual(requestedTools);
+            expect(res.body.parallel_tool_calls).toBe(false);
+            expect(res.body.output).toEqual([
+                { id: 'call_ns_echo', type: 'function_call', status: 'completed', call_id: 'call_ns_echo', name: 'read', arguments: '{"path":"a.txt"}' }
+            ]);
+            expect(res.text).not.toContain('internal_allowed_tools');
+            expect(res.text).not.toContain('external__');
+        });
+
+        test('Phase 2A non-stream response reports no tools and true parallel calls by default', async () => {
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', input: 'Hello' });
+            expect(res.statusCode).toBe(200);
+            expect(res.body.tools).toEqual([]);
+            expect(res.body.parallel_tool_calls).toBe(true);
+        });
+
+        test('Phase 2A stream rejects conflicting arguments under one explicit function_call id', async () => {
+            setToolStream([
+                {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { type: 'text', sessionID: 'test-session-id' },
+                        delta: '<function_calls>[{"id":"call_conflict","name":"read","arguments":{"path":"a.txt"}},{"id":"call_conflict","name":"read","arguments":{"path":"b.txt"}}]</function_calls>'
+                    }
+                },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
+            ]);
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', input: 'Read a.txt', stream: true, tools: [readTool] });
+            expect(res.statusCode).toBe(200);
+            const frames = readSseFrames(res.text);
+            expect(frames.map((frame) => (frame === '[DONE]' ? frame : frame.type))).toEqual([
+                'response.created',
+                'response.failed',
+                '[DONE]'
+            ]);
+            const [created, failed] = frames;
+            expect(created.response.model).toBe('opencode/kimi-k2.5');
+            expect(failed.response.model).toBe('opencode/kimi-k2.5');
+            expect(failed.response.error.code).toBe('duplicate_external_tool_call_id');
+            expect(failed.response.error.message).toContain('duplicate external tool call id');
+            expect(failed.response.output).toEqual([]);
+            expect(frames.some((frame) => frame !== '[DONE]' && String(frame.type).startsWith('response.function_call'))).toBe(false);
+            expect(frames.some((frame) => frame !== '[DONE]' && frame.type === 'response.output_item.added')).toBe(false);
+        });
+
+        test('Phase 2A non-stream rejects conflicting arguments under one explicit function_call id', async () => {
+            sdkMocks.sessionPrompt.mockResolvedValueOnce({
+                data: {
+                    parts: [{ type: 'text', text: '<function_calls>[{"id":"call_conflict","name":"read","arguments":{"path":"a.txt"}},{"id":"call_conflict","name":"read","arguments":{"path":"b.txt"}}]</function_calls>' }]
+                }
+            });
+            const res = await request(app)
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', input: 'Read a.txt', tools: [readTool] });
+            expect(res.statusCode).toBe(500);
+            expect(res.body.code).toBe('duplicate_external_tool_call_id');
+            expect(res.body.message).toContain('duplicate external tool call id');
+            expect(res.body.output).toBeUndefined();
+            expect(res.text).not.toContain('"call_id":"call_conflict"');
+        });
+
     });
 
     test('chains follow-up turns onto the stored session without recreating it', async () => {
