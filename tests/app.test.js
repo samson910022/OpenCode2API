@@ -1,7 +1,7 @@
 import request from 'supertest';
 import { jest } from '@jest/globals';
 import { buildExternalToolRegistry } from '../src/tool-runtime/registry.js';
-import { normalizeExternalToolChoice, buildToolExposure } from '../src/tool-runtime/router.js';
+import { normalizeExternalToolChoice, buildToolExposure, preflightExternalToolChoice } from '../src/tool-runtime/router.js';
 import { evaluateToolPolicy } from '../src/tool-runtime/policy.js';
 import { validateToolCall, validateToolCalls } from '../src/tool-runtime/validator.js';
 
@@ -127,6 +127,77 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
 }));
 
 const { createApp } = await import('../src/proxy.js');
+
+describe('Phase 1A tool policy and exact tool choice', () => {
+    test('keeps side effect and risk metadata without inferring confirmation', () => {
+        const [tool] = buildExternalToolRegistry([{
+            type: 'function',
+            function: {
+                name: 'delete_ticket',
+                x_proxy_side_effect: 'delete',
+                x_proxy_risk_level: 'critical'
+            }
+        }]);
+
+        expect(tool.sideEffect).toBe('delete');
+        expect(tool.riskLevel).toBe('critical');
+        expect(tool.requiresConfirmation).toBe(false);
+        expect(evaluateToolPolicy(tool, {}, { config: {} })).toMatchObject({ status: 'allow' });
+    });
+
+    test('requires confirmation only from explicit metadata or direct config', () => {
+        const [metadataTool] = buildExternalToolRegistry([{
+            type: 'function',
+            function: { name: 'write_ticket', x_proxy_requires_confirmation: true }
+        }]);
+        const [configTool] = buildExternalToolRegistry([{
+            type: 'function',
+            function: { name: 'write_ticket' }
+        }]);
+
+        expect(evaluateToolPolicy(metadataTool, {}, { config: {} })).toMatchObject({ status: 'require_confirmation' });
+        expect(evaluateToolPolicy(configTool, {}, {
+            config: { EXTERNAL_TOOL_REQUIRE_CONFIRMATION_FOR: ['write_ticket'] }
+        })).toMatchObject({ status: 'require_confirmation' });
+    });
+
+    test('denylist wins and a nonempty allowlist restricts tools', () => {
+        const [tool] = buildExternalToolRegistry([{ type: 'function', name: 'delete_ticket' }]);
+        const denied = evaluateToolPolicy(tool, {}, {
+            config: {
+                EXTERNAL_TOOL_ALLOWLIST: ['delete_ticket'],
+                EXTERNAL_TOOL_DENYLIST: ['delete_ticket']
+            }
+        });
+        const notAllowed = evaluateToolPolicy(tool, {}, {
+            config: { EXTERNAL_TOOL_ALLOWLIST: ['read_ticket'] }
+        });
+
+        expect(denied).toMatchObject({ status: 'deny', code: 'tool_denied_by_policy' });
+        expect(notAllowed).toMatchObject({ status: 'deny', code: 'tool_not_allowed_by_policy' });
+    });
+
+    test('preflights exact names and rejects unknown, disabled, and malformed choices', () => {
+        const registry = buildExternalToolRegistry([
+            { type: 'function', name: 'read' },
+            { type: 'function', name: 'off', enabled: false }
+        ]);
+
+        expect(preflightExternalToolChoice({ type: 'function', name: 'read' }, registry)).toEqual({
+            ok: true,
+            normalized: { mode: 'required', requiredTool: 'external__read' }
+        });
+        expect(preflightExternalToolChoice({ type: 'function', name: 'external__read' }, registry)).toEqual({
+            ok: true,
+            normalized: { mode: 'required', requiredTool: 'external__read' }
+        });
+        expect(preflightExternalToolChoice({ type: 'function', name: 'READ' }, registry)).toMatchObject({ ok: false, code: 'unknown_tool' });
+        expect(preflightExternalToolChoice({ type: 'function', name: 'off' }, registry)).toMatchObject({ ok: false, code: 'tool_disabled' });
+        expect(preflightExternalToolChoice({ type: 'function' }, registry)).toMatchObject({ ok: false, code: 'invalid_tool_choice' });
+        expect(preflightExternalToolChoice('none', registry)).toEqual({ ok: true, normalized: { mode: 'none', requiredTool: null } });
+        expect(preflightExternalToolChoice('required', registry)).toEqual({ ok: true, normalized: { mode: 'required', requiredTool: null } });
+    });
+});
 
 describe('Proxy OpenAI API', () => {
     let app;
@@ -254,6 +325,60 @@ describe('Proxy OpenAI API', () => {
         expect(promptCall.body.system).toContain('External tools are virtualized by this proxy. They are not OpenCode tools.');
         expect(promptCall.body.system).toContain('external__weather_lookup');
         expect(promptCall.body.system).toContain('client_name');
+    });
+
+    test('POST /v1/chat/completions keeps external tool schema when OMIT_SYSTEM_PROMPT is true', async () => {
+        const omitApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            OMIT_SYSTEM_PROMPT: true,
+            DEBUG: false
+        }).app;
+
+        const res = await request(omitApp)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [
+                    { role: 'system', content: 'user-system-secret' },
+                    { role: 'user', content: 'Read a.txt' }
+                ],
+                tools: [{
+                    type: 'function',
+                    function: {
+                        name: 'read',
+                        parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+                    }
+                }]
+            });
+
+        expect(res.statusCode).toBe(200);
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.system).not.toContain('user-system-secret');
+        expect(promptCall.body.system).toContain('external__read');
+        expect(promptCall.body.system).toContain('"path"');
+    });
+
+    test('POST /v1/chat/completions rejects an unknown specific tool choice', async () => {
+        sdkMocks.sessionPrompt.mockClear();
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Use a tool' }],
+                tools: [{ type: 'function', function: { name: 'read' } }],
+                tool_choice: { type: 'function', name: 'missing' }
+            });
+
+        expect(res.statusCode).toBe(400);
+        expect(res.body.error.type).toBe('invalid_request_error');
+        expect(res.body.error.message).toContain('unknown tool');
+        expect(sdkMocks.sessionPrompt).not.toHaveBeenCalled();
     });
 
     test('POST /v1/chat/completions keeps external web_fetch isolated from internal tool semantics', async () => {
@@ -850,6 +975,34 @@ describe('Proxy OpenAI API', () => {
         expect(promptCall.body.parts[1].text).toContain('external__weather_lookup');
         expect(promptCall.body.parts[1].text).toContain('call_weather_1');
         expect(promptCall.body.parts[1].text).toContain('{\\"city\\":\\"Tokyo\\"}');
+    });
+
+    test('POST /v1/chat/completions preserves an explicit empty tool result', async () => {
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                tools: [{ type: 'function', function: { name: 'read' } }],
+                messages: [
+                    { role: 'user', content: 'Read a.txt' },
+                    {
+                        role: 'assistant',
+                        content: null,
+                        tool_calls: [{ id: 'call_read_1', type: 'function', function: { name: 'read', arguments: '{}' } }]
+                    },
+                    { role: 'tool', tool_call_id: 'call_read_1', name: 'read', content: '' }
+                ]
+            });
+
+        expect(res.statusCode).toBe(200);
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.parts).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                type: 'text',
+                text: 'TOOL_RESULT: {"tool_call_id":"call_read_1","name":"external__read","content":""}'
+            })
+        ]));
     });
 
     test('GET /health returns status ok', async () => {
@@ -1829,6 +1982,30 @@ describe('Proxy OpenAI API', () => {
             filesystem: false,
             bash: false
         });
+    });
+
+    test('POST /v1/responses preserves an explicit empty function_call_output', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                tools: [{ type: 'function', function: { name: 'read' } }],
+                input: [
+                    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Read a.txt' }] },
+                    { type: 'function_call', call_id: 'call_read_1', name: 'read', arguments: '{}' },
+                    { type: 'function_call_output', call_id: 'call_read_1', output: '' }
+                ]
+            });
+
+        expect(res.statusCode).toBe(200);
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.parts).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                type: 'text',
+                text: 'TOOL_RESULT: {"tool_call_id":"call_read_1","name":"external__read","content":""}'
+            })
+        ]));
     });
 
     test('POST /v1/responses continues after function_call_output input and returns assistant text', async () => {

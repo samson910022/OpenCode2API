@@ -88,6 +88,37 @@ describe('Anthropic /v1/messages converters', () => {
         expect(anthropicToolChoiceToChat({ type: 'tool', name: 'w' })).toEqual({ type: 'function', function: { name: 'w' } });
         expect(mapFinishToStopReason('stop', true)).toBe('tool_use');
     });
+
+    test('preserves enabled and proxy policy metadata in converted tools', () => {
+        const converted = anthropicToolsToChatTools([{
+            name: 'w',
+            input_schema: { type: 'object' },
+            enabled: false,
+            x_proxy_side_effect: 'write',
+            x_proxy_risk_level: 'high',
+            x_proxy_requires_confirmation: true
+        }]);
+
+        expect(converted[0].function).toMatchObject({
+            enabled: false,
+            x_proxy_side_effect: 'write',
+            x_proxy_risk_level: 'high',
+            x_proxy_requires_confirmation: true
+        });
+    });
+
+    test('does not convert a tool choice without a name to required', () => {
+        expect(anthropicToolChoiceToChat({ type: 'tool' })).toBeUndefined();
+        expect(validateMessagesRequest({
+            model: 'm',
+            max_tokens: 10,
+            messages: [{ role: 'user', content: 'hi' }],
+            tool_choice: { type: 'tool' }
+        })).toMatchObject({
+            statusCode: 400,
+            body: { type: 'error', error: { type: 'invalid_request_error' } }
+        });
+    });
 });
 
 describe('POST /v1/messages', () => {
@@ -97,6 +128,31 @@ describe('POST /v1/messages', () => {
         const config = { PORT: 10000, API_KEY: 'test-key', OPENCODE_SERVER_URL: 'http://127.0.0.1:10001', REQUEST_TIMEOUT_MS: 5000, DISABLE_TOOLS: true, DEBUG: false };
         app = createApp(config).app;
     });
+    test('preserves an explicit empty tool_result in non-stream input', async () => {
+        const res = await request(app)
+            .post('/v1/messages')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/muse-spark-1.3-contributor-free',
+                max_tokens: 100,
+                tools: [{ name: 'read', input_schema: { type: 'object' } }],
+                messages: [
+                    { role: 'user', content: 'Read a.txt' },
+                    { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_read_1', name: 'read', input: {} }] },
+                    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_read_1', content: '' }] }
+                ]
+            });
+
+        expect(res.statusCode).toBe(200);
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(promptCall.body.parts).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                type: 'text',
+                text: 'TOOL_RESULT: {"tool_call_id":"toolu_read_1","name":"external__read","content":""}'
+            })
+        ]));
+    });
+
     test('non-stream returns Anthropic message shape', async () => {
         const res = await request(app).post('/v1/messages')
             .set('Authorization', 'Bearer test-key')
@@ -114,6 +170,23 @@ describe('POST /v1/messages', () => {
         expect(res.statusCode).toBe(401);
         expect(res.body.type).toBe('error');
     });
+    test('missing tool_choice name returns an invalid request', async () => {
+        const res = await request(app)
+            .post('/v1/messages')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/muse-spark-1.3-contributor-free',
+                max_tokens: 10,
+                messages: [{ role: 'user', content: 'hi' }],
+                tool_choice: { type: 'tool' }
+            });
+
+        expect(res.statusCode).toBe(400);
+        expect(res.body.type).toBe('error');
+        expect(res.body.error.type).toBe('invalid_request_error');
+        expect(res.body.error.message).toContain('tool_choice.name');
+    });
+
     test('tiny max_tokens does not fake max_tokens stop_reason (usage is estimated)', async () => {
         const res = await request(app).post('/v1/messages')
             .set('Authorization', 'Bearer test-key')

@@ -338,6 +338,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
 
   const buildSystemPrompt = (
     systemMsg: unknown,
+    externalToolPrompt: unknown = '',
     reasoningEffort: unknown = null,
     toolMode: unknown = TOOL_MODE.DISABLED,
     internalAllowedTools: unknown = [],
@@ -345,6 +346,9 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     const parts: string[] = [];
     if (!OMIT_SYSTEM_PROMPT && typeof systemMsg === 'string' && systemMsg.trim()) {
       parts.push(systemMsg.trim());
+    }
+    if (typeof externalToolPrompt === 'string' && externalToolPrompt.trim()) {
+      parts.push(externalToolPrompt.trim());
     }
     if (reasoningEffort && reasoningEffort !== 'none') {
       parts.push(`[Reasoning Effort: ${String(reasoningEffort)}]`);

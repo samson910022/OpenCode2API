@@ -136,7 +136,7 @@ export function normalizeToolDefinition(tool: unknown): NormalizedToolDefinition
     name,
     description: definition['description'],
     parameters,
-    enabled: definition['enabled'],
+    enabled: definition['enabled'] ?? topLevel['enabled'],
     x_proxy_side_effect: definition['x_proxy_side_effect'] ?? topLevel['x_proxy_side_effect'],
     x_proxy_risk_level: definition['x_proxy_risk_level'] ?? topLevel['x_proxy_risk_level'],
     x_proxy_requires_confirmation:
@@ -169,16 +169,8 @@ function inferRiskLevel(definition: unknown = {}, sideEffect: ToolSideEffect = T
   return TOOL_RISK_LEVELS.LOW;
 }
 
-function inferRequiresConfirmation(
-  definition: unknown = {},
-  sideEffect: ToolSideEffect = TOOL_SIDE_EFFECTS.NONE,
-  riskLevel: ToolRiskLevel = TOOL_RISK_LEVELS.LOW
-): boolean {
-  const record = asRecord(definition);
-  if (typeof record['x_proxy_requires_confirmation'] === 'boolean') {
-    return record['x_proxy_requires_confirmation'] as boolean;
-  }
-  return sideEffect === TOOL_SIDE_EFFECTS.WRITE || riskLevel === TOOL_RISK_LEVELS.HIGH || riskLevel === TOOL_RISK_LEVELS.CRITICAL;
+function inferRequiresConfirmation(definition: unknown = {}): boolean {
+  return asRecord(definition)['x_proxy_requires_confirmation'] === true;
 }
 
 export function buildExternalToolRegistry(tools: unknown, options: unknown = {}): ExternalToolEntry[] {
@@ -212,7 +204,7 @@ export function buildExternalToolRegistry(tools: unknown, options: unknown = {})
       parameters: normalizeParameters(definition.parameters),
       sideEffect,
       riskLevel,
-      requiresConfirmation: inferRequiresConfirmation(definition, sideEffect, riskLevel),
+      requiresConfirmation: inferRequiresConfirmation(definition),
       enabled: definition.enabled !== false,
       sourceTool: tool
     });

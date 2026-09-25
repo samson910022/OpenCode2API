@@ -2,6 +2,7 @@
 import crypto from 'crypto';
 import { findExternalToolByName } from '../tool-runtime/registry.js';
 import { EXTERNAL_TOOL_PREFIX } from '../tool-runtime/contracts.js';
+import { preflightExternalToolChoice } from '../tool-runtime/router.js';
 import { computeRetryDelay } from '../retry/policy.js';
 import {
   stripFunctionCallMarkup,
@@ -201,7 +202,17 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       });
       const externalToolContext = requestToolContext.external;
       const externalToolRegistry: ExternalToolEntry[] = externalToolContext.registry;
-      const externalToolChoice = externalToolContext.toolChoice;
+      const toolChoicePreflight = preflightExternalToolChoice(tool_choice, externalToolRegistry);
+      if (!toolChoicePreflight.ok) {
+        res.status(400).json({
+          error: {
+            message: toolChoicePreflight.message,
+            type: 'invalid_request_error',
+          },
+        });
+        return;
+      }
+      const externalToolChoice = toolChoicePreflight.normalized;
       const assistantToolCalls = new Map<string, string>();
 
       const rememberAssistantToolCall = (toolCallId: unknown, toolName: unknown): void => {
@@ -214,7 +225,6 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         const text = normalizeToolResultContent(
           ir['content'] ?? ir['output'] ?? ir['result'] ?? ir['text'],
         );
-        if (!text) return null;
         const callIdRaw: unknown = ir['call_id'] ?? ir['tool_call_id'];
         const mappedTool =
           findExternalToolByName(externalToolRegistry, ir['name']) ||
@@ -396,14 +406,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       }
 
       const systemWithGuard = buildSystemPrompt(
-        [
-          instructions,
-          ...systemChunks,
-          externalToolContext.prompt,
-          hostedSearch.requested ? SEARCH_GROUNDING_INSTRUCTION : '',
-        ]
-          .filter(Boolean)
-          .join('\n\n'),
+        [instructions, ...systemChunks].filter(Boolean).join('\n\n'),
+        [externalToolContext.prompt, hostedSearch.requested ? SEARCH_GROUNDING_INSTRUCTION : ''].filter(Boolean).join('\n\n'),
         reasoningLevel,
         toolMode,
         internalToolContext.allowedToolNames,

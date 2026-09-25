@@ -118,7 +118,7 @@ export interface AppContext {
   getEffectiveInternalAllowedTools: () => string[];
   SERVER_INTERNAL_ALLOWED_TOOL_NAMES: string[];
   buildInternalAllowlistPrompt: (allowedToolNames?: unknown) => string;
-  buildSystemPrompt: (systemMsg: unknown, reasoningEffort?: unknown, toolMode?: unknown, internalAllowedTools?: unknown) => string | undefined;
+  buildSystemPrompt: (systemMsg: unknown, externalToolPrompt?: unknown, reasoningEffort?: unknown, toolMode?: unknown, internalAllowedTools?: unknown) => string | undefined;
   selectPromptToolOverrides: (overrides: unknown, providerID?: unknown, modelID?: unknown) => Record<string, boolean> | null;
   normalizeReasoningEffort: (value: unknown, fallback?: unknown) => string | null;
   stripFunctionCalls: (text: unknown, trim?: boolean) => string;

@@ -2,6 +2,7 @@
 import crypto from 'crypto';
 import { findExternalToolByName } from '../tool-runtime/registry.js';
 import { EXTERNAL_TOOL_PREFIX } from '../tool-runtime/contracts.js';
+import { preflightExternalToolChoice } from '../tool-runtime/router.js';
 import { computeRetryDelay } from '../retry/policy.js';
 import {
   validateMessagesRequest,
@@ -193,7 +194,18 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           const toolMode: string = requestToolContext.mode;
           const externalToolContext = requestToolContext.external;
           const externalToolRegistry = externalToolContext.registry;
-          const externalToolChoice = externalToolContext.toolChoice;
+          const toolChoicePreflight = preflightExternalToolChoice(chatToolChoice, externalToolRegistry);
+          if (!toolChoicePreflight.ok) {
+            res.status(400).json({
+              type: 'error',
+              error: {
+                type: 'invalid_request_error',
+                message: toolChoicePreflight.message,
+              },
+            });
+            return;
+          }
+          const externalToolChoice = toolChoicePreflight.normalized;
           const internalToolContext = requestToolContext.internal;
           trackToolMode(toolMode, { route: '/v1/messages' });
 
@@ -234,19 +246,17 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
             }
             if (role === 'tool') {
               const text = normalizeTextContent(content);
-              if (text) {
-                const mapped =
-                  findExternalToolByName(externalToolRegistry, mr['name']) ||
-                  findExternalToolByName(externalToolRegistry, assistantToolCalls.get(String(mr['tool_call_id'] ?? '')));
-                const toolName =
-                  mapped?.namespacedName ||
-                  assistantToolCalls.get(String(mr['tool_call_id'] ?? '')) ||
-                  (typeof mr['name'] === 'string' ? (mr['name'] as string) : `${EXTERNAL_TOOL_PREFIX}unknown`);
-                parts.push({
-                  type: 'text',
-                  text: `TOOL_RESULT: ${JSON.stringify({ tool_call_id: mr['tool_call_id'] ?? toolName, name: toolName, content: text })}`,
-                });
-              }
+              const mapped =
+                findExternalToolByName(externalToolRegistry, mr['name']) ||
+                findExternalToolByName(externalToolRegistry, assistantToolCalls.get(String(mr['tool_call_id'] ?? '')));
+              const toolName =
+                mapped?.namespacedName ||
+                assistantToolCalls.get(String(mr['tool_call_id'] ?? '')) ||
+                (typeof mr['name'] === 'string' ? (mr['name'] as string) : `${EXTERNAL_TOOL_PREFIX}unknown`);
+              parts.push({
+                type: 'text',
+                text: `TOOL_RESULT: ${JSON.stringify({ tool_call_id: mr['tool_call_id'] ?? toolName, name: toolName, content: text })}`,
+              });
               continue;
             }
             if (!content) continue;
@@ -279,7 +289,8 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           }
 
           const systemWithGuard = buildSystemPrompt(
-            [systemChunks.join('\n\n'), externalToolContext.prompt].filter(Boolean).join('\n\n'),
+            systemChunks.join('\n\n'),
+            externalToolContext.prompt,
             requestParams['reasoning_effort'],
             toolMode,
             internalToolContext.allowedToolNames,

@@ -2,6 +2,7 @@
 import crypto from 'crypto';
 import { findExternalToolByName } from '../tool-runtime/registry.js';
 import { EXTERNAL_TOOL_PREFIX } from '../tool-runtime/contracts.js';
+import { preflightExternalToolChoice } from '../tool-runtime/router.js';
 import { computeRetryDelay } from '../retry/policy.js';
 import {
   stripFunctionCallMarkup,
@@ -240,23 +241,21 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
 
                 if (role === 'tool') {
                   const text = normalizeMessageContent(content);
-                  if (text) {
-                    const mappedTool =
-                      findExternalToolByName(externalToolRegistry, mr['name']) ||
-                      findExternalToolByName(externalToolRegistry, assistantToolCalls.get(String(mr['tool_call_id'] ?? '')));
-                    const toolName =
-                      mappedTool?.namespacedName ||
-                      assistantToolCalls.get(String(mr['tool_call_id'] ?? '')) ||
-                      (typeof mr['name'] === 'string' ? (mr['name'] as string) : `${EXTERNAL_TOOL_PREFIX}unknown`);
-                    const toolCallId =
-                      typeof mr['tool_call_id'] === 'string'
-                        ? (mr['tool_call_id'] as string)
-                        : `call_${String(toolName).replace(/[^a-zA-Z0-9_]/g, '_')}`;
-                    parts.push({
-                      type: 'text',
-                      text: `TOOL_RESULT: ${JSON.stringify({ tool_call_id: toolCallId, name: toolName, content: text })}`,
-                    });
-                  }
+                  const mappedTool =
+                    findExternalToolByName(externalToolRegistry, mr['name']) ||
+                    findExternalToolByName(externalToolRegistry, assistantToolCalls.get(String(mr['tool_call_id'] ?? '')));
+                  const toolName =
+                    mappedTool?.namespacedName ||
+                    assistantToolCalls.get(String(mr['tool_call_id'] ?? '')) ||
+                    (typeof mr['name'] === 'string' ? (mr['name'] as string) : `${EXTERNAL_TOOL_PREFIX}unknown`);
+                  const toolCallId =
+                    typeof mr['tool_call_id'] === 'string'
+                      ? (mr['tool_call_id'] as string)
+                      : `call_${String(toolName).replace(/[^a-zA-Z0-9_]/g, '_')}`;
+                  parts.push({
+                    type: 'text',
+                    text: `TOOL_RESULT: ${JSON.stringify({ tool_call_id: toolCallId, name: toolName, content: text })}`,
+                  });
                   continue;
                 }
 
@@ -316,7 +315,17 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
             const toolMode: string = requestToolContext.mode;
             const externalToolContext = requestToolContext.external;
             const externalToolRegistry = externalToolContext.registry;
-            const externalToolChoice = externalToolContext.toolChoice;
+            const toolChoicePreflight = preflightExternalToolChoice(tool_choice, externalToolRegistry);
+            if (!toolChoicePreflight.ok) {
+              res.status(400).json({
+                error: {
+                  message: toolChoicePreflight.message,
+                  type: 'invalid_request_error',
+                },
+              });
+              return;
+            }
+            const externalToolChoice = toolChoicePreflight.normalized;
             const internalToolContext = requestToolContext.internal;
             trackToolMode(toolMode, {
               configuredAllowlist: internalToolContext.allowedToolNames,
@@ -332,7 +341,8 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               externalToolRegistry,
             );
             const systemWithGuard = buildSystemPrompt(
-              [systemMsg, externalToolContext.prompt].filter(Boolean).join('\n\n'),
+              systemMsg,
+              externalToolContext.prompt,
               requestParams['reasoning_effort'],
               toolMode,
               internalToolContext.allowedToolNames,

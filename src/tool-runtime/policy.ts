@@ -1,8 +1,4 @@
-import {
-  TOOL_POLICY_DECISIONS,
-  TOOL_RISK_LEVELS,
-  TOOL_SIDE_EFFECTS
-} from './contracts.js';
+import { TOOL_POLICY_DECISIONS, TOOL_RISK_LEVELS } from './contracts.js';
 
 /** Raw policy configuration source (env / file merge). */
 export interface PolicyRawConfig {
@@ -110,15 +106,8 @@ export function evaluateToolPolicy(tool: unknown, args: unknown, context: unknow
   const inAllowlist = toolNames.some((name) => policy.allowlist.has(name));
   const inDenylist = toolNames.some((name) => policy.denylist.has(name));
   const requiresConfirmation =
-    Boolean(candidate.requiresConfirmation) ||
+    candidate.requiresConfirmation === true ||
     toolNames.some((name) => policy.confirmationRequired.has(name));
-
-  if (inAllowlist) {
-    return {
-      status: TOOL_POLICY_DECISIONS.ALLOW,
-      effectiveRisk: candidate.riskLevel || policy.defaultRiskLevel
-    };
-  }
 
   if (inDenylist) {
     return {
@@ -128,16 +117,11 @@ export function evaluateToolPolicy(tool: unknown, args: unknown, context: unknow
     };
   }
 
-  if (!inAllowlist && (candidate.sideEffect === TOOL_SIDE_EFFECTS.DELETE || candidate.riskLevel === TOOL_RISK_LEVELS.CRITICAL)) {
+  if (policy.allowlist.size > 0 && !inAllowlist) {
     return {
-      status: TOOL_POLICY_DECISIONS.REQUIRE_CONFIRMATION,
-      reason: `Tool ${String(candidate.originalName)} is high risk and requires confirmation.`,
-      confirmationPayload: {
-        toolName: candidate.originalName,
-        namespacedName: candidate.namespacedName,
-        argumentsPreview: args,
-        risk: candidate.riskLevel
-      }
+      status: TOOL_POLICY_DECISIONS.DENY,
+      code: 'tool_not_allowed_by_policy',
+      reason: `Tool ${String(candidate.originalName)} is not in the external tool allowlist.`
     };
   }
 

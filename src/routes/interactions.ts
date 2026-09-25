@@ -260,9 +260,8 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         fullPromptText += `${text}\n\n`;
       }
       const systemWithGuard = buildSystemPrompt(
-        [systemText, ...systemTexts, hostedSearch.requested ? SEARCH_GROUNDING_INSTRUCTION : '']
-          .filter(Boolean)
-          .join('\n\n'),
+        [systemText, ...systemTexts].filter(Boolean).join('\n\n'),
+        hostedSearch.requested ? SEARCH_GROUNDING_INSTRUCTION : '',
         null,
         toolMode,
         internalToolContext.allowedToolNames,
