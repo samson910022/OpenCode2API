@@ -470,8 +470,13 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                  assertToolCallArtifactIntegrity(parsed, externalToolRegistry, [reasoning, content]);
                }
              }
-            const { validCalls } = finalizeValidatedToolCalls(parsed, externalToolRegistry);
-            res.json(finalizeAnthropic(content, reasoning, validCalls));
+             const { validCalls } = finalizeValidatedToolCalls(parsed, externalToolRegistry);
+             if (externalToolChoice.mode === 'required' && validCalls.length === 0) {
+               const requiredError = new Error('The model did not emit the required external tool call.') as Error & { code?: string };
+               requiredError.code = 'external_tool_choice_required';
+               throw requiredError;
+             }
+             res.json(finalizeAnthropic(content, reasoning, validCalls));
             return;
           }
 
@@ -765,12 +770,18 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [forcedReasoning, forcedContent]);
              }
            }
-           const finalValidated = finalizeStreamToolCalls(
-             parsedToolCalls,
-             externalToolRegistry,
-             externalToolChoice,
-             streamSource,
-           );
+            let finalValidated;
+            try {
+              finalValidated = finalizeStreamToolCalls(parsedToolCalls, externalToolRegistry, externalToolChoice, streamSource);
+            } catch (parallelError) {
+              const parallelCode = (parallelError as Error & { code?: string }).code;
+              if (parallelCode !== 'parallel_external_tool_calls') throw parallelError;
+              if (externalToolChoice.mode === 'none') throw parallelError;
+              const parallelValidated = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
+              if (parallelValidated.invalidCalls.length > 0) throw parallelError;
+              if (parallelValidated.validCalls.length !== parsedToolCalls.length) throw parallelError;
+              finalValidated = parallelValidated.validCalls;
+            }
            if (!streamedText.trim() && !streamedReasoning.trim() && finalValidated.length === 0) {
              throw new Error('Upstream returned no assistant data');
            }
