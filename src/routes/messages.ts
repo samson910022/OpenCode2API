@@ -140,6 +140,9 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           const thinking: unknown = body['thinking'];
           const stream = Boolean(requestStream);
           const requestOpencodeConfig: unknown = body['opencode'];
+          const disableParallelRaw = body['disable_parallel_tool_use'];
+          const choiceDisableParallel = asRecord(tool_choice)['disable_parallel_tool_use'];
+          const parallelToolCalls: boolean = disableParallelRaw === true || choiceDisableParallel === true ? false : true;
           // Phase 2 wiring: inbound claude.request -> chat.request via the wired
           // N×N registry (thin wrapper over the same anthropic.ts pure layer,
           // so shapes match). Direct registry call (not the Safe wrapper):
@@ -460,21 +463,54 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
             }
              let parsed: FinalToolCall[] =
                externalToolRegistry.length > 0 ? parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content) : [];
-             assertToolCallArtifactIntegrity(parsed, externalToolRegistry, [reasoning, content]);
-             if (parsed.length === 0 && externalToolChoice.mode === 'required') {
-               const forcedResponse = await requestForcedMessagesToolCall();
-               if (forcedResponse) {
-                 content = String(forcedResponse['content'] ?? content);
-                 reasoning = String(forcedResponse['reasoning'] ?? reasoning);
-                 parsed = parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content);
-                 assertToolCallArtifactIntegrity(parsed, externalToolRegistry, [reasoning, content]);
+             let validCalls: FinalToolCall[] = [];
+             try {
+               assertToolCallArtifactIntegrity(parsed, externalToolRegistry, [reasoning, content]);
+               if (parsed.length === 0 && externalToolChoice.mode === 'required') {
+                 const forcedResponse = await requestForcedMessagesToolCall();
+                 if (forcedResponse) {
+                   content = String(forcedResponse['content'] ?? content);
+                   reasoning = String(forcedResponse['reasoning'] ?? reasoning);
+                   parsed = parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content);
+                   assertToolCallArtifactIntegrity(parsed, externalToolRegistry, [reasoning, content]);
+                 }
                }
-             }
-             const { validCalls } = finalizeValidatedToolCalls(parsed, externalToolRegistry);
-             if (externalToolChoice.mode === 'required' && validCalls.length === 0) {
-               const requiredError = new Error('The model did not emit the required external tool call.') as Error & { code?: string };
-               requiredError.code = 'external_tool_choice_required';
-               throw requiredError;
+               validCalls = finalizeStreamToolCalls(
+                 parsed,
+                 externalToolRegistry,
+                 externalToolChoice,
+                 [reasoning, content],
+                 parallelToolCalls,
+               ) as unknown as FinalToolCall[];
+             } catch (toolError) {
+               const toolCode = (toolError as Error & { code?: string }).code;
+               const failClosedCodes = [
+                 'parallel_external_tool_calls',
+                 'external_tool_choice_none',
+                 'external_tool_choice_required',
+                 'invalid_external_tool_call',
+                 'external_tool_policy_blocked',
+                 'external_tool_choice_mismatch',
+                 'duplicate_external_tool_call_id',
+                 'malformed_external_tool_call',
+               ];
+               if (toolCode && failClosedCodes.includes(toolCode)) {
+                 try {
+                   if (sessionId) await activeClient.session.delete({ path: { id: sessionId } });
+                 } catch (_cleanupError) {
+                   void _cleanupError;
+                 }
+                 res.status(502).json({
+                   type: 'error',
+                   error: {
+                     type: 'api_error',
+                     message: toErrorMessage(toolError),
+                     code: toolCode,
+                   },
+                 });
+                 return;
+               }
+               throw toolError;
              }
              res.json(finalizeAnthropic(content, reasoning, validCalls));
             return;
@@ -770,18 +806,13 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [forcedReasoning, forcedContent]);
              }
            }
-            let finalValidated;
-            try {
-              finalValidated = finalizeStreamToolCalls(parsedToolCalls, externalToolRegistry, externalToolChoice, streamSource);
-            } catch (parallelError) {
-              const parallelCode = (parallelError as Error & { code?: string }).code;
-              if (parallelCode !== 'parallel_external_tool_calls') throw parallelError;
-              if (externalToolChoice.mode === 'none') throw parallelError;
-              const parallelValidated = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
-              if (parallelValidated.invalidCalls.length > 0) throw parallelError;
-              if (parallelValidated.validCalls.length !== parsedToolCalls.length) throw parallelError;
-              finalValidated = parallelValidated.validCalls;
-            }
+            const finalValidated = finalizeStreamToolCalls(
+              parsedToolCalls,
+              externalToolRegistry,
+              externalToolChoice,
+              streamSource,
+              parallelToolCalls,
+            );
            if (!streamedText.trim() && !streamedReasoning.trim() && finalValidated.length === 0) {
              throw new Error('Upstream returned no assistant data');
            }

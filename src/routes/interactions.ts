@@ -332,6 +332,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       // Thin retry: free-limit errors engage the proxy pool and rotate the
       // session (bounded by maxAttempts like the other routes). Ordinary
       // errors throw immediately — no generic transient backoff here.
+      const parentSessionId = previousState?.sessionId ?? null;
       const promptAndPoll = async (): Promise<{
         content: string;
         reasoning: string;
@@ -342,16 +343,20 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
           if (res.destroyed || res.writableEnded) throw new Error('Client disconnected');
           if (attempt > 1) {
-         try {
-           await activeClient.session.delete({ path: { id: sessionId as string } });
-           ownedSessionId = null;
-         } catch (e: unknown) {
-
-              logDebug('Failed to delete retried interaction session', { error: toErrorMessage(e) });
+            const currentId = sessionId as string;
+            const shouldDelete = sessionNewlyCreated || (parentSessionId ? currentId !== parentSessionId : true);
+            if (shouldDelete) {
+              try {
+                await activeClient.session.delete({ path: { id: currentId } });
+                if (ownedSessionId === currentId) ownedSessionId = null;
+              } catch (e: unknown) {
+                logDebug('Failed to delete retried interaction session', { error: toErrorMessage(e) });
+              }
             }
             const retryRes = (await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
             sessionId = (asRecord(asRecord(retryRes)['data'])['id'] as string | undefined) ?? null;
              if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
+             sessionNewlyCreated = true;
              ownedSessionId = sessionId;
              promptParams.path.id = sessionId;
 

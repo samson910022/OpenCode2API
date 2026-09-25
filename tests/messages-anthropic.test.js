@@ -615,9 +615,9 @@ describe('POST /v1/messages', () => {
         const res = await request(app).post('/v1/messages')
             .set('Authorization', 'Bearer test-key')
             .send({ model: 'opencode/muse-spark-1.3-contributor-free', max_tokens: 100, messages: [{ role: 'user', content: 'Read a.txt' }], tools: [{ name: 'read', description: 'Read', input_schema: { type: 'object' } }], tool_choice: { type: 'any' } });
-        expect(res.statusCode).toBe(500);
+        expect(res.statusCode).toBe(502);
         expect(res.body.type).toBe('error');
-        expect(res.body.error.type).toBe('internal_error');
+        expect(res.body.error.code).toBe('external_tool_choice_required');
         expect(String(res.body.error.message)).toContain('required external tool call');
     });
     test('tool_choice required without tool on stream returns explicit contract', async () => {

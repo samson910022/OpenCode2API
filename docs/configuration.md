@@ -219,7 +219,7 @@ OpenCode2API 现在支持把外部客户端传入的 OpenAI-compatible `tools` �
 | 4 | `EXTERNAL_TOOL_POLICY_MODE` | `enforce`（默认，命中确认名单即拦截）/ `report-only`（只记 debug 日志并放行） |
 | 兜底 | `EXTERNAL_TOOL_DEFAULT_RISK_LEVEL` | 工具未声明风险等级时返回的 `effectiveRisk`（默认 `low`） |
 
-> 名单按客户端声明名 / 命名空间名（`external__*`）/ 原始名任一命中即可；三个列表默认为空，即不改变现有行为。library 调用方也可直接传 `EXTERNAL_TOOL_ALLOWLIST: [...]` 等 options 覆盖。
+> 名单按客户端声明名 / 命名空间名（`external__*`）/ 原始名任一命中即可；三个列表默认为空，即不改变现有行为。library 调用方也可直接传 `EXTERNAL_TOOL_ALLOWLIST: [...]` 等 options 覆盖。外部桥接工具由客户端执行，代理仅返回调用契约；名称推断的 sideEffect/risk 只做元数据，不自动触发 confirmation，operator 需用显式 confirmation 名单、deny/allowlist 控制。
 
 ### 内置工具 allowlist
 

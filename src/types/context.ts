@@ -135,7 +135,7 @@ export interface AppContext {
     parsedToolCalls: unknown,
     registry: unknown
   ) => { validCalls: ValidatedToolCall[]; invalidCalls: Array<{ call: unknown; validation: unknown }> };
-  finalizeStreamToolCalls: (parsedToolCalls: unknown, registry: unknown, toolChoice: unknown, sourceText?: unknown) => ValidatedToolCall[];
+  finalizeStreamToolCalls: (parsedToolCalls: unknown, registry: unknown, toolChoice: unknown, sourceText?: unknown, parallelToolCalls?: unknown) => ValidatedToolCall[];
   toPublicToolCalls: (toolCalls: unknown) => FinalToolCall[];
   createForcedToolCallRequester: (options: ForcedToolCallRequesterOptions) => () => Promise<Record<string, unknown> | null>;
   TOOL_IDS_CACHE_MS: number;

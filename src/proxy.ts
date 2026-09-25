@@ -567,11 +567,13 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     registry: unknown,
     toolChoice: unknown,
     sourceText: unknown = undefined,
+    parallelToolCalls: unknown = true,
   ): ValidatedToolCall[] => {
     const calls = Array.isArray(parsedToolCalls) ? (parsedToolCalls as ValidatedToolCall[]) : [];
     const choice = asRecord(toolChoice);
     const mode = String(choice['mode'] || 'auto');
     const requiredTool = typeof choice['requiredTool'] === 'string' ? choice['requiredTool'] : null;
+    const parallelAllowed = parallelToolCalls !== false;
     const fail = (code: string, message: string): never => {
       const error = new Error(message) as Error & { code?: string };
       error.code = code;
@@ -579,7 +581,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     };
 
     assertToolCallArtifactIntegrity(calls, registry, sourceText);
-    if (calls.length > 1) {
+    if (!parallelAllowed && calls.length > 1) {
       fail('parallel_external_tool_calls', 'More than one external tool call was emitted for this turn.');
     }
     if (mode === 'none' && calls.length > 0) {
@@ -596,11 +598,14 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     if (validCalls.length !== calls.length) {
       fail('external_tool_policy_blocked', 'The model emitted a tool call blocked by policy.');
     }
-    if (requiredTool && validCalls.length === 1) {
-      const record = asRecord(validCalls[0]);
-      const fn = asRecord(record['function']);
-      const selected = findExternalToolByName(registry, fn['name']);
-      if (!selected || selected.namespacedName !== requiredTool) {
+    if (requiredTool && validCalls.length > 0) {
+      const matched = validCalls.some((entry) => {
+        const record = asRecord(entry);
+        const fn = asRecord(record['function']);
+        const selected = findExternalToolByName(registry, fn['name']);
+        return Boolean(selected && selected.namespacedName === requiredTool);
+      });
+      if (!matched) {
         fail('external_tool_choice_mismatch', 'The model emitted a tool call that did not match tool_choice.');
       }
     }

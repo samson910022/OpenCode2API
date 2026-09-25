@@ -694,6 +694,32 @@ describe('<function=name>/<parameter=key> markup (Qwen/GLM native dialect)', () 
         expect(merged).toHaveLength(2);
         expect(new Set(merged.map((call) => call.id)).size).toBe(2);
     });
+
+    test('retains different explicit ids with the same arguments', () => {
+        const calls = parseExternalToolCallsFromText(
+            registry,
+            '<function_calls>[{"id":"call_a","name":"read","arguments":{"file":"a.txt"}},{"id":"call_b","name":"read","arguments":{"file":"a.txt"}}]</function_calls>'
+        );
+        const merged = mergeToolCallArtifacts(calls);
+        expect(merged.map((call) => call.id)).toEqual(['call_a', 'call_b']);
+    });
+
+    test('retains generated parallel calls with identical arguments', () => {
+        const calls = parseExternalToolCallsFromText(
+            registry,
+            '<function_calls>[{"name":"read","arguments":{"file":"a.txt"}},{"name":"read","arguments":{"file":"a.txt"}}]</function_calls>'
+        );
+        expect(calls).toHaveLength(2);
+        const merged = mergeToolCallArtifacts(calls);
+        expect(merged).toHaveLength(2);
+        expect(new Set(merged.map((call) => call.id)).size).toBe(2);
+    });
+
+    test('deduplicates a repeated generated artifact to a single call', () => {
+        const single = parseExternalToolCallsFromText(registry, '<function_calls>{"name":"read","arguments":{"file":"a.txt"}}</function_calls>');
+        const merged = mergeToolCallArtifacts(single, single);
+        expect(merged).toHaveLength(1);
+    });
 });
 
 describe('malformed envelope gate', () => {

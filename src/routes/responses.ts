@@ -469,6 +469,12 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         const callIdRaw: unknown = ir['call_id'] ?? ir['tool_call_id'];
         const remembered = assistantToolCalls.get(String(callIdRaw ?? ''));
         const declaredName = typeof ir['name'] === 'string' ? (ir['name'] as string).trim() : '';
+        if (typeof callIdRaw === 'string' && callIdRaw && !remembered && !declaredName) {
+          throw createInvalidRequestError(
+            `Unknown tool call id "${callIdRaw}". Provide the matching function_call item or a tool name.`,
+            'unknown_tool_call_id',
+          );
+        }
         const mappedTool =
           (declaredName ? resolveExternalToolName(externalToolRegistry, declaredName, ir['namespace']) : null) ||
           (remembered ? resolveExternalToolName(externalToolRegistry, remembered) : null);
@@ -591,24 +597,33 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       };
 
       let messages: NormalizedInputMessage[] = [];
-      if (Array.isArray(chatMessages) && (chatMessages as unknown[]).length) {
-        messages = buildResponsesInputMessages(chatMessages);
-      } else if (typeof prompt === 'string' && prompt.trim()) {
-        messages = [{ role: 'user', content: prompt }];
-      } else if (typeof input === 'string') {
-        messages = [{ role: 'user', content: input }];
-      } else if (Array.isArray(input)) {
-        messages = buildResponsesInputMessages(input);
-      } else if (input && typeof input === 'object') {
-        const ir = asRecord(input);
-        if (['message', 'function_call', 'function_call_output', 'custom_tool_call', 'custom_tool_call_output', 'tool_result'].includes(String(ir['type']))) {
-          messages = buildResponsesInputMessages([input]);
-        } else {
-          const content = normalizeTextContent(ir['content'] ?? ir['text']);
-          if (content) {
-            messages = [{ role: responsesInputRole(ir['role']), content }];
+      try {
+        if (Array.isArray(chatMessages) && (chatMessages as unknown[]).length) {
+          messages = buildResponsesInputMessages(chatMessages);
+        } else if (typeof prompt === 'string' && prompt.trim()) {
+          messages = [{ role: 'user', content: prompt }];
+        } else if (typeof input === 'string') {
+          messages = [{ role: 'user', content: input }];
+        } else if (Array.isArray(input)) {
+          messages = buildResponsesInputMessages(input);
+        } else if (input && typeof input === 'object') {
+          const ir = asRecord(input);
+          if (['message', 'function_call', 'function_call_output', 'custom_tool_call', 'custom_tool_call_output', 'tool_result'].includes(String(ir['type']))) {
+            messages = buildResponsesInputMessages([input]);
+          } else {
+            const content = normalizeTextContent(ir['content'] ?? ir['text']);
+            if (content) {
+              messages = [{ role: responsesInputRole(ir['role']), content }];
+            }
           }
         }
+      } catch (inputError) {
+        const code = (inputError as Error & { code?: string }).code;
+        if (typeof code === 'string' && code) {
+          rejectInvalidRequest(toErrorMessage(inputError), code);
+          return;
+        }
+        throw inputError;
       }
 
       if (!messages.length) {
@@ -1313,12 +1328,13 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
              assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [forcedReasoning, forcedContent]);
            }
          }
-         const validatedStreamedToolCalls = finalizeStreamToolCalls(
-           parsedToolCalls,
-           externalToolRegistry,
-           externalToolChoice,
-           streamSource,
-         );
+          const validatedStreamedToolCalls = finalizeStreamToolCalls(
+            parsedToolCalls,
+            externalToolRegistry,
+            externalToolChoice,
+            streamSource,
+            parallelToolCalls,
+          );
          const joinedSafe = stripExternalToolCallMarkupFromJoinedText(
            externalToolRegistry,
            reasoning,
@@ -1562,17 +1578,50 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
            : externalToolRegistry.length > 0
              ? parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content)
              : [];
-       assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
-      if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
-        const forcedResponse = await requestForcedResponsesToolCall();
-        if (forcedResponse) {
-          content = String(forcedResponse['content'] ?? content);
-          reasoning = String(forcedResponse['reasoning'] ?? reasoning);
-          parsedToolCalls = parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content);
-          assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
-        }
-      }
-      const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
+       let validatedToolCalls: FinalToolCall[] = [];
+       try {
+         assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
+         if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+           const forcedResponse = await requestForcedResponsesToolCall();
+           if (forcedResponse) {
+             content = String(forcedResponse['content'] ?? content);
+             reasoning = String(forcedResponse['reasoning'] ?? reasoning);
+             parsedToolCalls = parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content);
+             assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
+           }
+         }
+         validatedToolCalls = finalizeStreamToolCalls(
+           parsedToolCalls,
+           externalToolRegistry,
+           externalToolChoice,
+           [reasoning, content],
+           parallelToolCalls,
+         ) as unknown as FinalToolCall[];
+       } catch (toolError) {
+         const toolCode = (toolError as Error & { code?: string }).code;
+         const failClosedCodes = [
+           'parallel_external_tool_calls',
+           'external_tool_choice_none',
+           'external_tool_choice_required',
+           'invalid_external_tool_call',
+           'external_tool_policy_blocked',
+           'external_tool_choice_mismatch',
+           'duplicate_external_tool_call_id',
+           'malformed_external_tool_call',
+         ];
+         if (toolCode && failClosedCodes.includes(toolCode)) {
+           await cleanupOwnedResponsesSession();
+           res.status(502).json({
+             error: {
+               message: toErrorMessage(toolError),
+               type: 'server_error',
+               code: toolCode,
+             },
+           });
+           return;
+         }
+         throw toolError;
+       }
       const joinedSafe = stripExternalToolCallMarkupFromJoinedText(
         externalToolRegistry,
         reasoning,

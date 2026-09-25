@@ -205,7 +205,7 @@ curl -X POST http://127.0.0.1:10000/v1/responses \
   }'
 ```
 
-非流式 `responses` 响应会在 `response.output` 中返回 `type: "function_call"` 项；流式模式会发送 function_call 生命周期和参数增量事件。
+非流式 `responses` 响应会在 `response.output` 中返回 `type: "function_call"` 项；流式模式会发送 function_call 生命周期和参数增量事件。`previous_response_id` 续写只保留最近 128 条工具调用元数据；`function_call_output` 的 `call_id` 不在 state 且无 `name` 时返回 400 `unknown_tool_call_id`。
 
 **服务端联网搜索（`web_search`）:**
 

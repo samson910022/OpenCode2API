@@ -1060,14 +1060,16 @@ function collectAll(text: unknown, registry: unknown): ExtractedCalls {
     extractBareJson(source, registry)
   ];
 
-  const seen = new Set<string>();
+  const seenExplicit = new Set<string>();
   const calls: RawToolCall[] = [];
   results.forEach((result) => {
     result.calls.forEach((call) => {
       const explicit = typeof call.id === 'string' && Boolean(call.id);
-      const key = `${explicit ? `id:${call.id}` : 'generated'}::${toolCallKey(call.name, call.arguments)}`;
-      if (seen.has(key)) return;
-      seen.add(key);
+      if (explicit) {
+        const key = `id:${call.id}::${toolCallKey(call.name, call.arguments)}`;
+        if (seenExplicit.has(key)) return;
+        seenExplicit.add(key);
+      }
       calls.push(call);
     });
   });
@@ -1164,22 +1166,27 @@ function toolCallKey(name: string, args: unknown): string {
 }
 
 export function mergeToolCallArtifacts(...artifacts: unknown[]): FinalToolCall[] {
-  const values: unknown[] = [];
-  const visit = (value: unknown): void => {
+  const perArtifact: unknown[][] = [];
+  const visitInto = (target: unknown[], value: unknown): void => {
     if (Array.isArray(value)) {
-      value.forEach(visit);
+      value.forEach((entry) => visitInto(target, entry));
       return;
     }
     if (value && typeof value === 'object') {
       const nested = (value as Record<string, unknown>)['calls'];
       if (Array.isArray(nested)) {
-        nested.forEach(visit);
+        nested.forEach((entry) => visitInto(target, entry));
         return;
       }
-      values.push(value);
+      target.push(value);
     }
   };
-  artifacts.forEach(visit);
+  artifacts.forEach((artifact) => {
+    const list: unknown[] = [];
+    visitInto(list, artifact);
+    perArtifact.push(list);
+  });
+  const values: unknown[] = perArtifact.flat();
 
   const reservedExplicitIds = new Set<string>();
   values.forEach((value: unknown) => {
@@ -1192,8 +1199,26 @@ export function mergeToolCallArtifacts(...artifacts: unknown[]): FinalToolCall[]
   const output: FinalToolCall[] = [];
   const usedIds = new Set<string>();
   const seenExplicitArtifacts = new Set<string>();
-  const seenGenerated = new Set<string>();
+  const generatedMaxPerKey = new Map<string, number>();
+  const generatedEmittedPerKey = new Map<string, number>();
   const generatedCounts = new Map<string, number>();
+  perArtifact.forEach((list) => {
+    const perKey = new Map<string, number>();
+    list.forEach((value: unknown) => {
+      const record = value as Record<string, unknown>;
+      const fn = record['function'];
+      const fnRecord = fn && typeof fn === 'object' && !Array.isArray(fn)
+        ? (fn as Record<string, unknown>)
+        : {};
+      const generated = isGeneratedToolCall(record) || (typeof record['id'] !== 'string' || !record['id']);
+      if (!generated) return;
+      const key = toolCallKey(String(fnRecord['name'] ?? ''), fnRecord['arguments'] ?? {});
+      perKey.set(key, (perKey.get(key) ?? 0) + 1);
+    });
+    perKey.forEach((count, key) => {
+      generatedMaxPerKey.set(key, Math.max(generatedMaxPerKey.get(key) ?? 0, count));
+    });
+  });
 
   values.forEach((value: unknown) => {
     const record = value as Record<string, unknown>;
@@ -1223,8 +1248,10 @@ export function mergeToolCallArtifacts(...artifacts: unknown[]): FinalToolCall[]
     }
 
     const key = toolCallKey(name, args);
-    if (seenGenerated.has(key)) return;
-    seenGenerated.add(key);
+    const allowed = generatedMaxPerKey.get(key) ?? 1;
+    const emitted = generatedEmittedPerKey.get(key) ?? 0;
+    if (emitted >= allowed) return;
+    generatedEmittedPerKey.set(key, emitted + 1);
     const generatedBase = rawId || `call_${name.replace(/[^a-zA-Z0-9_]/g, '_') || 'tool'}`;
     let id: string;
     if (rawId) {

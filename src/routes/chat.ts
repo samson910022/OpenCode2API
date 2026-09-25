@@ -139,20 +139,34 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
             const reasoning_effort: unknown = body['reasoning_effort'];
             const reasoning: unknown = body['reasoning'];
             const requestOpencodeConfig: unknown = body['opencode'];
+            const parallelToolCalls: boolean = body['parallel_tool_calls'] !== false;
             stream = Boolean(requestStream);
             if (!messages || !Array.isArray(messages) || (messages as unknown[]).length === 0) {
               res.status(400).json({ error: { message: 'messages array is required' } });
               return;
             }
-            // Hosted search (web_search) is a Responses/Interactions API tool;
-            // on chat completions it would be silently dropped by the function
-            // registry, so fail loudly with a pointer instead.
             if (detectHostedSearchTools(tools).requested) {
               res.status(400).json({
                 error: {
                   message:
                     'web_search is not supported on /v1/chat/completions; use POST /v1/responses with tools:[{type:"web_search"}] or POST /v1beta/interactions with tools:[{type:"google_search"}]',
                   type: 'invalid_request_error',
+                },
+              });
+              return;
+            }
+            const unsupportedChatToolIndex = tools.findIndex((def) => {
+              const t = asRecord(def);
+              return t['type'] !== 'function';
+            });
+            if (unsupportedChatToolIndex >= 0) {
+              const rawType = asRecord(tools[unsupportedChatToolIndex])['type'];
+              const label = typeof rawType === 'string' && rawType.trim() ? rawType.trim() : 'missing';
+              res.status(400).json({
+                error: {
+                  message: `Unsupported tool type "${label}" at tools[${unsupportedChatToolIndex}]. Only function tools are supported on this endpoint.`,
+                  type: 'invalid_request_error',
+                  code: 'unsupported_tool_type',
                 },
               });
               return;
@@ -857,6 +871,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 externalToolRegistry,
                 externalToolChoice,
                 streamSource,
+                parallelToolCalls,
               );
               if (shouldBufferExternalStream) {
                 writeVisibleDelta(streamedReasoning, true);
@@ -997,17 +1012,54 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                let parsedToolCalls: FinalToolCall[] = externalToolRegistry.length > 0
                  ? parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content)
                  : [];
-               assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
-               if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
-                 const forcedResponse = await requestForcedChatToolCall();
-                 if (forcedResponse) {
-                   content = String(forcedResponse['content'] ?? content);
-                   reasoning = String(forcedResponse['reasoning'] ?? reasoning);
-                   parsedToolCalls = parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content);
-                   assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
+               let validatedToolCalls: FinalToolCall[] = [];
+               try {
+                 assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
+                 if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                   const forcedResponse = await requestForcedChatToolCall();
+                   if (forcedResponse) {
+                     content = String(forcedResponse['content'] ?? content);
+                     reasoning = String(forcedResponse['reasoning'] ?? reasoning);
+                     parsedToolCalls = parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content);
+                     assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
+                   }
                  }
+                 validatedToolCalls = finalizeStreamToolCalls(
+                   parsedToolCalls,
+                   externalToolRegistry,
+                   externalToolChoice,
+                   [reasoning, content],
+                   parallelToolCalls,
+                 ) as unknown as FinalToolCall[];
+               } catch (toolError) {
+                 const toolCode = (toolError as Error & { code?: string }).code;
+                 const failClosedCodes = [
+                   'parallel_external_tool_calls',
+                   'external_tool_choice_none',
+                   'external_tool_choice_required',
+                   'invalid_external_tool_call',
+                   'external_tool_policy_blocked',
+                   'external_tool_choice_mismatch',
+                   'duplicate_external_tool_call_id',
+                   'malformed_external_tool_call',
+                 ];
+                 if (toolCode && failClosedCodes.includes(toolCode)) {
+                   try {
+                     if (sessionId) await activeClient.session.delete({ path: { id: sessionId } });
+                   } catch (_cleanupError) {
+                     void _cleanupError;
+                   }
+                   res.status(502).json({
+                     error: {
+                       message: toErrorMessage(toolError),
+                       type: 'server_error',
+                       code: toolCode,
+                     },
+                   });
+                   return;
+                 }
+                 throw toolError;
                }
-               const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
                const joinedSafe = stripExternalToolCallMarkupFromJoinedText(
                  externalToolRegistry,
                  reasoning,

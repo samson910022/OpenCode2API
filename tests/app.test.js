@@ -671,7 +671,7 @@ describe('Proxy OpenAI API', () => {
         expect(promptCall.body.system).toContain('Tools are disabled');
     });
 
-    test('POST /v1/chat/completions strips tool-call markup from output when DISABLE_TOOLS=true', async () => {
+    test('POST /v1/chat/completions fails closed on invalid tool call instead of stripping to 200', async () => {
         const lockedApp = createApp({
             PORT: 10000,
             API_KEY: 'test-key',
@@ -686,7 +686,7 @@ describe('Proxy OpenAI API', () => {
                 parts: [
                     {
                         type: 'text',
-                        text: 'Here is the summary. <function_calls>{"name":"bash","arguments":{"command":"ls"}}</function_calls>'
+                        text: '<function_calls>{"name":"external__read","arguments":{}}</function_calls>'
                     }
                 ]
             }
@@ -697,14 +697,13 @@ describe('Proxy OpenAI API', () => {
             .set('Authorization', 'Bearer test-key')
             .send({
                 model: 'opencode/kimi-k2.5',
-                messages: [{ role: 'user', content: 'List files' }]
+                messages: [{ role: 'user', content: 'List files' }],
+                tools: [{ type: 'function', function: { name: 'read', description: 'Read', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } }]
             });
 
-        expect(res.statusCode).toEqual(200);
-        const content = res.body.choices[0].message.content;
-        expect(content).toContain('Here is the summary.');
-        expect(content).not.toContain('<function_calls>');
-        expect(content).not.toContain('function_calls');
+        expect(res.statusCode).toEqual(502);
+        expect(res.body.error.code).toBe('invalid_external_tool_call');
+        expect(sdkMocks.sessionDelete).toHaveBeenCalled();
     });
 
     test('POST /v1/chat/completions applies request-level allowlist narrowing (intersection)', async () => {
@@ -1584,7 +1583,7 @@ describe('Proxy OpenAI API', () => {
         expect(res.text).toContain('"name":"weather_lookup"');
     });
 
-    test('POST /v1/chat/completions strips denied external tool calls from non-stream output', async () => {
+    test('POST /v1/chat/completions fails closed on denied external tool calls', async () => {
         const restrictedApp = createApp({
             PORT: 10000,
             API_KEY: 'test-key',
@@ -1629,10 +1628,9 @@ describe('Proxy OpenAI API', () => {
                 ]
             });
 
-        expect(res.statusCode).toEqual(200);
-        expect(res.body.choices[0].finish_reason).toEqual('stop');
-        expect(res.body.choices[0].message.tool_calls).toBeUndefined();
-        expect(res.body.choices[0].message.content).toEqual('');
+        expect(res.statusCode).toEqual(502);
+        expect(res.body.error.code).toBe('external_tool_policy_blocked');
+        expect(sdkMocks.sessionDelete).toHaveBeenCalled();
     });
 
     test('POST /v1/responses returns assistant response', async () => {
@@ -2295,7 +2293,7 @@ describe('Proxy OpenAI API', () => {
          expect(res.text).not.toContain('response.completed');
     });
 
-    test('POST /v1/responses strips denied external function calls from non-stream output', async () => {
+    test('POST /v1/responses fails closed on denied external function calls', async () => {
         const restrictedApp = createApp({
             PORT: 10000,
             API_KEY: 'test-key',
@@ -2339,11 +2337,12 @@ describe('Proxy OpenAI API', () => {
                 ]
             });
 
-        expect(res.statusCode).toEqual(200);
-        expect(res.body.output).toEqual([]);
+        expect(res.statusCode).toEqual(502);
+        expect(res.body.error.code).toBe('external_tool_policy_blocked');
+        expect(sdkMocks.sessionDelete).toHaveBeenCalled();
     });
 
-    test('POST /v1/responses strips tool-call markup from output when DISABLE_TOOLS=true', async () => {
+    test('POST /v1/responses fails closed on invalid tool call instead of stripping to 200', async () => {
         const lockedApp = createApp({
             PORT: 10000,
             API_KEY: 'test-key',
@@ -2358,7 +2357,7 @@ describe('Proxy OpenAI API', () => {
                 parts: [
                     {
                         type: 'text',
-                        text: 'Search summary here. <function_calls>{"name":"webfetch","arguments":{"url":"https://example.com"}}</function_calls>'
+                        text: '<function_calls>{"name":"external__read","arguments":{}}</function_calls>'
                     }
                 ]
             }
@@ -2369,13 +2368,13 @@ describe('Proxy OpenAI API', () => {
             .set('Authorization', 'Bearer test-key')
             .send({
                 model: 'opencode/kimi-k2.5',
-                input: 'Summarize https://example.com'
+                input: 'Read a.txt',
+                tools: [{ type: 'function', name: 'read', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } }]
             });
 
-        expect(res.statusCode).toEqual(200);
-        const flat = JSON.stringify(res.body.output);
-        expect(flat).toContain('Search summary here.');
-        expect(flat).not.toContain('<function_calls>');
+        expect(res.statusCode).toEqual(502);
+        expect(res.body.error.code).toBe('invalid_external_tool_call');
+        expect(sdkMocks.sessionDelete).toHaveBeenCalled();
     });
 
     /**
@@ -2770,9 +2769,7 @@ describe('Proxy Responses API previous_response_id', () => {
             ['valid DSML plus unclosed wrapper', '<tool_calls><invoke name="read"><parameter name="path" string="true">a.txt</parameter></invoke></tool_calls><tool_call>{"name":"read"'],
             ['bare array with an invalid member', '[{"name":"read","arguments":{"path":"a.txt"}},{"arguments":{"path":"b.txt"}}]'],
             ['bare array with an unknown member', '[{"name":"read","arguments":{"path":"a.txt"}},{"name":"missing","arguments":{}}]'],
-            ['bare array with a trailing member', '[{"name":"read","arguments":{"path":"a.txt"}},"junk"]'],
-            ['parallel calls', '<function_calls>[{"name":"read","arguments":{"path":"a.txt"}},{"name":"read","arguments":{"path":"b.txt"}}]</function_calls>'],
-            ['canonical block plus a second bare payload', '<function_calls>{"name":"read","arguments":{"path":"a.txt"}}</function_calls>{"name":"read","arguments":{"path":"b.txt"}}']
+            ['bare array with a trailing member', '[{"name":"read","arguments":{"path":"a.txt"}},"junk"]']
         ])('external chat stream fails closed for %s', async (_label, markup) => {
             sdkMocks.eventSubscribe.mockImplementationOnce(eventStream([
                 { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: markup } },
@@ -2805,6 +2802,52 @@ describe('Proxy Responses API previous_response_id', () => {
             expect(res.statusCode).toBe(200);
             expect(res.text).toContain('duplicate external tool call id');
             expect(res.text).not.toContain('data: [DONE]');
+        });
+
+        test('external chat stream allows parallel calls with index and id', async () => {
+            sdkMocks.eventSubscribe.mockImplementationOnce(eventStream([
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: '<function_calls>[{"id":"call_p_a","name":"read","arguments":{"path":"a.txt"}},{"id":"call_p_b","name":"read","arguments":{"path":"b.txt"}}]</function_calls>' } },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
+            ]));
+            const res = await request(app)
+                .post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', stream: true, messages: [{ role: 'user', content: 'Read both' }], tools: [readTool] });
+            expect(res.statusCode).toBe(200);
+            expect(res.text).toContain('call_p_a');
+            expect(res.text).toContain('call_p_b');
+            expect(res.text).toContain('"index":0');
+            expect(res.text).toContain('"index":1');
+            expect(res.text).toContain('data: [DONE]');
+        });
+
+        test('external chat stream rejects parallel calls when parallel_tool_calls is false', async () => {
+            sdkMocks.eventSubscribe.mockImplementationOnce(eventStream([
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: '<function_calls>[{"id":"call_p_a","name":"read","arguments":{"path":"a.txt"}},{"id":"call_p_b","name":"read","arguments":{"path":"b.txt"}}]</function_calls>' } },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
+            ]));
+            const res = await request(app)
+                .post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', stream: true, messages: [{ role: 'user', content: 'Read both' }], tools: [readTool], parallel_tool_calls: false });
+            expect(res.statusCode).toBe(200);
+            expect(res.text).toContain('data: {"error"');
+            expect(res.text).not.toContain('data: [DONE]');
+        });
+
+        test.each([
+            ['custom', { type: 'custom', name: 'run_shell' }],
+            ['namespace', { type: 'namespace', name: 'gh', tools: [{ type: 'function', name: 'ping' }] }],
+            ['file_search', { type: 'file_search' }],
+            ['mcp', { type: 'mcp', server_label: 'github' }]
+        ])('chat rejects unsupported %s tool with 400', async (_label, tool) => {
+            const res = await request(app)
+                .post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }], tools: [readTool, tool] });
+            expect(res.statusCode).toBe(400);
+            expect(res.body.error.code).toBe('unsupported_tool_type');
+            expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
         });
 
         test('external responses stream fails closed before response.completed', async () => {
@@ -4047,9 +4090,9 @@ describe('Proxy Responses API previous_response_id', () => {
                 .post('/v1/responses')
                 .set('Authorization', 'Bearer test-key')
                 .send({ model: 'opencode/kimi-k2.5', input: 'Read a.txt', tools: [readTool] });
-            expect(res.statusCode).toBe(500);
-            expect(res.body.code).toBe('duplicate_external_tool_call_id');
-            expect(res.body.message).toContain('duplicate external tool call id');
+            expect(res.statusCode).toBe(502);
+            expect(res.body.error.code).toBe('duplicate_external_tool_call_id');
+            expect(res.body.error.message).toContain('duplicate external tool call id');
             expect(res.body.output).toBeUndefined();
             expect(res.text).not.toContain('"call_id":"call_conflict"');
         });
@@ -4662,9 +4705,8 @@ describe('Proxy Responses API previous_response_id', () => {
                         tools: [namespaceTool('gh', [{ type: 'function', name: 'delete_repo' }])]
                     });
 
-                expect(res.statusCode).toBe(200);
-                expect(res.body.output.some((item) => item.type === 'function_call')).toBe(false);
-                expect(lastPromptText()).toContain('Delete the repo');
+                expect(res.statusCode).toBe(502);
+                expect(res.body.error.code).toBe('external_tool_policy_blocked');
             });
         });
 
@@ -4811,6 +4853,7 @@ describe('Proxy Responses API previous_response_id', () => {
                 ['namespace hint with a bare name', 'create_issue', 'external__gh__create_issue', 'gh'],
                 ['top-level name', 'create_issue', 'external__create_issue', null]
             ])('tool_choice can require a namespace tool by its %s', async (_label, toolChoiceName, expected, namespace) => {
+                replyWithToolCall('call_req_ns', expected, '{"title":"x"}');
                 const res = await postResponses({
                     model: 'opencode/kimi-k2.5',
                     input: 'Create an issue',
@@ -4974,7 +5017,7 @@ describe('Proxy Responses API previous_response_id', () => {
                 ['a missing input key', '{"cmd":"echo hi"}'],
                 ['a non-string input', '{"input":42}'],
                 ['a null input', '{"input":null}']
-            ])('drops a custom tool call whose arguments are %s', async (_label, args) => {
+            ])('fails closed on a custom tool call whose arguments are %s', async (_label, args) => {
                 replyWithToolCall('call_custom_bad', 'external__gh__run_shell', args);
                 const res = await postResponses({
                     model: 'opencode/kimi-k2.5',
@@ -4982,12 +5025,12 @@ describe('Proxy Responses API previous_response_id', () => {
                     tools: [namespaceTool('gh', [customShell])]
                 });
 
-                expect(res.statusCode).toBe(200);
-                expect(res.body.output.some((item) => item.type === 'custom_tool_call')).toBe(false);
-                expect(res.text).not.toContain('"input":""');
+                expect(res.statusCode).toBe(502);
+                expect(res.body.error.code).toBe('invalid_external_tool_call');
             });
 
             test('a custom tool_choice names the custom function the request declared', async () => {
+                replyWithToolCall('call_custom_req', 'external__run_shell', '{"input":"echo hi"}');
                 const res = await postResponses({
                     model: 'opencode/kimi-k2.5',
                     input: 'Run echo hi',
@@ -5000,6 +5043,7 @@ describe('Proxy Responses API previous_response_id', () => {
             });
 
             test('a custom tool_choice resolves a namespaced custom tool and rejects an unknown one', async () => {
+                replyWithToolCall('call_custom_ns_req', 'external__gh__run_shell', '{"input":"echo hi"}');
                 const res = await postResponses({
                     model: 'opencode/kimi-k2.5',
                     input: 'Run echo hi',
@@ -5185,17 +5229,15 @@ describe('Proxy Responses API previous_response_id', () => {
                 ]);
             });
 
-            test('falls back to the explicit unknown tool for a blank tool result name', async () => {
+            test('rejects a tool result whose call id is unknown and has no name', async () => {
                 const res = await postResponses({
                     model: 'opencode/kimi-k2.5',
                     input: [{ type: 'function_call_output', call_id: 'lite_call_8', name: '   ', output: 'body' }],
                     tools: [liteRead]
                 });
 
-                expect(res.statusCode).toBe(200);
-                expect(lastPromptText()).toContain(
-                    'TOOL_RESULT: {"tool_call_id":"lite_call_8","name":"external__unknown","content":"body"}'
-                );
+                expect(res.statusCode).toBe(400);
+                expect(res.body.error.code).toBe('unknown_tool_call_id');
             });
         });
 
@@ -5331,7 +5373,7 @@ describe('Proxy Responses API previous_response_id', () => {
                 );
             });
 
-            test('leaves an unrecorded call id on the unknown fallback path', async () => {
+            test('rejects an unrecorded call id without a name', async () => {
                 const first = await postResponses({ model: 'opencode/kimi-k2.5', input: 'Hello' });
                 expect(first.statusCode).toBe(200);
 
@@ -5340,10 +5382,8 @@ describe('Proxy Responses API previous_response_id', () => {
                     input: [{ type: 'function_call_output', call_id: 'call_never_issued', output: 'orphan' }]
                 });
 
-                expect(followUp.statusCode).toBe(200);
-                expect(lastPromptText()).toContain(
-                    'TOOL_RESULT: {"tool_call_id":"call_never_issued","name":"external__unknown","content":"orphan"}'
-                );
+                expect(followUp.statusCode).toBe(400);
+                expect(followUp.body.error.code).toBe('unknown_tool_call_id');
             });
 
             test('caps the stored continuation metadata to the most recent calls', async () => {
@@ -5367,10 +5407,8 @@ describe('Proxy Responses API previous_response_id', () => {
                     previous_response_id: first.body.id,
                     input: [{ type: 'function_call_output', call_id: 'call_cap_0', output: 'oldest' }]
                 });
-                expect(forgotten.statusCode).toBe(200);
-                expect(lastPromptText()).toContain(
-                    'TOOL_RESULT: {"tool_call_id":"call_cap_0","name":"external__unknown","content":"oldest"}'
-                );
+                expect(forgotten.statusCode).toBe(400);
+                expect(forgotten.body.error.code).toBe('unknown_tool_call_id');
 
                 const remembered = await postResponses({
                     previous_response_id: first.body.id,
