@@ -2,6 +2,7 @@
 import crypto from 'crypto';
 import { findExternalToolByName } from '../tool-runtime/registry.js';
 import { EXTERNAL_TOOL_PREFIX } from '../tool-runtime/contracts.js';
+import { preflightExternalToolChoice } from '../tool-runtime/router.js';
 import { computeRetryDelay } from '../retry/policy.js';
 import {
   validateMessagesRequest,
@@ -14,8 +15,10 @@ import { defaultTranslatorRegistry } from '../converters/registry.js';
 import { ensureTranslatorsRegistered } from '../converters/wire.js';
 import { resolveMessagesReasoningLevel } from '../converters/chat-messages/request.js';
 import {
-  stripFunctionCallMarkup,
-  parseExternalToolCallsFromText,
+  assertToolCallArtifactIntegrity,
+  stripExternalToolCallMarkupFromJoinedText,
+  parseExternalToolCallsFromJoinedText,
+  mergeToolCallArtifacts,
   createToolCallFilter,
   createExternalToolCallStreamParser,
 } from '../tool-runtime/parser.js';
@@ -46,11 +49,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
     buildSystemPrompt,
     selectPromptToolOverrides,
     normalizeReasoningEffort,
-    stripFunctionCalls,
     normalizeTextContent,
     normalizeToolArguments,
     createRequestToolContext,
     finalizeValidatedToolCalls,
+    finalizeStreamToolCalls,
     toPublicToolCalls,
     createForcedToolCallRequester,
     trackToolMode,
@@ -69,8 +72,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
   app.post('/v1/messages', async (req: Request, res: Response): Promise<void> => {
     try {
       await lock(async (): Promise<void> => {
-        let sessionId: string | null = null;
-        let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
+         let sessionId: string | null = null;
+         let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
+         const requestAbortController = new AbortController();
+         let disconnectedSessionCleaned = false;
+
         // P3 fallback bundle: direct by default; adopts the proxy bundle when
         // this request hits a free-limit error (or the pool is already engaged).
         let activeClient = client;
@@ -134,6 +140,9 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           const thinking: unknown = body['thinking'];
           const stream = Boolean(requestStream);
           const requestOpencodeConfig: unknown = body['opencode'];
+          const disableParallelRaw = body['disable_parallel_tool_use'];
+          const choiceDisableParallel = asRecord(tool_choice)['disable_parallel_tool_use'];
+          const parallelToolCalls: boolean = disableParallelRaw === true || choiceDisableParallel === true ? false : true;
           // Phase 2 wiring: inbound claude.request -> chat.request via the wired
           // N×N registry (thin wrapper over the same anthropic.ts pure layer,
           // so shapes match). Direct registry call (not the Safe wrapper):
@@ -193,7 +202,18 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           const toolMode: string = requestToolContext.mode;
           const externalToolContext = requestToolContext.external;
           const externalToolRegistry = externalToolContext.registry;
-          const externalToolChoice = externalToolContext.toolChoice;
+          const toolChoicePreflight = preflightExternalToolChoice(chatToolChoice, externalToolRegistry);
+          if (!toolChoicePreflight.ok) {
+            res.status(400).json({
+              type: 'error',
+              error: {
+                type: 'invalid_request_error',
+                message: toolChoicePreflight.message,
+              },
+            });
+            return;
+          }
+          const externalToolChoice = toolChoicePreflight.normalized;
           const internalToolContext = requestToolContext.internal;
           trackToolMode(toolMode, { route: '/v1/messages' });
 
@@ -234,19 +254,17 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
             }
             if (role === 'tool') {
               const text = normalizeTextContent(content);
-              if (text) {
-                const mapped =
-                  findExternalToolByName(externalToolRegistry, mr['name']) ||
-                  findExternalToolByName(externalToolRegistry, assistantToolCalls.get(String(mr['tool_call_id'] ?? '')));
-                const toolName =
-                  mapped?.namespacedName ||
-                  assistantToolCalls.get(String(mr['tool_call_id'] ?? '')) ||
-                  (typeof mr['name'] === 'string' ? (mr['name'] as string) : `${EXTERNAL_TOOL_PREFIX}unknown`);
-                parts.push({
-                  type: 'text',
-                  text: `TOOL_RESULT: ${JSON.stringify({ tool_call_id: mr['tool_call_id'] ?? toolName, name: toolName, content: text })}`,
-                });
-              }
+              const mapped =
+                findExternalToolByName(externalToolRegistry, mr['name']) ||
+                findExternalToolByName(externalToolRegistry, assistantToolCalls.get(String(mr['tool_call_id'] ?? '')));
+              const toolName =
+                mapped?.namespacedName ||
+                assistantToolCalls.get(String(mr['tool_call_id'] ?? '')) ||
+                (typeof mr['name'] === 'string' ? (mr['name'] as string) : `${EXTERNAL_TOOL_PREFIX}unknown`);
+              parts.push({
+                type: 'text',
+                text: `TOOL_RESULT: ${JSON.stringify({ tool_call_id: mr['tool_call_id'] ?? toolName, name: toolName, content: text })}`,
+              });
               continue;
             }
             if (!content) continue;
@@ -279,7 +297,8 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           }
 
           const systemWithGuard = buildSystemPrompt(
-            [systemChunks.join('\n\n'), externalToolContext.prompt].filter(Boolean).join('\n\n'),
+            systemChunks.join('\n\n'),
+            externalToolContext.prompt,
             requestParams['reasoning_effort'],
             toolMode,
             internalToolContext.allowedToolNames,
@@ -311,6 +330,22 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
             REQUEST_TIMEOUT_MS,
             'load tool overrides',
           )) as Record<string, boolean> | null;
+          // Fail-closed by design (see chat.ts): null or verified-empty both 503.
+          if (DISABLE_TOOLS && (!toolOverrides || Object.keys(toolOverrides).length === 0)) {
+            try {
+              await activeClient.session.delete({ path: { id: sessionId as string } });
+            } catch (cleanupError: unknown) {
+              logDebug('Failed to cleanup session after tool discovery unavailable', { error: toErrorMessage(cleanupError) });
+            }
+            res.status(503).json({
+              type: 'error',
+              error: {
+                type: 'tool_discovery_unavailable',
+                message: 'Tool discovery unavailable; backend tool IDs could not be verified',
+              },
+            });
+            return;
+          }
           // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
           const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
           if (promptToolOverrides) promptParams.body['tools'] = promptToolOverrides;
@@ -338,8 +373,14 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
             reasoning: unknown,
             validatedToolCalls: unknown,
           ): Record<string, unknown> => {
-            const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
-            const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
+            const joinedSafe = stripExternalToolCallMarkupFromJoinedText(
+              externalToolRegistry,
+              reasoning,
+              content,
+              true,
+            );
+            const safeContent = joinedSafe.content;
+            const safeReasoning = joinedSafe.reasoning;
             const publicCalls = toPublicToolCalls(validatedToolCalls);
             const anthropicTools = publicCalls.map((tc) => {
               const tcr = tc as unknown as Record<string, unknown>;
@@ -390,7 +431,13 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
               }
               try {
                 await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-                const collected = await activePollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
+                 const collected = await activePollForAssistantResponse(
+                   sessionId as string,
+                   REQUEST_TIMEOUT_MS,
+                   undefined,
+                   requestAbortController.signal,
+                 );
+
                 content = collected.content || '';
                 reasoning = collected.reasoning || '';
                 error = collected.error || null;
@@ -403,7 +450,8 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
               if (error && !content && !reasoning && attempt < maxAttempts && isTransientUpstreamError(error)) continue;
               break;
             }
-            if (error && !content && !reasoning) {
+              // Fail-closed: any backend error fails even with partial content (see chat.ts).
+                          if (error != null) {
               const t = transformUpstreamError(error);
               res.status(t.statusCode).json({
                 type: 'error',
@@ -415,41 +463,91 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
               });
               return;
             }
-            let parsed: FinalToolCall[] =
-              externalToolRegistry.length > 0 ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content) : [];
-            if (parsed.length === 0 && externalToolChoice.mode === 'required') {
-              const forcedResponse = await requestForcedMessagesToolCall();
-              if (forcedResponse) {
-                content = String(forcedResponse['content'] ?? content);
-                reasoning = String(forcedResponse['reasoning'] ?? reasoning);
-                parsed = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
-              }
-            }
-            const { validCalls } = finalizeValidatedToolCalls(parsed, externalToolRegistry);
-            res.json(finalizeAnthropic(content, reasoning, validCalls));
+             let parsed: FinalToolCall[] =
+               externalToolRegistry.length > 0 ? parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content) : [];
+             let validCalls: FinalToolCall[] = [];
+             try {
+               assertToolCallArtifactIntegrity(parsed, externalToolRegistry, [reasoning, content]);
+               if (parsed.length === 0 && externalToolChoice.mode === 'required') {
+                 const forcedResponse = await requestForcedMessagesToolCall();
+                 if (forcedResponse) {
+                   content = String(forcedResponse['content'] ?? content);
+                   reasoning = String(forcedResponse['reasoning'] ?? reasoning);
+                   parsed = parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content);
+                   assertToolCallArtifactIntegrity(parsed, externalToolRegistry, [reasoning, content]);
+                 }
+               }
+               validCalls = finalizeStreamToolCalls(
+                 parsed,
+                 externalToolRegistry,
+                 externalToolChoice,
+                 [reasoning, content],
+                 parallelToolCalls,
+               ) as unknown as FinalToolCall[];
+             } catch (toolError) {
+               const toolCode = (toolError as Error & { code?: string }).code;
+               const failClosedCodes = [
+                 'parallel_external_tool_calls',
+                 'external_tool_choice_none',
+                 'external_tool_choice_required',
+                 'invalid_external_tool_call',
+                 'external_tool_policy_blocked',
+                 'external_tool_choice_mismatch',
+                 'duplicate_external_tool_call_id',
+                 'malformed_external_tool_call',
+               ];
+               if (toolCode && failClosedCodes.includes(toolCode)) {
+                 try {
+                   if (sessionId) await activeClient.session.delete({ path: { id: sessionId } });
+                 } catch (_cleanupError) {
+                   void _cleanupError;
+                 }
+                 res.status(502).json({
+                   type: 'error',
+                   error: {
+                     type: 'api_error',
+                     message: toErrorMessage(toolError),
+                     code: toolCode,
+                   },
+                 });
+                 return;
+               }
+               throw toolError;
+             }
+             res.json(finalizeAnthropic(content, reasoning, validCalls));
             return;
           }
 
-          res.setHeader('Content-Type', 'text/event-stream');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
-          keepaliveInterval = setInterval(() => {
+                      res.setHeader('Content-Type', 'text/event-stream');
+           res.setHeader('Cache-Control', 'no-cache');
+           res.setHeader('Connection', 'keep-alive');
+           const flushHeaders = (res as unknown as { flushHeaders?: unknown }).flushHeaders;
+           if (typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
+           keepaliveInterval = setInterval(() => {
             if (!res.destroyed && !res.writableEnded) res.write(': keep-alive\n\n');
           }, 15000);
-          const resClosed = new Promise<boolean>((resolve) =>
-            res.once('close', () => {
-              if (!res.writableEnded) resolve(true);
-            }),
-          );
+           const resClosed = new Promise<boolean>((resolve) =>
+             res.once('close', () => {
+               if (!res.writableEnded) {
+                 requestAbortController.abort();
+                 resolve(true);
+               }
+             }),
+           );
+
           let streamedText = '';
           let streamedReasoning = '';
           let rawContent = '';
           let rawReasoning = '';
-          const streamedToolCalls: FinalToolCall[] = [];
-          const filterContent = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: externalToolRegistry.length > 0 });
-          const filterReasoning = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: externalToolRegistry.length > 0 });
-          const parseContent = createExternalToolCallStreamParser(externalToolRegistry);
-          const parseReason = createExternalToolCallStreamParser(externalToolRegistry);
+           const streamedToolCalls: FinalToolCall[] = [];
+           // Intentional: buffer while any external tool contract is declared so tool
+           // markup is never emitted as incremental `content_block_delta` before it
+           // can be classified. Pure-text turns with tools declared also batch.
+           const shouldBufferExternalStream = externalToolRegistry.length > 0;
+           const filterContent = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
+           const filterReasoning = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
+           const parseContent = createExternalToolCallStreamParser(externalToolRegistry);
+           const parseReason = createExternalToolCallStreamParser(externalToolRegistry);
           let textBlockOpen = false;
           let thinkingBlockOpen = false;
           let nextBlockIndex = 0;
@@ -495,26 +593,87 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
             else rawContent += delta;
             const parsedCalls = isReasoning ? parseReason(delta) : parseContent(delta);
             parsedCalls.forEach((tc) => streamedToolCalls.push(tc));
-            const filtered = isReasoning ? filterReasoning(delta) : filterContent(delta);
-            if (!filtered) return;
-            if (isReasoning) sendReasoningDelta(filtered);
-            else sendTextDelta(filtered);
+             const filtered = isReasoning ? filterReasoning(delta) : filterContent(delta);
+             if (!filtered) return;
+             if (shouldBufferExternalStream) {
+               if (isReasoning) streamedReasoning += filtered;
+               else streamedText += filtered;
+             } else if (isReasoning) sendReasoningDelta(filtered);
+             else sendTextDelta(filtered);
           };
-          let collected: Record<string, unknown> | null = null;
+           let collected: Record<string, unknown> | null = null;
+           let polledSnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
+           let snapshotPolled = false;
+           let snapshotPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> | null = null;
+           const pollSnapshot = async (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> => {
+             snapshotPolled = true;
+             if (!snapshotPromise) {
+                 snapshotPromise = activePollForAssistantResponse(
+                   sessionId as string,
+                   REQUEST_TIMEOUT_MS,
+                   undefined,
+                   requestAbortController.signal,
+                 );
+
+             }
+             return snapshotPromise;
+           };
+          // Recovery snapshots repeat what the event stream already delivered, so only the
+          // suffix past the raw prefix may be replayed. A snapshot the raw prefix does not
+          // match is still sent in full rather than dropped.
+           const unsentSuffix = (full: unknown, raw: string): string => {
+             const text = typeof full === 'string' ? full : '';
+             if (!text) return '';
+             if (!raw) return text;
+             return text.startsWith(raw) ? text.slice(raw.length) : text;
+           };
+           const hasPartialOutput = (): boolean => {
+             const current = asRecord(collected);
+             return Boolean(rawContent || rawReasoning || streamedToolCalls.length > 0 || current['content'] || current['reasoning']);
+           };
+           const recoverSnapshot = async (
+             fallbackError: unknown = null,
+           ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown } | null> => {
+             if (res.destroyed || res.writableEnded) return null;
+             let snapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown };
+             try {
+               snapshot = await pollSnapshot();
+             } catch (error: unknown) {
+               if (res.destroyed || res.writableEnded) return null;
+               if (hasPartialOutput()) {
+                 logDebug('Ignoring messages recovery poll failure after partial stream output', { error: toErrorMessage(error) });
+                 return null;
+               }
+               if (fallbackError != null) throw normalizeBackendError(fallbackError);
+               throw normalizeBackendError(error);
+             }
+             if (snapshot.error != null) throw normalizeBackendError(snapshot.error);
+             if (
+               fallbackError != null &&
+               !snapshot.content &&
+               !snapshot.reasoning &&
+               !(Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0)
+             ) throw normalizeBackendError(fallbackError);
+             return snapshot;
+           };
+
           if (fallbackToProxy) {
             // SSE subscribe ignores custom fetch (SDK gap): prompt+poll
             // through the proxy bundle instead of the event stream.
             try {
               await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-              const pres = await activePollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
-              if (pres.error && !pres.content && !pres.reasoning) throw normalizeBackendError(pres.error);
+               const pres = await pollSnapshot();
+               polledSnapshot = pres;
+               if (pres.error != null) throw normalizeBackendError(pres.error);
               if (res.destroyed || res.writableEnded) {
                 if (keepaliveInterval) clearInterval(keepaliveInterval);
                 return;
               }
               // Raw text: sendDelta parses tool calls and filters display markup.
-              if (pres.content) sendDelta(pres.content, false);
-              if (pres.reasoning) sendDelta(pres.reasoning, true);
+              const presContent = unsentSuffix(pres.content, rawContent);
+              const presReasoning = unsentSuffix(pres.reasoning, rawReasoning);
+              if (presContent) sendDelta(presContent, false);
+              if (presReasoning) sendDelta(presReasoning, true);
               collected = { content: pres.content, reasoning: pres.reasoning };
             } catch (e: unknown) {
               throw normalizeBackendError(e);
@@ -524,113 +683,263 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
               sessionId as string,
               REQUEST_TIMEOUT_MS,
               sendDelta,
-              DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-              DEFAULT_EVENT_IDLE_TIMEOUT_MS,
-            ).catch((err: unknown) => ({ __error: err }));
+               DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
+               DEFAULT_EVENT_IDLE_TIMEOUT_MS,
+               requestAbortController.signal,
+             ).catch((err: unknown) => ({ __error: err }));
+
             activeClient.session.prompt(promptParams).catch((err: unknown) => logDebug('Prompt error:', toErrorMessage(err)));
             const raced = (await Promise.race([collectPromise, resClosed.then(() => ({ __cancelled: true }))])) as Record<string, unknown>;
             collected = raced;
-            if (raced['__cancelled']) {
-              if (keepaliveInterval) clearInterval(keepaliveInterval);
-              try {
-                if (sessionId) await activeClient.session.delete({ path: { id: sessionId } });
-              } catch (e: unknown) {
-                logDebug('Failed to cleanup cancelled messages session', { error: toErrorMessage(e) });
+             if (raced['__cancelled'] || requestAbortController.signal.aborted) {
+               if (keepaliveInterval) clearInterval(keepaliveInterval);
+               try {
+                 if (sessionId) {
+                   await activeClient.session.delete({ path: { id: sessionId } });
+                   disconnectedSessionCleaned = true;
+                 }
+               } catch (e: unknown) {
+                 logDebug('Failed to cleanup cancelled messages session', { error: toErrorMessage(e) });
+               }
+               try {
+                 if (!res.destroyed) res.end();
+               } catch {
+                 // ignore
+               }
+               return;
+             }
+             if (raced['error'] != null) throw normalizeBackendError(raced['error']);
+              const recoveryRecord = asRecord(collected);
+              const hasValidTerminal = Boolean(
+                collected &&
+                !recoveryRecord['__error'] &&
+                !recoveryRecord['noData'] &&
+                !recoveryRecord['idleTimeout'] &&
+                !recoveryRecord['cancelled'] &&
+                (rawContent || rawReasoning || streamedToolCalls.length > 0 || recoveryRecord['content'] || recoveryRecord['reasoning']),
+              );
+              if (recoveryRecord['__error']) {
+                if (!fallbackToProxy) engageProxyFallback(recoveryRecord['__error']);
+                const snapshot = await recoverSnapshot(recoveryRecord['__error']);
+
+               if (snapshot) {
+                 polledSnapshot = snapshot;
+                 const remainingContent = unsentSuffix(snapshot.content, rawContent);
+                 const remainingReasoning = unsentSuffix(snapshot.reasoning, rawReasoning);
+                 if (remainingContent) sendDelta(remainingContent, false);
+                 if (remainingReasoning) sendDelta(remainingReasoning, true);
+               }
+              } else if (recoveryRecord['noData'] || recoveryRecord['idleTimeout']) {
+
+               const snapshot = await recoverSnapshot();
+               if (snapshot) {
+                 polledSnapshot = snapshot;
+                 const remainingContent = unsentSuffix(snapshot.content, rawContent);
+                 const remainingReasoning = unsentSuffix(snapshot.reasoning, rawReasoning);
+                 if (remainingContent) sendDelta(remainingContent, false);
+                 if (remainingReasoning) sendDelta(remainingReasoning, true);
+               }
+             }
+             if (externalToolRegistry.length > 0 && !hasValidTerminal && !snapshotPolled) {
+               const snapshot = await recoverSnapshot();
+               if (snapshot) {
+                 polledSnapshot = snapshot;
+                 const remainingReasoning = unsentSuffix(snapshot.reasoning, rawReasoning);
+                 const remainingContent = unsentSuffix(snapshot.content, rawContent);
+                 if (remainingReasoning) sendDelta(remainingReasoning, true);
+                 if (remainingContent) sendDelta(remainingContent, false);
+               }
+             }
+           }
+           if (requestAbortController.signal.aborted || res.destroyed || res.writableEnded) {
+             if (sessionId && !disconnectedSessionCleaned) {
+               try {
+                 await activeClient.session.delete({ path: { id: sessionId } });
+                 disconnectedSessionCleaned = true;
+               } catch (e: unknown) {
+                 logDebug('Failed to cleanup disconnected messages session', { error: toErrorMessage(e) });
+               }
+             }
+             return;
+           }
+
+            const flushedReasoningCalls = parseReason.flush ? parseReason.flush() : [];
+           const flushedContentCalls = parseContent.flush ? parseContent.flush() : [];
+           const flushedReasoningText = filterReasoning.flush ? filterReasoning.flush() : '';
+           const flushedContentText = filterContent.flush ? filterContent.flush() : '';
+           if (shouldBufferExternalStream) {
+             const visible = stripExternalToolCallMarkupFromJoinedText(
+               externalToolRegistry,
+               rawReasoning,
+               rawContent,
+             );
+             streamedReasoning = visible.reasoning;
+             streamedText = visible.content;
+           } else {
+             if (flushedReasoningText) sendReasoningDelta(flushedReasoningText);
+             if (flushedContentText) sendTextDelta(flushedContentText);
+           }
+
+           const collectedR = asRecord(collected);
+           if (collectedR['error'] != null) throw normalizeBackendError(collectedR['error']);
+           const snapshotReasoning = polledSnapshot?.reasoning ?? (typeof collectedR['reasoning'] === 'string' ? collectedR['reasoning'] as string : rawReasoning);
+           const snapshotContent = polledSnapshot?.content ?? (typeof collectedR['content'] === 'string' ? collectedR['content'] as string : rawContent);
+           const parseJoined = (reasoningText: string, contentText: string): FinalToolCall[] =>
+             externalToolRegistry.length > 0
+               ? parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoningText, contentText)
+               : [];
+           const streamSource = [
+             [snapshotReasoning, snapshotContent],
+             [rawReasoning, rawContent]
+           ];
+            let parsedToolCalls: FinalToolCall[] = externalToolRegistry.length > 0
+              ? mergeToolCallArtifacts(
+                  streamedToolCalls,
+                  flushedReasoningCalls,
+                  flushedContentCalls,
+                  parseJoined(snapshotReasoning, snapshotContent),
+                  parseJoined(rawReasoning, rawContent),
+                )
+              : [];
+            let finalValidated: FinalToolCall[];
+            try {
+              assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource);
+              if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                const forcedResponse = await requestForcedMessagesToolCall();
+                if (forcedResponse) {
+                  const forcedReasoning = typeof forcedResponse['reasoning'] === 'string' ? forcedResponse['reasoning'] as string : '';
+                  const forcedContent = typeof forcedResponse['content'] === 'string' ? forcedResponse['content'] as string : '';
+                  parsedToolCalls = mergeToolCallArtifacts(parsedToolCalls, parseJoined(forcedReasoning, forcedContent));
+                  assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [forcedReasoning, forcedContent]);
+                }
               }
-              try {
-                if (!res.destroyed) res.end();
-              } catch {
-                // ignore
+              finalValidated = finalizeStreamToolCalls(
+                parsedToolCalls,
+                externalToolRegistry,
+                externalToolChoice,
+                streamSource,
+                parallelToolCalls,
+              ) as unknown as FinalToolCall[];
+            } catch (toolError) {
+              const toolCode = (toolError as Error & { code?: string }).code;
+              const failClosedCodes = [
+                'parallel_external_tool_calls',
+                'external_tool_choice_none',
+                'external_tool_choice_required',
+                'invalid_external_tool_call',
+                'external_tool_policy_blocked',
+                'external_tool_choice_mismatch',
+                'duplicate_external_tool_call_id',
+                'malformed_external_tool_call',
+              ];
+              if (toolCode && failClosedCodes.includes(toolCode)) {
+                try {
+                  if (sessionId) await activeClient.session.delete({ path: { id: sessionId } });
+                } catch (_cleanupError) {
+                  void _cleanupError;
+                }
+                if (keepaliveInterval) clearInterval(keepaliveInterval);
+                const toolMessage = toErrorMessage(toolError);
+                if (!res.headersSent) {
+                  res.status(502).json({
+                    type: 'error',
+                    error: { type: 'api_error', message: toolMessage, code: toolCode },
+                  });
+                } else if (!res.destroyed) {
+                  try {
+                    res.write(
+                      sseEvent('error', {
+                        type: 'error',
+                        error: { type: 'api_error', message: toolMessage, code: toolCode },
+                      }),
+                    );
+                  } catch {
+                    // ignore
+                  }
+                  res.end();
+                }
+                return;
+              }
+              throw toolError;
+            }
+           if (!streamedText.trim() && !streamedReasoning.trim() && finalValidated.length === 0) {
+             throw new Error('Upstream returned no assistant data');
+           }
+           if (shouldBufferExternalStream) {
+             if (streamedReasoning) {
+               const idx = ensureThinkingIndex();
+               if (!thinkingBlockOpen) {
+                 res.write(sseEvent('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'thinking', thinking: '', signature: '' } }));
+                 thinkingBlockOpen = true;
+               }
+               res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'thinking_delta', thinking: streamedReasoning } }));
+             }
+             if (streamedText) {
+               const idx = ensureTextIndex();
+               if (!textBlockOpen) {
+                 res.write(sseEvent('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'text', text: '' } }));
+                 textBlockOpen = true;
+               }
+               res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: streamedText } }));
+             }
+           }
+           if (textBlockOpen) res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
+           if (thinkingBlockOpen) res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: thinkingIndex }));
+           let toolBlockIndex = nextBlockIndex;
+           for (const tc of toPublicToolCalls(finalValidated)) {
+             const tcr = tc as unknown as Record<string, unknown>;
+             const fn = asRecord(tcr['function']);
+             res.write(
+               sseEvent('content_block_start', {
+                 type: 'content_block_start',
+                 index: toolBlockIndex,
+                 content_block: { type: 'tool_use', id: tcr['id'], name: fn['name'], input: {} },
+               }),
+             );
+             res.write(
+               sseEvent('content_block_delta', {
+                 type: 'content_block_delta',
+                 index: toolBlockIndex,
+                 delta: { type: 'input_json_delta', partial_json: (fn['arguments'] as string) || '{}' },
+               }),
+             );
+             res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: toolBlockIndex }));
+             toolBlockIndex += 1;
+           }
+           const outputTokens = estimateTokens(streamedText + streamedReasoning);
+           const stopReason = mapFinishToStopReason('stop', finalValidated.length > 0);
+           res.write(
+             sseEvent('message_delta', {
+               type: 'message_delta',
+               delta: { stop_reason: stopReason, stop_sequence: null },
+               usage: { output_tokens: outputTokens },
+             }),
+           );
+            res.write(sseEvent('message_stop', { type: 'message_stop' }));
+            if (requestAbortController.signal.aborted || res.destroyed) {
+              if (sessionId && !disconnectedSessionCleaned) {
+                try {
+                  await activeClient.session.delete({ path: { id: sessionId } });
+                  disconnectedSessionCleaned = true;
+                } catch (e: unknown) {
+                  logDebug('Failed to cleanup disconnected messages session', { error: toErrorMessage(e) });
+                }
               }
               return;
             }
-          if (raced['error'] && !rawContent && !rawReasoning) throw normalizeBackendError(raced['error']);
-          if (raced['__error']) {
-            // The collect error itself may be the free-limit signal.
-            if (!fallbackToProxy) engageProxyFallback(raced['__error']);
-            const polled = await activePollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
-            if (polled.error && !polled.content && !polled.reasoning && !rawContent && !rawReasoning)
-              throw normalizeBackendError(polled.error);
-            // Raw text through sendDelta so tool calls are parsed and raw
-            // snapshots stay consistent with the fallback branch above.
-            if (polled.content && !rawContent) sendDelta(polled.content, false);
-            if (polled.reasoning && !rawReasoning) sendDelta(polled.reasoning, true);
-          }
-          }
-          if (textBlockOpen) res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
-          if (thinkingBlockOpen) res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: thinkingIndex }));
-          const flushedReasoningCalls = parseReason.flush ? parseReason.flush() : [];
-          const flushedContentCalls = parseContent.flush ? parseContent.flush() : [];
-          const flushedReasoningText = filterReasoning.flush ? filterReasoning.flush() : '';
-          const flushedContentText = filterContent.flush ? filterContent.flush() : '';
-          const finalReasoningText = rawReasoning + flushedReasoningText;
-          const finalContentText = rawContent + flushedContentText;
-          const parseStreamedToolCalls = (): FinalToolCall[] => {
-            if (externalToolRegistry.length === 0) return [];
-            const perChannel = [
-              ...flushedReasoningCalls,
-              ...flushedContentCalls,
-              ...parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText, finalContentText),
-            ];
-            if (perChannel.length > 0) return perChannel;
-            return parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText + finalContentText);
-          };
-          let parsedToolCalls: FinalToolCall[] =
-            streamedToolCalls.length > 0
-              ? [...streamedToolCalls, ...flushedReasoningCalls, ...flushedContentCalls]
-              : parseStreamedToolCalls();
-          if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
-            const forcedResponse = await requestForcedMessagesToolCall();
-            if (forcedResponse) {
-              parsedToolCalls = parseExternalToolCallsFromText(
-                externalToolRegistry,
-                forcedResponse['reasoning'] as string,
-                forcedResponse['content'] as string,
-              );
-            }
-          }
-          const { validCalls: finalValidated } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
-          let toolBlockIndex = nextBlockIndex;
-          for (const tc of toPublicToolCalls(finalValidated)) {
-            const tcr = tc as unknown as Record<string, unknown>;
-            const fn = asRecord(tcr['function']);
-            res.write(
-              sseEvent('content_block_start', {
-                type: 'content_block_start',
-                index: toolBlockIndex,
-                content_block: { type: 'tool_use', id: tcr['id'], name: fn['name'], input: {} },
-              }),
-            );
-            res.write(
-              sseEvent('content_block_delta', {
-                type: 'content_block_delta',
-                index: toolBlockIndex,
-                delta: { type: 'input_json_delta', partial_json: (fn['arguments'] as string) || '{}' },
-              }),
-            );
-            res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: toolBlockIndex }));
-            toolBlockIndex += 1;
-          }
-          const outputTokens = estimateTokens(streamedText + streamedReasoning);
-          const stopReason = mapFinishToStopReason('stop', finalValidated.length > 0);
-          res.write(
-            sseEvent('message_delta', {
-              type: 'message_delta',
-              delta: { stop_reason: stopReason, stop_sequence: null },
-              usage: { output_tokens: outputTokens },
-            }),
-          );
-          res.write(sseEvent('message_stop', { type: 'message_stop' }));
-          if (keepaliveInterval) clearInterval(keepaliveInterval);
-          res.end();
-          return;
+            if (keepaliveInterval) clearInterval(keepaliveInterval);
+
+           res.end();
+           return;
         } catch (error: unknown) {
           if (keepaliveInterval) clearInterval(keepaliveInterval);
           if (!fallbackToProxy) engageProxyFallback(error);
           if (sessionId) {
-            try {
-              await activeClient.session.delete({ path: { id: sessionId } });
-            } catch (e: unknown) {
+             try {
+               await activeClient.session.delete({ path: { id: sessionId } });
+               if (requestAbortController.signal.aborted) disconnectedSessionCleaned = true;
+             } catch (e: unknown) {
+
               logDebug('Failed to cleanup messages session on error', { error: toErrorMessage(e) });
             }
           }

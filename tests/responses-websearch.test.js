@@ -6,7 +6,6 @@ import {
     detectHostedSearchTools,
     extractSearchEvidence,
     extractUrls,
-    stripHostedSearchTools,
 } from '../src/search/grounding.js';
 
 const SEARCH_OUTPUT = 'PostgreSQL 18.3 was released. Notes: https://www.postgresql.org/docs/release/18.3/ .';
@@ -94,14 +93,14 @@ function baseConfig(overrides = {}) {
 }
 
 describe('grounding pure helpers', () => {
-    test('detect/strip hosted search tools', () => {
+    test('detect hosted search tools', () => {
         expect(detectHostedSearchTools([{ type: 'web_search' }]).requested).toBe(true);
         expect(detectHostedSearchTools([{ type: 'Google_Search' }]).requested).toBe(true);
         expect(detectHostedSearchTools([{ type: 'web_search_20260222' }]).requested).toBe(true);
         expect(detectHostedSearchTools([{ type: 'function', function: { name: 'x' } }]).requested).toBe(false);
         expect(detectHostedSearchTools('nope').requested).toBe(false);
         const mixed = [{ type: 'web_search' }, { type: 'function', function: { name: 'f' } }];
-        expect(stripHostedSearchTools(mixed)).toHaveLength(1);
+        expect(detectHostedSearchTools(mixed).kinds).toEqual(['web_search']);
     });
 
     test('extractSearchEvidence only trusts completed websearch parts', () => {
@@ -193,6 +192,7 @@ describe('POST /v1/responses web_search grounding', () => {
             model: 'opencode/kimi-k2.5',
             input: 'What is the latest PostgreSQL release?',
             tools: [{ type: 'web_search' }],
+            tool_choice: 'required',
             stream: true,
         });
         expect(res.statusCode).toBe(200);
@@ -204,5 +204,18 @@ describe('POST /v1/responses web_search grounding', () => {
         expect(searchCalls).toHaveLength(1);
         const message = completed.response.output.find((o) => o.type === 'message');
         expect(message.content[0].annotations.length).toBeGreaterThan(0);
+    });
+
+    test('internal-only required choice does not require an external call', async () => {
+        const app = createApp(baseConfig({ INTERNAL_ALLOWED_TOOLS: ['webfetch'] })).app;
+        const res = await request(app).post('/v1/responses').send({
+            model: 'opencode/kimi-k2.5',
+            input: 'Use an internal tool if needed.',
+            tool_choice: 'required',
+            stream: true,
+        });
+        expect(res.statusCode).toBe(200);
+        expect(res.text).toContain('response.completed');
+        expect(res.text).not.toContain('response.failed');
     });
 });

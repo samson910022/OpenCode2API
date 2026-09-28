@@ -2,14 +2,17 @@
 import crypto from 'crypto';
 import { findExternalToolByName } from '../tool-runtime/registry.js';
 import { EXTERNAL_TOOL_PREFIX } from '../tool-runtime/contracts.js';
+import { preflightExternalToolChoice } from '../tool-runtime/router.js';
 import { computeRetryDelay } from '../retry/policy.js';
 import {
-  stripFunctionCallMarkup,
-  parseExternalToolCallsFromText,
+  assertToolCallArtifactIntegrity,
+  stripExternalToolCallMarkupFromJoinedText,
+  parseExternalToolCallsFromJoinedText,
+  mergeToolCallArtifacts,
   createToolCallFilter,
   createExternalToolCallStreamParser,
 } from '../tool-runtime/parser.js';
-import { isTransientUpstreamError, transformUpstreamError } from '../errors/upstream.js';
+import { isTransientUpstreamError, normalizeBackendError, transformUpstreamError } from '../errors/upstream.js';
 import { engageFallbackForFreeLimit } from '../upstream-proxy/fallback.js';
 import { detectHostedSearchTools } from '../search/grounding.js';
 import {
@@ -60,11 +63,11 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
     buildSystemPrompt,
     selectPromptToolOverrides,
     normalizeReasoningEffort,
-    stripFunctionCalls,
     normalizeTextContent,
     normalizeToolArguments,
     createRequestToolContext,
     finalizeValidatedToolCalls,
+    finalizeStreamToolCalls,
     toPublicToolCalls,
     createForcedToolCallRequester,
     trackToolMode,
@@ -89,7 +92,12 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
           let pID = 'opencode';
           let mID = 'kimi-k2.5-free';
           let id = `chatcmpl-${crypto.randomUUID()}`;
-          let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
+           let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
+           const requestAbortController = new AbortController();
+           let clientDisconnected = false;
+           let disconnectedSessionCleaned = false;
+           let removeClientCloseListener = (): void => {};
+
           // P3 fallback bundle: direct by default; switched to the proxy
           // bundle for subsequent attempts once a free-limit error engages it.
           let activeClient = client;
@@ -131,20 +139,34 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
             const reasoning_effort: unknown = body['reasoning_effort'];
             const reasoning: unknown = body['reasoning'];
             const requestOpencodeConfig: unknown = body['opencode'];
+            const parallelToolCalls: boolean = body['parallel_tool_calls'] !== false;
             stream = Boolean(requestStream);
             if (!messages || !Array.isArray(messages) || (messages as unknown[]).length === 0) {
               res.status(400).json({ error: { message: 'messages array is required' } });
               return;
             }
-            // Hosted search (web_search) is a Responses/Interactions API tool;
-            // on chat completions it would be silently dropped by the function
-            // registry, so fail loudly with a pointer instead.
             if (detectHostedSearchTools(tools).requested) {
               res.status(400).json({
                 error: {
                   message:
                     'web_search is not supported on /v1/chat/completions; use POST /v1/responses with tools:[{type:"web_search"}] or POST /v1beta/interactions with tools:[{type:"google_search"}]',
                   type: 'invalid_request_error',
+                },
+              });
+              return;
+            }
+            const unsupportedChatToolIndex = tools.findIndex((def) => {
+              const t = asRecord(def);
+              return t['type'] !== 'function';
+            });
+            if (unsupportedChatToolIndex >= 0) {
+              const rawType = asRecord(tools[unsupportedChatToolIndex])['type'];
+              const label = typeof rawType === 'string' && rawType.trim() ? rawType.trim() : 'missing';
+              res.status(400).json({
+                error: {
+                  message: `Unsupported tool type "${label}" at tools[${unsupportedChatToolIndex}]. Only function tools are supported on this endpoint.`,
+                  type: 'invalid_request_error',
+                  code: 'unsupported_tool_type',
                 },
               });
               return;
@@ -240,23 +262,21 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
 
                 if (role === 'tool') {
                   const text = normalizeMessageContent(content);
-                  if (text) {
-                    const mappedTool =
-                      findExternalToolByName(externalToolRegistry, mr['name']) ||
-                      findExternalToolByName(externalToolRegistry, assistantToolCalls.get(String(mr['tool_call_id'] ?? '')));
-                    const toolName =
-                      mappedTool?.namespacedName ||
-                      assistantToolCalls.get(String(mr['tool_call_id'] ?? '')) ||
-                      (typeof mr['name'] === 'string' ? (mr['name'] as string) : `${EXTERNAL_TOOL_PREFIX}unknown`);
-                    const toolCallId =
-                      typeof mr['tool_call_id'] === 'string'
-                        ? (mr['tool_call_id'] as string)
-                        : `call_${String(toolName).replace(/[^a-zA-Z0-9_]/g, '_')}`;
-                    parts.push({
-                      type: 'text',
-                      text: `TOOL_RESULT: ${JSON.stringify({ tool_call_id: toolCallId, name: toolName, content: text })}`,
-                    });
-                  }
+                  const mappedTool =
+                    findExternalToolByName(externalToolRegistry, mr['name']) ||
+                    findExternalToolByName(externalToolRegistry, assistantToolCalls.get(String(mr['tool_call_id'] ?? '')));
+                  const toolName =
+                    mappedTool?.namespacedName ||
+                    assistantToolCalls.get(String(mr['tool_call_id'] ?? '')) ||
+                    (typeof mr['name'] === 'string' ? (mr['name'] as string) : `${EXTERNAL_TOOL_PREFIX}unknown`);
+                  const toolCallId =
+                    typeof mr['tool_call_id'] === 'string'
+                      ? (mr['tool_call_id'] as string)
+                      : `call_${String(toolName).replace(/[^a-zA-Z0-9_]/g, '_')}`;
+                  parts.push({
+                    type: 'text',
+                    text: `TOOL_RESULT: ${JSON.stringify({ tool_call_id: toolCallId, name: toolName, content: text })}`,
+                  });
                   continue;
                 }
 
@@ -316,7 +336,17 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
             const toolMode: string = requestToolContext.mode;
             const externalToolContext = requestToolContext.external;
             const externalToolRegistry = externalToolContext.registry;
-            const externalToolChoice = externalToolContext.toolChoice;
+            const toolChoicePreflight = preflightExternalToolChoice(tool_choice, externalToolRegistry);
+            if (!toolChoicePreflight.ok) {
+              res.status(400).json({
+                error: {
+                  message: toolChoicePreflight.message,
+                  type: 'invalid_request_error',
+                },
+              });
+              return;
+            }
+            const externalToolChoice = toolChoicePreflight.normalized;
             const internalToolContext = requestToolContext.internal;
             trackToolMode(toolMode, {
               configuredAllowlist: internalToolContext.allowedToolNames,
@@ -332,7 +362,8 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               externalToolRegistry,
             );
             const systemWithGuard = buildSystemPrompt(
-              [systemMsg, externalToolContext.prompt].filter(Boolean).join('\n\n'),
+              systemMsg,
+              externalToolContext.prompt,
               requestParams['reasoning_effort'],
               toolMode,
               internalToolContext.allowedToolNames,
@@ -401,6 +432,23 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               REQUEST_TIMEOUT_MS,
               'load tool overrides',
             )) as Record<string, boolean> | null;
+            // Fail-closed by design: null (discovery failed) or verified-empty (no
+            // tool IDs to disable) both 503. A real backend always exposes tools.
+            if (DISABLE_TOOLS && (!toolOverrides || Object.keys(toolOverrides).length === 0)) {
+              try {
+                await activeClient.session.delete({ path: { id: sessionId as string } });
+              } catch (cleanupError: unknown) {
+                logDebug('Failed to cleanup session after tool discovery unavailable', { error: toErrorMessage(cleanupError) });
+              }
+              res.status(503).json({
+                error: {
+                  message: 'Tool discovery unavailable; backend tool IDs could not be verified',
+                  type: 'tool_discovery_unavailable',
+                  code: 'tool_discovery_unavailable',
+                },
+              });
+              return;
+            }
             // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
             const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
             if (promptToolOverrides) {
@@ -424,19 +472,39 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
             res.setHeader('Content-Type', stream ? 'text/event-stream' : 'application/json');
             res.setHeader('Cache-Control', 'no-cache');
             res.setHeader('Connection', 'keep-alive');
+            if (stream) {
+              const flushHeaders = (res as unknown as { flushHeaders?: unknown }).flushHeaders;
+             if (typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
+             const onClientClose = (): void => {
+               if (res.writableEnded) return;
+               clientDisconnected = true;
+               requestAbortController.abort();
+             };
+             res.once('close', onClientClose);
+             removeClientCloseListener = (): void => {
+               res.removeListener('close', onClientClose);
+             };
+           }
 
             if (stream) {
-              const shouldStripStreamingToolMarkup = externalToolRegistry.length > 0;
-              const filterContentDelta = createToolCallFilter({
+              // Intentional: buffer visible text while any external tool contract is
+              // declared so `<function_calls>` / `<external__*>` markup fragments are
+              // never streamed incrementally before the parser can classify them.
+              // Trade-off: pure-text turns with tools declared also emit in one batch
+              // at completion instead of incrementally.
+              const shouldBufferExternalStream = externalToolRegistry.length > 0;
+              let filterContentDelta = createToolCallFilter({
                 disableTools: DISABLE_TOOLS,
-                forceStrip: shouldStripStreamingToolMarkup,
+                forceStrip: shouldBufferExternalStream,
+                registry: externalToolRegistry,
               });
-              const filterReasoningDelta = createToolCallFilter({
+              let filterReasoningDelta = createToolCallFilter({
                 disableTools: DISABLE_TOOLS,
-                forceStrip: shouldStripStreamingToolMarkup,
+                forceStrip: shouldBufferExternalStream,
+                registry: externalToolRegistry,
               });
-              const parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
-              const parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+              let parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+              let parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
               let streamedContent = '';
               let streamedReasoning = '';
               let rawStreamedContent = '';
@@ -457,44 +525,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               };
               ensureKeepalive();
 
-              const sendDelta = (delta: string, isReasoning: boolean = false): void => {
-                if (!delta) return;
-                if (isReasoning) rawStreamedReasoning += delta;
-                else rawStreamedContent += delta;
-                const parsedDeltaToolCalls = isReasoning
-                  ? parseReasoningToolCalls(delta)
-                  : parseContentToolCalls(delta);
-                parsedDeltaToolCalls.forEach((toolCall) => {
-                  streamedToolCalls.push(toolCall);
-                  res.write(
-                    `data: ${JSON.stringify({
-                      id,
-                      object: 'chat.completion.chunk',
-                      created: Math.floor(Date.now() / 1000),
-                      model: `${pID}/${mID}`,
-                      choices: [
-                        {
-                          index: 0,
-                          delta: {
-                            tool_calls: [
-                              {
-                                index: streamedToolCalls.length - 1,
-                                id: toolCall.id,
-                                type: 'function',
-                                function: {
-                                  name: toolCall.function.name,
-                                  arguments: toolCall.function.arguments,
-                                },
-                              },
-                            ],
-                          },
-                          finish_reason: null,
-                        },
-                      ],
-                    })}\n\n`,
-                  );
-                });
-                const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
+              const appendFilteredDelta = (filtered: string, isReasoning: boolean): void => {
                 if (!filtered) return;
                 if (isReasoning) {
                   streamedReasoning += filtered;
@@ -503,6 +534,9 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   streamedContent += filtered;
                   completionTokens += Math.ceil(filtered.length / 4);
                 }
+              };
+              const writeVisibleDelta = (filtered: string, isReasoning: boolean): void => {
+                if (!filtered) return;
                 const deltaField = isReasoning ? { reasoning_content: filtered } : { content: filtered };
                 const chunk = {
                   id,
@@ -513,9 +547,99 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 };
                 res.write(`data: ${JSON.stringify(chunk)}\n\n`);
               };
+              const sendDelta = (delta: string, isReasoning: boolean = false): void => {
+                if (!delta) return;
+                if (isReasoning) rawStreamedReasoning += delta;
+                else rawStreamedContent += delta;
+                const parsedDeltaToolCalls = isReasoning
+                  ? parseReasoningToolCalls(delta)
+                  : parseContentToolCalls(delta);
+                parsedDeltaToolCalls.forEach((toolCall) => {
+                  streamedToolCalls.push(toolCall);
+                });
+                if (!shouldBufferExternalStream) {
+                  const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
+                  if (!filtered) return;
+                  appendFilteredDelta(filtered, isReasoning);
+                  writeVisibleDelta(filtered, isReasoning);
+                } else {
+                  const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
+                  appendFilteredDelta(filtered, isReasoning);
+                }
+              };
 
-              let collected: Record<string, unknown> | null = null;
-              let lastStreamAttemptError: unknown = null;
+               let collected: Record<string, unknown> | null = null;
+               let lastStreamAttemptError: unknown = null;
+               let polledSnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
+               let snapshotPolled = false;
+               let snapshotPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> | null = null;
+               const pollSnapshot = async (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> => {
+                 snapshotPolled = true;
+                 if (!snapshotPromise) {
+                    snapshotPromise = activePollForAssistantResponse(
+                      sessionId as string,
+                      REQUEST_TIMEOUT_MS,
+                      undefined,
+                      requestAbortController.signal,
+                    );
+
+                 }
+                 return snapshotPromise;
+               };
+               // Recovery snapshots repeat what the event stream already delivered. Only the
+               // suffix past the raw prefix may be replayed, otherwise every recovered turn
+               // duplicates text. A snapshot the raw prefix does not match is still sent in
+               // full rather than dropped.
+               const unsentSuffix = (full: unknown, raw: string): string => {
+                 const text = typeof full === 'string' ? full : '';
+                 if (!text) return '';
+                 if (!raw) return text;
+                 return text.startsWith(raw) ? text.slice(raw.length) : text;
+               };
+                const replaySnapshot = (snapshot: { content: string; reasoning: string; error: unknown }): void => {
+                  if (snapshot.error != null) throw snapshot.error;
+                  const remainingReasoning = unsentSuffix(snapshot.reasoning, rawStreamedReasoning);
+                  const remainingContent = unsentSuffix(snapshot.content, rawStreamedContent);
+                  if (remainingReasoning) sendDelta(remainingReasoning, true);
+                  if (remainingContent) sendDelta(remainingContent, false);
+                };
+                const hasPartialOutput = (): boolean => {
+                  const current = asRecord(collected);
+                  return Boolean(
+                    rawStreamedContent ||
+                    rawStreamedReasoning ||
+                    streamedToolCalls.length > 0 ||
+                    current['content'] ||
+                    current['reasoning'],
+                  );
+                };
+                const recoverSnapshot = async (
+                  fallbackError: unknown = null,
+                ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown } | null> => {
+                  if (clientDisconnected) return null;
+                  let snapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown };
+                  try {
+                    snapshot = await pollSnapshot();
+                  } catch (error: unknown) {
+                    if (clientDisconnected) return null;
+                    if (hasPartialOutput()) {
+                      logDebug('Ignoring recovery poll failure after partial stream output', { error: toErrorMessage(error) });
+                      return null;
+                    }
+                    if (fallbackError != null) throw fallbackError;
+                    throw error;
+                  }
+                   if (snapshot.error != null) throw snapshot.error;
+                   if (
+                     fallbackError != null &&
+                     !snapshot.content &&
+                     !snapshot.reasoning &&
+                     !(Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0)
+                   ) throw fallbackError;
+                   return snapshot;
+
+                };
+
               for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
                 if (attempt > 1) {
                   try {
@@ -534,12 +658,27 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   requestForcedChatToolCall = makeForcedChatToolCallRequester();
                   streamedContent = '';
                   streamedReasoning = '';
-                  rawStreamedContent = '';
-                  rawStreamedReasoning = '';
-                  streamedToolCalls.length = 0;
-                  completionTokens = 0;
-                  reasoningTokens = 0;
-                  await sleep(computeRetryDelay(attempt - 1, lastStreamAttemptError));
+                   rawStreamedContent = '';
+                   rawStreamedReasoning = '';
+                                      streamedToolCalls.length = 0;
+                    polledSnapshot = null;
+                    snapshotPolled = false;
+                    snapshotPromise = null;
+                   filterContentDelta = createToolCallFilter({
+                     disableTools: DISABLE_TOOLS,
+                     forceStrip: shouldBufferExternalStream,
+                     registry: externalToolRegistry,
+                   });
+                   filterReasoningDelta = createToolCallFilter({
+                     disableTools: DISABLE_TOOLS,
+                     forceStrip: shouldBufferExternalStream,
+                     registry: externalToolRegistry,
+                   });
+                   parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+                   parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+                   completionTokens = 0;
+                   reasoningTokens = 0;
+                   await sleep(computeRetryDelay(attempt - 1, lastStreamAttemptError));
                 }
                 try {
                   if (fallbackToProxy) {
@@ -547,12 +686,12 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                     // through the proxy bundle instead of the event stream.
                     // Deltas go out immediately so the post-loop poll is skipped.
                     await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-                    const pres = (await activePollForAssistantResponse(
-                      sessionId as string,
-                      REQUEST_TIMEOUT_MS,
-                    )) as { content: string; reasoning: string; error: unknown };
-                    if (pres.reasoning) sendDelta(pres.reasoning, true);
-                    if (pres.content) sendDelta(pres.content, false);
+                     const pres = (await pollSnapshot()) as { content: string; reasoning: string; error: unknown };
+                     polledSnapshot = pres;
+                    const presReasoning = unsentSuffix(pres.reasoning, rawStreamedReasoning);
+                    const presContent = unsentSuffix(pres.content, rawStreamedContent);
+                    if (presReasoning) sendDelta(presReasoning, true);
+                    if (presContent) sendDelta(presContent, false);
                     // Only mark served when something arrived: error-only
                     // results must still reach the terminal poll/error report.
                     if (pres.content || pres.reasoning) fallbackServed = true;
@@ -566,9 +705,11 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                       sessionId as string,
                       REQUEST_TIMEOUT_MS,
                       sendDelta,
-                      DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-                      DEFAULT_EVENT_IDLE_TIMEOUT_MS,
-                    );
+                       DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
+                       DEFAULT_EVENT_IDLE_TIMEOUT_MS,
+                       requestAbortController.signal,
+                     );
+
                     const safeCollect = collectPromise.catch((err: unknown) => ({ __error: err }));
                     activeClient.session.prompt(promptParams).catch((err: unknown) => logDebug('Prompt error:', toErrorMessage(err)));
                     collected = (await safeCollect) as Record<string, unknown>;
@@ -597,147 +738,191 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 break;
               }
 
-              const collectedR = asRecord(collected);
-              // NOTE: success and __error shapes are mutually exclusive here —
-              // the fallback branch above stores content (no __error) while
-              // transport exceptions store __error only — so this recovery poll
-              // must always run regardless of fallbackServed.
-              if (collected && collectedR['__error']) {
-                logDebug('SSE collect error, falling back to polling', {
-                  sessionId,
-                  error: toErrorMessage(collectedR['__error']),
-                });
-                // The collect error itself may be the free-limit signal.
-                if (!fallbackToProxy) engageProxyFallback(collectedR['__error']);
-                const { content, reasoning, error } = await activePollForAssistantResponse(
-                  sessionId as string,
-                  REQUEST_TIMEOUT_MS,
-                );
-                if (error && !content && !reasoning) {
-                  const er = asRecord(error);
-                  sendDelta(
-                    `[Proxy Error] ${String(er['name'] ?? 'OpenCodeError')}: ${String(asRecord(er['data'])['message'] ?? (er['message'] as string) ?? 'Unknown error')}`,
-                  );
-                } else {
-                  if (reasoning) sendDelta(reasoning, true);
-                  if (content) sendDelta(content, false);
-                }
-              } else if (collected && collectedR['noData']) {
-                logDebug('Fallback to polling (stream)', { sessionId });
-                const { content, reasoning, error } = await activePollForAssistantResponse(
-                  sessionId as string,
-                  REQUEST_TIMEOUT_MS,
-                );
-                if (error && !content && !reasoning) {
-                  const er = asRecord(error);
-                  sendDelta(
-                    `[Proxy Error] ${String(er['name'] ?? 'OpenCodeError')}: ${String(asRecord(er['data'])['message'] ?? (er['message'] as string) ?? 'Unknown error')}`,
-                  );
-                } else {
-                  if (reasoning) sendDelta(reasoning, true);
-                  if (content) sendDelta(content, false);
-                }
-              } else if (collected && collectedR['idleTimeout']) {
-                logDebug('SSE idle timeout, polling for completion', { sessionId });
-                const { content, reasoning, error } = await activePollForAssistantResponse(
-                  sessionId as string,
-                  REQUEST_TIMEOUT_MS,
-                );
-                if (error && !content && !reasoning) {
-                  const er = asRecord(error);
-                  sendDelta(
-                    `[Proxy Error] ${String(er['name'] ?? 'OpenCodeError')}: ${String(asRecord(er['data'])['message'] ?? (er['message'] as string) ?? 'Unknown error')}`,
-                  );
-                } else {
-                  const remainingReasoning =
-                    reasoning && reasoning.startsWith(rawStreamedReasoning)
-                      ? reasoning.slice(rawStreamedReasoning.length)
-                      : reasoning;
-                  const remainingContent =
-                    content && content.startsWith(rawStreamedContent)
-                      ? content.slice(rawStreamedContent.length)
-                      : content;
-                  if (remainingReasoning) sendDelta(remainingReasoning, true);
-                  if (remainingContent) sendDelta(remainingContent, false);
-                }
-              }
+                const collectedR = asRecord(collected);
+                if (clientDisconnected || collectedR['cancelled']) {
+                  if (sessionId) {
+                     try {
+                       await activeClient.session.delete({ path: { id: sessionId } });
+                       disconnectedSessionCleaned = true;
+                     } catch (error: unknown) {
 
-              if (
-                collected &&
-                !fallbackServed &&
-                !streamedContent &&
-                !streamedReasoning &&
-                ((collectedR['reasoning'] as string) || (collectedR['content'] as string))
-              ) {
-                if (collectedR['reasoning']) sendDelta(String(collectedR['reasoning']), true);
-                if (collectedR['content']) sendDelta(String(collectedR['content']), false);
-              }
-
-              if (!fallbackServed && !streamedContent && !streamedReasoning) {
-                logDebug('SSE returned empty, falling back to polling', { sessionId });
-                const { content, reasoning, error } = await activePollForAssistantResponse(
-                  sessionId as string,
-                  REQUEST_TIMEOUT_MS,
-                );
-                if (error && !content && !reasoning) {
-                  const er = asRecord(error);
-                  sendDelta(
-                    `[Proxy Error] ${String(er['name'] ?? 'OpenCodeError')}: ${String(asRecord(er['data'])['message'] ?? (er['message'] as string) ?? 'Unknown error')}`,
-                  );
-                } else {
-                  if (reasoning) sendDelta(reasoning, true);
-                  if (content) sendDelta(content, false);
+                      logDebug('Failed to cleanup disconnected chat session', { sessionId, error: toErrorMessage(error) });
+                    }
+                  }
+                  return;
                 }
-              } else if (streamedReasoning && !streamedContent) {
-                logDebug('Reasoning streamed but no content, reconciling from snapshot', { sessionId });
-                const snapshot = await activePollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS).catch(
-                  () => null,
-                );
-                if (snapshot && snapshot.content) {
-                  const remainingContent = rawStreamedContent
-                    ? snapshot.content.slice(rawStreamedContent.length)
-                    : snapshot.content;
-                  if (remainingContent) sendDelta(remainingContent, false);
+                if (collectedR['error'] != null) throw collectedR['error'];
+                if (collectedR['__error']) {
+                  logDebug('SSE collect error, falling back to polling', {
+                    sessionId,
+                    error: toErrorMessage(collectedR['__error']),
+                  });
+                  if (!fallbackToProxy) engageProxyFallback(collectedR['__error']);
+                  const snapshot = await recoverSnapshot(collectedR['__error']);
+                  if (snapshot) {
+                    polledSnapshot = snapshot;
+                    replaySnapshot(snapshot);
+                  }
+                } else if (collectedR['noData']) {
+                  logDebug('Fallback to polling (stream)', { sessionId });
+                  const snapshot = await recoverSnapshot();
+                  if (snapshot) {
+                    polledSnapshot = snapshot;
+                    replaySnapshot(snapshot);
+                  }
+                } else if (collectedR['idleTimeout']) {
+                  logDebug('SSE idle timeout, polling for completion', { sessionId });
+                  const snapshot = await recoverSnapshot();
+                  if (snapshot) {
+                    polledSnapshot = snapshot;
+                    replaySnapshot(snapshot);
+                  }
                 }
-              }
 
-              // Flush held buffers from the stream parsers and filters before final batch parse.
+                if (
+                  collected &&
+                  !fallbackServed &&
+                  !streamedContent &&
+                  !streamedReasoning &&
+                  ((collectedR['reasoning'] as string) || (collectedR['content'] as string))
+                ) {
+                  replaySnapshot({ content: String(collectedR['content'] ?? ''), reasoning: String(collectedR['reasoning'] ?? ''), error: null });
+                }
+
+                const hasValidTerminal = Boolean(
+                  collected &&
+                  !collectedR['__error'] &&
+                  !collectedR['noData'] &&
+                  !collectedR['idleTimeout'] &&
+                  !collectedR['cancelled'] &&
+                  (rawStreamedContent || rawStreamedReasoning || streamedToolCalls.length > 0 || collectedR['content'] || collectedR['reasoning']),
+                );
+
+                if (!fallbackServed && !rawStreamedContent && !rawStreamedReasoning && !hasValidTerminal) {
+                  logDebug('SSE returned empty, falling back to polling', { sessionId });
+                  const snapshot = await recoverSnapshot();
+                  if (snapshot) {
+                    polledSnapshot = snapshot;
+                    replaySnapshot(snapshot);
+                  }
+                } else if (streamedReasoning && !streamedContent) {
+                  logDebug('Reasoning streamed but no content, reconciling from snapshot', { sessionId });
+                  const snapshot = await recoverSnapshot();
+                  if (snapshot) {
+                    polledSnapshot = snapshot;
+                    const remainingContent = unsentSuffix(snapshot.content, rawStreamedContent);
+                    if (remainingContent) sendDelta(remainingContent, false);
+                  }
+                }
+
+                if (externalToolRegistry.length > 0 && !hasValidTerminal && !snapshotPolled) {
+                  const snapshot = await recoverSnapshot();
+                  if (snapshot) {
+                    polledSnapshot = snapshot;
+                    replaySnapshot(snapshot);
+                  }
+                }
+
+
               const flushedReasoningCalls = parseReasoningToolCalls.flush ? parseReasoningToolCalls.flush() : [];
               const flushedContentCalls = parseContentToolCalls.flush ? parseContentToolCalls.flush() : [];
               const flushedReasoningText = filterReasoningDelta.flush ? filterReasoningDelta.flush() : '';
               const flushedContentText = filterContentDelta.flush ? filterContentDelta.flush() : '';
-              const finalReasoningText = rawStreamedReasoning + flushedReasoningText;
-              const finalContentText = rawStreamedContent + flushedContentText;
-
-              const parseStreamedToolCalls = (): FinalToolCall[] => {
-                if (externalToolRegistry.length === 0) return [];
-                const perChannel = [
-                  ...flushedReasoningCalls,
-                  ...flushedContentCalls,
-                  ...parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText, finalContentText),
-                ];
-                if (perChannel.length > 0) return perChannel;
-                return parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText + finalContentText);
-              };
-
-              let parsedToolCalls: FinalToolCall[] =
-                streamedToolCalls.length > 0 ? streamedToolCalls : parseStreamedToolCalls();
-              if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
-                const forcedResponse = await requestForcedChatToolCall();
-                if (forcedResponse) {
-                  parsedToolCalls = parseExternalToolCallsFromText(
-                    externalToolRegistry,
-                    forcedResponse['reasoning'] as string,
-                    forcedResponse['content'] as string,
-                  );
-                }
+              if (!shouldBufferExternalStream) {
+                appendFilteredDelta(flushedReasoningText, true);
+                appendFilteredDelta(flushedContentText, false);
+                writeVisibleDelta(flushedReasoningText, true);
+                writeVisibleDelta(flushedContentText, false);
+              } else {
+                const visible = stripExternalToolCallMarkupFromJoinedText(
+                  externalToolRegistry,
+                  rawStreamedReasoning,
+                  rawStreamedContent,
+                );
+                streamedReasoning = visible.reasoning;
+                streamedContent = visible.content;
               }
-              const { validCalls: validatedStreamedToolCalls } = finalizeValidatedToolCalls(
-                parsedToolCalls,
-                externalToolRegistry,
-              );
-              const finalStreamedToolCalls = validatedStreamedToolCalls;
-              if (finalStreamedToolCalls.length > 0 && streamedToolCalls.length === 0) {
+
+              const snapshotReasoning = polledSnapshot?.reasoning ?? (typeof collectedR['reasoning'] === 'string' ? collectedR['reasoning'] as string : rawStreamedReasoning);
+              const snapshotContent = polledSnapshot?.content ?? (typeof collectedR['content'] === 'string' ? collectedR['content'] as string : rawStreamedContent);
+              const parseJoined = (reasoning: string, content: string): FinalToolCall[] =>
+                externalToolRegistry.length > 0
+                  ? parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content)
+                  : [];
+              const streamSource = [
+                [snapshotReasoning, snapshotContent],
+                [rawStreamedReasoning, rawStreamedContent]
+              ];
+              let parsedToolCalls: FinalToolCall[] = externalToolRegistry.length > 0
+                ? mergeToolCallArtifacts(
+                    streamedToolCalls,
+                    flushedReasoningCalls,
+                    flushedContentCalls,
+                    parseJoined(snapshotReasoning, snapshotContent),
+                    parseJoined(rawStreamedReasoning, rawStreamedContent),
+                  )
+                : [];
+              let finalStreamedToolCalls: FinalToolCall[];
+              try {
+                assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource);
+                if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                  const forcedResponse = await requestForcedChatToolCall();
+                  if (forcedResponse) {
+                    const forcedReasoning = typeof forcedResponse['reasoning'] === 'string' ? forcedResponse['reasoning'] as string : '';
+                    const forcedContent = typeof forcedResponse['content'] === 'string' ? forcedResponse['content'] as string : '';
+                    parsedToolCalls = mergeToolCallArtifacts(parsedToolCalls, parseJoined(forcedReasoning, forcedContent));
+                    assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [forcedReasoning, forcedContent]);
+                  }
+                }
+                finalStreamedToolCalls = finalizeStreamToolCalls(
+                  parsedToolCalls,
+                  externalToolRegistry,
+                  externalToolChoice,
+                  streamSource,
+                  parallelToolCalls,
+                ) as unknown as FinalToolCall[];
+              } catch (toolError) {
+                const toolCode = (toolError as Error & { code?: string }).code;
+                const failClosedCodes = [
+                  'parallel_external_tool_calls',
+                  'external_tool_choice_none',
+                  'external_tool_choice_required',
+                  'invalid_external_tool_call',
+                  'external_tool_policy_blocked',
+                  'external_tool_choice_mismatch',
+                  'duplicate_external_tool_call_id',
+                  'malformed_external_tool_call',
+                ];
+                if (toolCode && failClosedCodes.includes(toolCode)) {
+                  try {
+                    if (sessionId) await activeClient.session.delete({ path: { id: sessionId } });
+                  } catch (_cleanupError) {
+                    void _cleanupError;
+                  }
+                  if (keepaliveInterval) clearInterval(keepaliveInterval);
+                  keepaliveInterval = null;
+                  const toolMessage = toErrorMessage(toolError);
+                  if (!res.headersSent) {
+                    res.status(502).json({
+                      error: {
+                        message: toolMessage,
+                        type: 'server_error',
+                        code: toolCode,
+                      },
+                    });
+                  } else if (!res.destroyed) {
+                    res.write(`data: ${JSON.stringify({ error: { message: toolMessage, type: 'server_error', code: toolCode } })}\n\n`);
+                    res.end();
+                  }
+                  return;
+                }
+                throw toolError;
+              }
+              if (shouldBufferExternalStream) {
+                writeVisibleDelta(streamedReasoning, true);
+                writeVisibleDelta(streamedContent, false);
+              }
+              if (finalStreamedToolCalls.length > 0) {
                 const toolCallDeltas = finalStreamedToolCalls.map((toolCall, index) => ({
                   index,
                   id: toolCall.id,
@@ -762,6 +947,10 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                     ],
                   })}\n\n`,
                 );
+              }
+
+              if (!streamedReasoning.trim() && !streamedContent.trim() && finalStreamedToolCalls.length === 0) {
+                throw new Error('Upstream returned no assistant data');
               }
 
               if (keepaliveInterval) clearInterval(keepaliveInterval);
@@ -822,7 +1011,13 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 try {
                   await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
                   logDebug('Prompt sent', { sessionId, ms: Date.now() - attemptStart, attempt });
-                  const collected = await activePollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
+                   const collected = await activePollForAssistantResponse(
+                     sessionId as string,
+                     REQUEST_TIMEOUT_MS,
+                     undefined,
+                     requestAbortController.signal,
+                   );
+
                   content = collected.content || '';
                   reasoning = collected.reasoning || '';
                   error = collected.error || null;
@@ -843,8 +1038,16 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 }
                 break;
               }
-              if (error && !content && !reasoning) {
+              // Fail-closed: any backend error fails even when partial content exists.
+              // Returning partial text as success would hide the upstream failure and
+              // diverge from stream paths (which throw on snapshot.error). Retry above
+              // already covers the no-output transient case.
+              if (error != null) {
                 if (/^Request timeout after/.test(toErrorMessage(error))) throw error;
+                const normalizedDiscovery = normalizeBackendError(error);
+                if (normalizedDiscovery.statusCode === 503 && normalizedDiscovery.code === 'tool_discovery_unavailable') {
+                  throw normalizedDiscovery;
+                }
                 const er = asRecord(error);
                 const ed = asRecord(er['data']);
                 res.status(502).json({
@@ -855,21 +1058,65 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 });
                 return;
               }
-              let parsedToolCalls: FinalToolCall[] =
-                externalToolRegistry.length > 0
-                  ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
-                  : [];
-              if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
-                const forcedResponse = await requestForcedChatToolCall();
-                if (forcedResponse) {
-                  content = String(forcedResponse['content'] ?? content);
-                  reasoning = String(forcedResponse['reasoning'] ?? reasoning);
-                  parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
-                }
-              }
-              const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
-              const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
-              const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
+               let parsedToolCalls: FinalToolCall[] = externalToolRegistry.length > 0
+                 ? parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content)
+                 : [];
+               let validatedToolCalls: FinalToolCall[] = [];
+               try {
+                 assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
+                 if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                   const forcedResponse = await requestForcedChatToolCall();
+                   if (forcedResponse) {
+                     content = String(forcedResponse['content'] ?? content);
+                     reasoning = String(forcedResponse['reasoning'] ?? reasoning);
+                     parsedToolCalls = parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content);
+                     assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
+                   }
+                 }
+                 validatedToolCalls = finalizeStreamToolCalls(
+                   parsedToolCalls,
+                   externalToolRegistry,
+                   externalToolChoice,
+                   [reasoning, content],
+                   parallelToolCalls,
+                 ) as unknown as FinalToolCall[];
+               } catch (toolError) {
+                 const toolCode = (toolError as Error & { code?: string }).code;
+                 const failClosedCodes = [
+                   'parallel_external_tool_calls',
+                   'external_tool_choice_none',
+                   'external_tool_choice_required',
+                   'invalid_external_tool_call',
+                   'external_tool_policy_blocked',
+                   'external_tool_choice_mismatch',
+                   'duplicate_external_tool_call_id',
+                   'malformed_external_tool_call',
+                 ];
+                 if (toolCode && failClosedCodes.includes(toolCode)) {
+                   try {
+                     if (sessionId) await activeClient.session.delete({ path: { id: sessionId } });
+                   } catch (_cleanupError) {
+                     void _cleanupError;
+                   }
+                   res.status(502).json({
+                     error: {
+                       message: toErrorMessage(toolError),
+                       type: 'server_error',
+                       code: toolCode,
+                     },
+                   });
+                   return;
+                 }
+                 throw toolError;
+               }
+               const joinedSafe = stripExternalToolCallMarkupFromJoinedText(
+                 externalToolRegistry,
+                 reasoning,
+                 content,
+                 true,
+               );
+               const safeContent = joinedSafe.content;
+               const safeReasoning = joinedSafe.reasoning;
 
               const promptTokens = Math.ceil((fullPromptText || '').length / 4);
               const completionTokensCalc = Math.ceil((content || '').length / 4);
@@ -921,19 +1168,31 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               const transformed = transformUpstreamError(error);
               res.status(transformed.statusCode).json(transformed.error);
             } else if (!res.destroyed) {
-              res.write(`data: ${JSON.stringify({ error: { message: toErrorMessage(error) } })}\n\n`);
+              const transformed = transformUpstreamError(error);
+              res.write(`data: ${JSON.stringify({ error: transformed.error })}\n\n`);
               res.end();
             }
-            if (sessionId) {
-              try {
-                await activeClient.session.delete({ path: { id: sessionId } });
-              } catch (e: unknown) {
+             if (sessionId) {
+               try {
+                 await activeClient.session.delete({ path: { id: sessionId } });
+                 if (clientDisconnected) disconnectedSessionCleaned = true;
+               } catch (e: unknown) {
+
                 console.error('[Proxy] Failed to cleanup session on error:', toErrorMessage(e));
               }
             }
-          } finally {
-            if (keepaliveInterval) clearInterval(keepaliveInterval);
-            const es = eventStream as unknown as { close?: unknown } | null;
+           } finally {
+             removeClientCloseListener();
+             if (clientDisconnected && sessionId && !disconnectedSessionCleaned) {
+               try {
+                 await activeClient.session.delete({ path: { id: sessionId } });
+               } catch (error: unknown) {
+                 logDebug('Failed to cleanup disconnected chat session', { sessionId, error: toErrorMessage(error) });
+               }
+             }
+             if (keepaliveInterval) clearInterval(keepaliveInterval);
+             const es = eventStream as unknown as { close?: unknown } | null;
+
             if (es && typeof es['close'] === 'function') {
               (es['close'] as () => void)();
             }

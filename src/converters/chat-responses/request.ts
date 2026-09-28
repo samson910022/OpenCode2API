@@ -42,7 +42,7 @@ function collectReasoningText(item: Record<string, unknown>): string {
 }
 
 /** Mirrors Go qualifyResponsesNamespaceToolName (tools.go:268-280). */
-function qualifyToolName(namespace: unknown, child: unknown): string {
+export function qualifyToolName(namespace: unknown, child: unknown): string {
     const ns = str(namespace).trim();
     const name = str(child).trim();
     if (!name || !ns || name.startsWith('mcp__')) return name;

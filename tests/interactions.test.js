@@ -239,6 +239,25 @@ describe('POST /v1beta/interactions', () => {
         expect(res.text).not.toContain('<function_calls>');
     });
 
+    test('tool discovery unavailable fails closed instead of prompting without overrides', async () => {
+        const app = createApp(baseConfig({})).app;
+        sdkMocks.toolIds.mockRejectedValueOnce(new Error('discovery down'));
+        const res = await request(app).post('/v1beta/interactions').send({
+            model: 'opencode/kimi-k2.5',
+            input: 'hi',
+        });
+        expect(res.statusCode).toBe(503);
+        expect(res.body).toEqual({
+            error: {
+                message: 'Tool discovery unavailable; backend tool IDs could not be verified',
+                type: 'tool_discovery_unavailable',
+                code: 'tool_discovery_unavailable',
+            },
+        });
+        expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
+        expect(sdkMocks.sessionPrompt).not.toHaveBeenCalled();
+    });
+
     test('free-limit engages fallback and retries via proxy within the same request', async () => {
         sdkMocks.sessionPrompt.mockRejectedValueOnce({
             name: 'APIError',
@@ -267,5 +286,80 @@ describe('POST /v1beta/interactions', () => {
         expect((await request(app).post('/v1beta/interactions').send({ model: 'm', input: 'hi' })).statusCode).toBe(401);
         const ok = await request(app).post('/v1beta/interactions').set('Authorization', 'Bearer s3cret').send({ model: 'opencode/kimi-k2.5', input: 'hi' });
         expect(ok.statusCode).toBe(200);
+    });
+    test('stream google_search emits ordered steps without DONE', async () => {
+        const app = createApp(baseConfig({})).app;
+        const res = await request(app).post('/v1beta/interactions').send({ model: 'opencode/kimi-k2.5', input: 'Latest PostgreSQL release?', tools: [{ type: 'google_search' }], stream: true });
+        expect(res.statusCode).toBe(200);
+        expect(res.text).toContain('interaction.created');
+        expect(res.text).toContain('step.delta');
+        expect(res.text).toContain('google_search_call');
+        expect(res.text).toContain('google_search_result');
+        expect(res.text).toContain('model_output');
+        expect(res.text).toContain('interaction.completed');
+        expect(res.text).not.toContain('[DONE]');
+        const idxCreated = res.text.indexOf('interaction.created');
+        const idxDelta = res.text.indexOf('step.delta');
+        const idxCall = res.text.indexOf('google_search_call');
+        const idxResult = res.text.indexOf('google_search_result');
+        const idxOutput = res.text.indexOf('model_output');
+        const idxCompleted = res.text.indexOf('interaction.completed');
+        expect(idxCreated).toBeGreaterThanOrEqual(0);
+        expect(idxCreated).toBeLessThan(idxDelta);
+        expect(idxDelta).toBeLessThan(idxCompleted);
+        expect(idxCompleted).toBeLessThan(idxCall);
+        expect(idxCall).toBeLessThan(idxResult);
+        expect(idxResult).toBeLessThan(idxOutput);
+        expect(sdkMocks.eventSubscribe).not.toHaveBeenCalled();
+    });
+    test('stream error surfaces as error event without DONE or completed', async () => {
+        const app = createApp(baseConfig({})).app;
+        sdkMocks.sessionPrompt.mockRejectedValueOnce(new Error('backend down'));
+        const res = await request(app).post('/v1beta/interactions').send({ model: 'opencode/kimi-k2.5', input: 'hi', stream: true });
+        expect(res.statusCode).toBe(200);
+        expect(res.text).toContain('interaction.created');
+        expect(res.text).toContain('"type":"error"');
+        expect(res.text).not.toContain('interaction.completed');
+        expect(res.text).not.toContain('[DONE]');
+    });
+    test('function tools stay rejected without touching backend', async () => {
+        const app = createApp(baseConfig({})).app;
+        jest.clearAllMocks();
+        sdkMocks.toolIds.mockResolvedValue({ data: ['websearch', 'webfetch'] });
+        const res = await request(app).post('/v1beta/interactions').send({ model: 'opencode/kimi-k2.5', input: 'hi', tools: [{ type: 'function', function: { name: 'x' } }] });
+        expect(res.statusCode).toBe(400);
+        expect(res.body.error.type).toBe('invalid_request_error');
+        expect(JSON.stringify(res.body)).toContain('google_search');
+        expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
+        expect(sdkMocks.sessionPrompt).not.toHaveBeenCalled();
+        expect(sdkMocks.sessionMessages).not.toHaveBeenCalled();
+    });
+    test('stream previous_interaction_id reuses stored session', async () => {
+        const app = createApp(baseConfig({})).app;
+        const first = await request(app).post('/v1beta/interactions').send({ model: 'opencode/kimi-k2.5', input: 'hi' });
+        expect(first.statusCode).toBe(200);
+        jest.clearAllMocks();
+        sdkMocks.toolIds.mockResolvedValue({ data: ['websearch', 'webfetch'] });
+        const second = await request(app).post('/v1beta/interactions').send({ model: 'opencode/kimi-k2.5', input: 'follow-up', previous_interaction_id: first.body.id, stream: true });
+        expect(second.statusCode).toBe(200);
+        expect(second.text).toContain('interaction.completed');
+        expect(second.text).not.toContain('[DONE]');
+        expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
+    });
+    test('stream store false deletes owned session but keeps shared parent', async () => {
+        const app = createApp(baseConfig({})).app;
+        jest.clearAllMocks();
+        sdkMocks.toolIds.mockResolvedValue({ data: ['websearch', 'webfetch'] });
+        const ephemeral = await request(app).post('/v1beta/interactions').send({ model: 'opencode/kimi-k2.5', input: 'hi', stream: true, store: false });
+        expect(ephemeral.statusCode).toBe(200);
+        expect(sdkMocks.sessionDelete).toHaveBeenCalled();
+        const first = await request(app).post('/v1beta/interactions').send({ model: 'opencode/kimi-k2.5', input: 'hi' });
+        expect(first.statusCode).toBe(200);
+        jest.clearAllMocks();
+        sdkMocks.toolIds.mockResolvedValue({ data: ['websearch', 'webfetch'] });
+        const second = await request(app).post('/v1beta/interactions').send({ model: 'opencode/kimi-k2.5', input: 'follow-up', previous_interaction_id: first.body.id, stream: true, store: false });
+        expect(second.statusCode).toBe(200);
+        expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
+        expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
     });
 });

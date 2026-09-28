@@ -1,5 +1,4 @@
-import { EXTERNAL_TOOL_PREFIX } from './contracts.js';
-import { findExternalToolByName } from './registry.js';
+import { resolveExternalToolName } from './registry.js';
 import type { ExternalToolEntry } from './registry.js';
 
 /** String shorthand accepted by Chat Completions (`auto` / `none` / `required`). */
@@ -15,7 +14,7 @@ export interface ChatNestedFunctionToolChoice {
 
 /** Responses API object shape: `{ type:'function', name }` (flat). */
 export interface ChatFlatFunctionToolChoice {
-  type: 'function';
+  type: 'function' | 'custom';
   name?: unknown;
   function?: unknown;
   [key: string]: unknown;
@@ -86,52 +85,107 @@ function asRegistryList(registry: unknown): ExternalToolEntry[] {
   return Array.isArray(registry) ? (registry as ExternalToolEntry[]) : [];
 }
 
-export function normalizeExternalToolChoice(toolChoice: unknown, registry: unknown): NormalizedChoice {
+export interface ToolChoicePreflightSuccess {
+  ok: true;
+  normalized: NormalizedChoice;
+}
+
+export interface ToolChoicePreflightFailure {
+  ok: false;
+  code: string;
+  message: string;
+}
+
+export type ToolChoicePreflightResult = ToolChoicePreflightSuccess | ToolChoicePreflightFailure;
+
+function preflightFailure(code: string, message: string): ToolChoicePreflightFailure {
+  return { ok: false, code, message };
+}
+
+function exactToolForName(registry: ExternalToolEntry[], name: unknown, namespace?: unknown): ExternalToolEntry | null {
+  return resolveExternalToolName(registry, name, namespace);
+}
+
+export function preflightExternalToolChoice(toolChoice: unknown, registry: unknown): ToolChoicePreflightResult {
   const list = asRegistryList(registry);
-  if (!toolChoice || !Array.isArray(registry) || list.length === 0) {
-    return { mode: 'auto', requiredTool: null };
+  const hasExternalSurface = list.some((tool) => tool.enabled !== false);
+  if (toolChoice === undefined) {
+    return { ok: true, normalized: { mode: 'auto', requiredTool: null } };
   }
-  if (toolChoice === 'auto' || toolChoice === 'none') {
-    return { mode: toolChoice, requiredTool: null };
-  }
-  if (toolChoice === 'required') {
-    return { mode: 'required', requiredTool: null };
-  }
-  if (toolChoice && typeof toolChoice === 'object' && !Array.isArray(toolChoice)) {
-    const candidate = toolChoice as UnknownObjectToolChoice & Record<string, unknown>;
-    // Anthropic Messages shape: { type: 'auto' | 'any' | 'tool' | 'none', name? }.
-    if (typeof candidate['type'] === 'string' && candidate['function'] === undefined) {
-      const t = String(candidate['type']).toLowerCase();
-      if (t === 'auto') return { mode: 'auto', requiredTool: null };
-      if (t === 'none') return { mode: 'none', requiredTool: null };
-      if (t === 'any') return { mode: 'required', requiredTool: null };
-      if (t === 'tool' && candidate['name']) {
-        const requested = candidate['name'] as string;
-        const mappedTool = findExternalToolByName(list, requested);
-        return {
-          mode: 'required',
-          requiredTool: mappedTool?.namespacedName || `${EXTERNAL_TOOL_PREFIX}${String(requested)}`
-        };
-      }
-      if (t === 'tool') return { mode: 'required', requiredTool: null };
-    }
-    // Chat Completions sends { type:'function', function:{ name } }; the Responses API sends
-    // { type:'function', name }. Accept both so a forced tool choice is not silently ignored.
-    const fnRecord: unknown = candidate['function'];
-    const fnName: unknown =
-      fnRecord && typeof fnRecord === 'object' && !Array.isArray(fnRecord)
-        ? (fnRecord as Record<string, unknown>)['name']
-        : undefined;
-    const requestedName: unknown = fnName || candidate['name'];
-    if (candidate['type'] === 'function' && requestedName) {
-      const mappedTool = findExternalToolByName(list, requestedName);
+  if (typeof toolChoice === 'string') {
+    if (toolChoice === 'auto' || toolChoice === 'none' || toolChoice === 'required') {
       return {
-        mode: 'required',
-        requiredTool: mappedTool?.namespacedName || `${EXTERNAL_TOOL_PREFIX}${String(requestedName)}`
+        ok: true,
+        normalized: { mode: toolChoice === 'required' && !hasExternalSurface ? 'auto' : toolChoice, requiredTool: null },
       };
     }
+    return preflightFailure('invalid_tool_choice', `Invalid tool_choice: ${toolChoice}`);
   }
-  return { mode: 'auto', requiredTool: null };
+  if (!toolChoice || typeof toolChoice !== 'object' || Array.isArray(toolChoice)) {
+    return preflightFailure('invalid_tool_choice', 'tool_choice must be a valid string or object.');
+  }
+
+  const candidate = toolChoice as UnknownObjectToolChoice & Record<string, unknown>;
+  const type = candidate['type'];
+  if (typeof type !== 'string') {
+    return preflightFailure('invalid_tool_choice', 'tool_choice.type is required.');
+  }
+  if (type === 'auto' || type === 'none' || type === 'required') {
+    return {
+      ok: true,
+      normalized: { mode: type === 'required' && !hasExternalSurface ? 'auto' : type, requiredTool: null },
+    };
+  }
+  if (type === 'any') {
+    return { ok: true, normalized: { mode: hasExternalSurface ? 'required' : 'auto', requiredTool: null } };
+  }
+
+  let requestedName: unknown;
+  if (type === 'tool') {
+    requestedName = candidate['name'];
+  } else if (type === 'function' || type === 'custom') {
+    // `custom` names a freeform declaration, which the request converters expose
+    // as a function over the wrapped {input: string} schema — so it selects the
+    // same registry entry a `function` choice would.
+    const hasFunction = Object.prototype.hasOwnProperty.call(candidate, 'function');
+    const hasDirectName = Object.prototype.hasOwnProperty.call(candidate, 'name');
+    if (hasFunction) {
+      const fn = candidate['function'];
+      if (!fn || typeof fn !== 'object' || Array.isArray(fn)) {
+        return preflightFailure('invalid_tool_choice', 'tool_choice.function must contain a tool name.');
+      }
+      const fnRecord = fn as Record<string, unknown>;
+      const hasNestedName = Object.prototype.hasOwnProperty.call(fnRecord, 'name');
+      if (!hasNestedName || typeof fnRecord['name'] !== 'string' || !fnRecord['name']) {
+        return preflightFailure('invalid_tool_choice', 'tool_choice.function.name is required.');
+      }
+      if (hasDirectName && candidate['name'] !== fnRecord['name']) {
+        return preflightFailure('invalid_tool_choice', 'tool_choice contains conflicting tool names.');
+      }
+      requestedName = fnRecord['name'];
+    } else {
+      requestedName = hasDirectName ? candidate['name'] : undefined;
+    }
+  } else {
+    return preflightFailure('invalid_tool_choice', `Unsupported tool_choice.type: ${type}`);
+  }
+
+  if (typeof requestedName !== 'string' || !requestedName) {
+    return preflightFailure('invalid_tool_choice', 'tool_choice.name is required for a specific tool choice.');
+  }
+  const tool = exactToolForName(list, requestedName, candidate['namespace']);
+  if (!tool) {
+    return preflightFailure('unknown_tool', `tool_choice references an unknown tool: ${requestedName}`);
+  }
+  if (tool.enabled === false) {
+    return preflightFailure('tool_disabled', `tool_choice references a disabled tool: ${requestedName}`);
+  }
+  return { ok: true, normalized: { mode: 'required', requiredTool: tool.namespacedName } };
+}
+
+export function normalizeExternalToolChoice(toolChoice: unknown, registry: unknown): NormalizedChoice {
+  const result = preflightExternalToolChoice(toolChoice, registry);
+  return result.ok ? result.normalized : { mode: 'auto', requiredTool: null };
 }
 
 export function buildExternalToolsPrompt(registry: unknown, toolChoice: unknown = null): string {
@@ -197,10 +251,10 @@ export function buildExternalToolsReminder(registry: unknown, toolChoice: unknow
 }
 
 export function buildToolExposure(registry: unknown, toolChoice: unknown = null): ToolExposure {
-  const normalizedChoice = normalizeExternalToolChoice(toolChoice, registry);
   const exposedTools: ExternalToolEntry[] = Array.isArray(registry)
     ? (registry as ExternalToolEntry[]).filter((tool) => tool.enabled !== false)
     : [];
+  const normalizedChoice = normalizeExternalToolChoice(toolChoice, exposedTools);
   return {
     tools: exposedTools,
     toolChoice: normalizedChoice,

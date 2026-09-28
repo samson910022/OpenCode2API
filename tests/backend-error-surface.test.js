@@ -20,7 +20,7 @@ const sdkMocks = {
         data: { providers: [{ id: 'opencode', models: { 'kimi-k2.5': { name: 'Kimi' }, 'muse-spark-1.3-contributor-free': { name: 'Muse Spark' } } }] }
     })),
     configUpdate: jest.fn(async () => ({})),
-    toolIds: jest.fn(async () => ({ data: [] })),
+    toolIds: jest.fn(async () => ({ data: ['web_fetch', 'filesystem', 'bash'] })),
     sessionCreate: jest.fn(async () => ({ data: { id: 'err-session' } })),
     sessionPrompt: jest.fn(async () => ({ data: { parts: [] } })),
     sessionMessages: jest.fn(async () => ([
@@ -67,11 +67,79 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
 }));
 
 const { createApp } = await import('../src/proxy.js');
+const { createInvalidRequestError, transformUpstreamError } = await import('../src/errors/upstream.js');
+
+const BACKEND_BAD_REQUEST_ERROR = {
+    name: 'BadRequestError',
+    data: { message: '400: prompt rejected by the provider', statusCode: 400 }
+};
+
+describe('400 code passthrough', () => {
+    test('a proxy-authored 400 keeps its own code', () => {
+        expect(transformUpstreamError(createInvalidRequestError('bad tool', 'unsupported_tool_type'))).toEqual({
+            statusCode: 400,
+            error: { message: 'bad tool', type: 'invalid_request_error', code: 'unsupported_tool_type' }
+        });
+    });
+
+    test('a backend 400 never leaks the upstream class name as the wire code', () => {
+        expect(transformUpstreamError(BACKEND_BAD_REQUEST_ERROR)).toEqual({
+            statusCode: 400,
+            error: {
+                message: '400: prompt rejected by the provider',
+                type: 'invalid_request_error',
+                code: 'invalid_request_error'
+            }
+        });
+        // Same for an Error that merely *claims* a 400 without the proxy marker.
+        const unmarked = new Error('provider said no');
+        unmarked.statusCode = 400;
+        unmarked.code = 'BadRequestError';
+        expect(transformUpstreamError(unmarked).error.code).toBe('invalid_request_error');
+    });
+
+    test('responses surfaces a backend 400 as a generic invalid request', async () => {
+        const app = createApp({
+            PORT: 10000, API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000, DISABLE_TOOLS: true, DEBUG: false,
+            RETRY_MAX_RETRIES: 0
+        }).app;
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            { info: { role: 'assistant', finish: 'stop', error: BACKEND_BAD_REQUEST_ERROR }, parts: [] }
+        ]);
+
+        const res = await request(app).post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/kimi-k2.5', input: 'hi' });
+
+        expect(res.statusCode).toBe(400);
+        expect(res.body.type).toBe('invalid_request_error');
+        expect(res.body.code).toBe('invalid_request_error');
+        expect(res.body.message).toContain('prompt rejected by the provider');
+        expect(JSON.stringify(res.body)).not.toContain('BadRequestError');
+    });
+});
 
 describe('POST /v1/responses backend plain-object error', () => {
     let app;
     beforeEach(() => {
         jest.clearAllMocks();
+        sdkMocks.sessionPrompt.mockReset();
+        sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [] } }));
+        sdkMocks.sessionMessages.mockReset();
+        sdkMocks.sessionMessages.mockImplementation(async () => ([
+            { info: { role: 'assistant', finish: 'stop', error: BACKEND_CREDITS_ERROR }, parts: [] }
+        ]));
+        sdkMocks.eventSubscribe.mockReset();
+        sdkMocks.eventSubscribe.mockImplementation(async () => ({
+            stream: (async function* () {
+                yield {
+                    type: 'message.updated',
+                    properties: { info: { sessionID: 'err-session', finish: 'stop', error: BACKEND_CREDITS_ERROR } }
+                };
+            })()
+        }));
         app = createApp({
             PORT: 10000, API_KEY: 'test-key',
             OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
@@ -107,6 +175,27 @@ describe('POST /v1/responses backend plain-object error', () => {
             .send({ model: 'opencode/kimi-k2.5', input: 'hi', stream: true });
         expect(res.text).toContain('Insufficient balance');
         expect(res.text).not.toContain('"Object"');
+    });
+
+    test('session.error is surfaced as a stream error', async () => {
+        sdkMocks.eventSubscribe.mockResolvedValueOnce({
+            stream: (async function* () {
+                yield {
+                    type: 'session.error',
+                    properties: {
+                        sessionID: 'err-session',
+                        error: { name: 'SessionError', data: { message: 'session failed' } }
+                    }
+                };
+            })()
+        });
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/kimi-k2.5', input: 'hi', stream: true });
+        expect(res.text).toContain('session failed');
+        expect(res.text).toContain('response.failed');
+        expect(res.text).not.toContain('response.completed');
     });
 
     test('messages non-stream uses transformed status/type, not hardcoded 502', async () => {
@@ -260,6 +349,76 @@ describe('POST /v1/responses backend plain-object error', () => {
                 .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
             expect(res.statusCode).toBe(502);
             expect(sdkMocks.sessionCreate.mock.calls.length).toBe(1);
+        });
+    });
+
+    describe('503 discovery and upstream errors', () => {
+        test('a proxy-authored discovery failure keeps 503 and its wire contract', async () => {
+            const { createToolDiscoveryUnavailableError } = await import('../src/errors/upstream.js');
+            expect(transformUpstreamError(createToolDiscoveryUnavailableError())).toEqual({
+                statusCode: 503,
+                error: {
+                    message: 'Tool discovery unavailable; backend tool IDs could not be verified',
+                    type: 'tool_discovery_unavailable',
+                    code: 'tool_discovery_unavailable'
+                }
+            });
+        });
+
+        test('an unmarked upstream 503 keeps 503 but never uses the discovery contract', () => {
+            expect(transformUpstreamError({
+                name: 'ServiceUnavailableError',
+                data: { message: '503: backend overloaded', statusCode: 503 }
+            })).toEqual({
+                statusCode: 503,
+                error: {
+                    message: '503: backend overloaded',
+                    type: 'server_error',
+                    code: 'server_error'
+                }
+            });
+        });
+
+        test('chat non-stream preserves a discovery 503 through the shared transformer', async () => {
+            const chatApp = createApp({
+                PORT: 10000, API_KEY: 'test-key',
+                OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+                REQUEST_TIMEOUT_MS: 5000, DISABLE_TOOLS: true, DEBUG: false,
+                RETRY_MAX_RETRIES: 0
+            }).app;
+            sdkMocks.toolIds.mockRejectedValueOnce(new Error('discovery down'));
+            sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [] } });
+            const res = await request(chatApp).post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
+            expect(res.statusCode).toBe(503);
+            expect(res.body).toEqual({
+                error: {
+                    message: 'Tool discovery unavailable; backend tool IDs could not be verified',
+                    type: 'tool_discovery_unavailable',
+                    code: 'tool_discovery_unavailable'
+                }
+            });
+            expect(sdkMocks.sessionPrompt).not.toHaveBeenCalled();
+        });
+
+        test('responses stream preserves a discovery 503 as response.failed', async () => {
+            const responsesApp = createApp({
+                PORT: 10000, API_KEY: 'test-key',
+                OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+                REQUEST_TIMEOUT_MS: 5000, DISABLE_TOOLS: true, DEBUG: false,
+                RETRY_MAX_RETRIES: 0
+            }).app;
+            sdkMocks.toolIds.mockRejectedValueOnce(new Error('discovery down'));
+            sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [] } });
+            const res = await request(responsesApp).post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', input: 'hi', stream: true });
+            expect(res.statusCode).toBe(200);
+            expect(res.text).toContain('"type":"response.failed"');
+            expect(res.text).toContain('"code":"tool_discovery_unavailable"');
+            expect(res.text).toContain('data: [DONE]');
+            expect(sdkMocks.sessionPrompt).not.toHaveBeenCalled();
         });
     });
 });

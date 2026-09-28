@@ -42,6 +42,8 @@ export interface ChatTool {
         name: string;
         description: string;
         parameters: unknown;
+        enabled?: unknown;
+        [key: string]: unknown;
     };
 }
 
@@ -154,6 +156,27 @@ export function anthropicError(type: string, message: string, statusCode = 400):
     return { statusCode, body: { type: 'error', error: { type, message } } };
 }
 
+function validateAnthropicToolChoice(toolChoice: unknown): string | null {
+    if (toolChoice === undefined) return null;
+    if (typeof toolChoice === 'string') {
+        return ['auto', 'none', 'required'].includes(toolChoice)
+            ? null
+            : 'tool_choice must be auto, none, or required';
+    }
+    if (!toolChoice || typeof toolChoice !== 'object' || Array.isArray(toolChoice)) {
+        return 'tool_choice must be an object';
+    }
+    const choice = toolChoice as { type?: unknown; name?: unknown };
+    const type = typeof choice.type === 'string' ? choice.type : '';
+    if (type === 'auto' || type === 'none' || type === 'any' || type === 'required') return null;
+    if (type === 'tool') {
+        return typeof choice.name === 'string' && choice.name.trim()
+            ? null
+            : 'tool_choice.name is required when type is "tool"';
+    }
+    return 'tool_choice.type is invalid';
+}
+
 export function validateMessagesRequest(body: unknown = {}): AnthropicErrorShape | null {
     if (!body || typeof body !== 'object') return anthropicError('invalid_request_error', 'request body must be an object');
     const req = body as AnthropicMessagesRequest;
@@ -163,6 +186,8 @@ export function validateMessagesRequest(body: unknown = {}): AnthropicErrorShape
     if (!Array.isArray(req.messages) || req.messages.length === 0) return anthropicError('invalid_request_error', 'messages array is required');
     const first = req.messages[0] as { role?: unknown } | null | undefined;
     if (first?.role !== 'user') return anthropicError('invalid_request_error', 'first message must use role "user"');
+    const toolChoiceError = validateAnthropicToolChoice(req.tool_choice);
+    if (toolChoiceError) return anthropicError('invalid_request_error', toolChoiceError);
     return null;
 }
 
@@ -275,21 +300,33 @@ export function anthropicMessagesToChatMessages(anthropicMessages: unknown = [])
             chatMessages.push(...ordered);
         }
     }
-    return chatMessages.filter((m) => m && (m.content || m.tool_calls));
+    return chatMessages.filter((m) => m && (m.content || m.tool_calls || m.role === 'tool'));
 }
 
 export function anthropicToolsToChatTools(tools: unknown): ChatTool[] {
     if (!Array.isArray(tools)) return [];
-    return (tools as Array<{ name?: unknown; description?: unknown; input_schema?: unknown } | null | undefined>)
-        .filter((t) => t && typeof t.name === 'string')
-        .map((t) => ({
-            type: 'function' as const,
-            function: {
-                name: (t as { name?: unknown }).name as string,
-                description: ((t as { description?: unknown }).description || '') as string,
-                parameters: ((t as { input_schema?: unknown }).input_schema || { type: 'object', properties: {} }) as unknown
+    return (tools as Array<Record<string, unknown> | null | undefined>)
+        .filter((t) => t && typeof t['name'] === 'string' && t['name'])
+        .map((t) => {
+            const definition = t as Record<string, unknown>;
+            const functionDefinition: Record<string, unknown> = {
+                name: definition['name'],
+                description: (definition['description'] || '') as string,
+                parameters: (definition['input_schema'] || { type: 'object', properties: {} }) as unknown,
+            };
+            // `enabled` is a declaration field. The `__proxy_*`/`x_proxy_*` family
+            // is reserved for the proxy's own metadata and is dropped here: it
+            // must never travel from an Anthropic tool body into the registry.
+            for (const key of ['enabled']) {
+                if (Object.prototype.hasOwnProperty.call(definition, key)) {
+                    functionDefinition[key] = definition[key];
+                }
             }
-        }));
+            return {
+                type: 'function' as const,
+                function: functionDefinition as ChatTool['function'],
+            };
+        });
 }
 
 export function anthropicToolChoiceToChat(toolChoice: unknown): ChatToolChoice | undefined {
@@ -299,9 +336,10 @@ export function anthropicToolChoiceToChat(toolChoice: unknown): ChatToolChoice |
     const t = String(choice.type || '').toLowerCase();
     if (t === 'auto') return 'auto';
     if (t === 'none') return 'none';
-    if (t === 'any') return 'required';
-    if (t === 'tool' && choice.name) return { type: 'function', function: { name: choice.name as string } };
-    if (t === 'tool') return 'required';
+    if (t === 'any' || t === 'required') return 'required';
+    if (t === 'tool' && typeof choice.name === 'string' && choice.name.trim()) {
+        return { type: 'function', function: { name: choice.name as string } };
+    }
     return undefined;
 }
 

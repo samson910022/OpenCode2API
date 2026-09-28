@@ -7,12 +7,12 @@ import path from 'path';
 import { createOpencodeClient } from '@opencode-ai/sdk';
 import type { OpencodeClient } from '@opencode-ai/sdk';
 import type { Application, Request, Response, NextFunction } from 'express';
-import { buildExternalToolRegistry, normalizeToolNameForMatch } from './tool-runtime/registry.js';
+import { buildExternalToolRegistry, findExternalToolByName, normalizeToolNameForMatch } from './tool-runtime/registry.js';
 import { resolveMaxRetries } from './retry/policy.js';
 import { buildToolExposure } from './tool-runtime/router.js';
 import { evaluateToolPolicy } from './tool-runtime/policy.js';
 import { validateToolCalls } from './tool-runtime/validator.js';
-import { stripFunctionCallMarkup } from './tool-runtime/parser.js';
+import { stripFunctionCallMarkup, assertToolCallArtifactIntegrity } from './tool-runtime/parser.js';
 import type { ExternalToolEntry } from './tool-runtime/registry.js';
 import type { ValidatedToolCall } from './tool-runtime/validator.js';
 import type { FinalToolCall } from './tool-runtime/parser.js';
@@ -41,7 +41,7 @@ import type {
   InternalToolMetrics,
 } from './types/context.js';
 import type { ProxyClient, ProviderInfo, ModelInfo, ResolvedModel } from './types/client.js';
-import type { ResponseStateEntry } from './types/backend.js';
+import type { ResponseStateEntry, ResponseToolCallState } from './types/backend.js';
 import { asRecord, toErrorMessage } from './utils/guards.js';
 import { buildEffectiveApiKeys, createApiKeyVerifier } from './auth/keys.js';
 import { defaultTranslatorRegistry } from './converters/registry.js';
@@ -257,6 +257,26 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   const responseState = new Map<string, ResponseStateEntry>();
   const RESPONSE_STATE_TTL_MS = 30 * 60 * 1000;
   const RESPONSE_STATE_SWEEP_INTERVAL_MS = 60 * 1000;
+  const RESPONSE_TOOL_CALL_STATE_LIMIT = 128;
+  const normalizeResponseToolCallState = (value: unknown): ResponseToolCallState[] => {
+    if (!Array.isArray(value)) return [];
+    const calls: ResponseToolCallState[] = [];
+    for (const entry of value as unknown[]) {
+      const record = asRecord(entry);
+      const callId = typeof record['callId'] === 'string' ? (record['callId'] as string) : '';
+      const name = typeof record['name'] === 'string' ? (record['name'] as string) : '';
+      if (!callId || !name) continue;
+      calls.push({ callId, name });
+    }
+    if (calls.length <= RESPONSE_TOOL_CALL_STATE_LIMIT) return calls;
+    const dropped = calls.length - RESPONSE_TOOL_CALL_STATE_LIMIT;
+    logDebug('Dropped the oldest continuation tool call metadata past the cap', {
+      limit: RESPONSE_TOOL_CALL_STATE_LIMIT,
+      dropped,
+      kept: RESPONSE_TOOL_CALL_STATE_LIMIT
+    });
+    return calls.slice(-RESPONSE_TOOL_CALL_STATE_LIMIT);
+  };
   const getResponseState = (responseId: unknown): ResponseStateEntry | null => {
     if (typeof responseId !== 'string') return null;
     const state = responseState.get(responseId);
@@ -267,12 +287,13 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     }
     return state;
   };
-  const storeResponseState = (responseId: unknown, sessionId: unknown, model: unknown): void => {
+  const storeResponseState = (responseId: unknown, sessionId: unknown, model: unknown, toolCalls: unknown = []): void => {
     if (!responseId || !sessionId || typeof responseId !== 'string' || typeof sessionId !== 'string') return;
     responseState.set(responseId, {
       sessionId,
       model: typeof model === 'string' ? model : String(model ?? ''),
       expiresAt: Date.now() + RESPONSE_STATE_TTL_MS,
+      toolCalls: normalizeResponseToolCallState(toolCalls),
     });
   };
   const sweepResponseState = async (): Promise<void> => {
@@ -338,6 +359,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
 
   const buildSystemPrompt = (
     systemMsg: unknown,
+    externalToolPrompt: unknown = '',
     reasoningEffort: unknown = null,
     toolMode: unknown = TOOL_MODE.DISABLED,
     internalAllowedTools: unknown = [],
@@ -345,6 +367,9 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     const parts: string[] = [];
     if (!OMIT_SYSTEM_PROMPT && typeof systemMsg === 'string' && systemMsg.trim()) {
       parts.push(systemMsg.trim());
+    }
+    if (typeof externalToolPrompt === 'string' && externalToolPrompt.trim()) {
+      parts.push(externalToolPrompt.trim());
     }
     if (reasoningEffort && reasoningEffort !== 'none') {
       parts.push(`[Reasoning Effort: ${String(reasoningEffort)}]`);
@@ -537,6 +562,56 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     return { validCalls: allowedCalls, invalidCalls: invalidCalls as Array<{ call: unknown; validation: unknown }> };
   };
 
+  const finalizeStreamToolCalls = (
+    parsedToolCalls: unknown,
+    registry: unknown,
+    toolChoice: unknown,
+    sourceText: unknown = undefined,
+    parallelToolCalls: unknown = true,
+  ): ValidatedToolCall[] => {
+    const calls = Array.isArray(parsedToolCalls) ? (parsedToolCalls as ValidatedToolCall[]) : [];
+    const choice = asRecord(toolChoice);
+    const mode = String(choice['mode'] || 'auto');
+    const requiredTool = typeof choice['requiredTool'] === 'string' ? choice['requiredTool'] : null;
+    const parallelAllowed = parallelToolCalls !== false;
+    const fail = (code: string, message: string): never => {
+      const error = new Error(message) as Error & { code?: string };
+      error.code = code;
+      throw error;
+    };
+
+    assertToolCallArtifactIntegrity(calls, registry, sourceText);
+    if (!parallelAllowed && calls.length > 1) {
+      fail('parallel_external_tool_calls', 'More than one external tool call was emitted for this turn.');
+    }
+    if (mode === 'none' && calls.length > 0) {
+      fail('external_tool_choice_none', 'The model emitted a tool call when tool_choice was none.');
+    }
+    if (mode === 'required' && calls.length === 0) {
+      fail('external_tool_choice_required', 'The model did not emit the required external tool call.');
+    }
+
+    const { validCalls, invalidCalls } = finalizeValidatedToolCalls(calls, registry);
+    if (invalidCalls.length > 0) {
+      fail('invalid_external_tool_call', 'The model emitted an invalid external tool call.');
+    }
+    if (validCalls.length !== calls.length) {
+      fail('external_tool_policy_blocked', 'The model emitted a tool call blocked by policy.');
+    }
+    if (requiredTool && validCalls.length > 0) {
+      const matched = validCalls.some((entry) => {
+        const record = asRecord(entry);
+        const fn = asRecord(record['function']);
+        const selected = findExternalToolByName(registry, fn['name']);
+        return Boolean(selected && selected.namespacedName === requiredTool);
+      });
+      if (!matched) {
+        fail('external_tool_choice_mismatch', 'The model emitted a tool call that did not match tool_choice.');
+      }
+    }
+    return validCalls;
+  };
+
   const toPublicToolCalls = (toolCalls: unknown): FinalToolCall[] => {
     if (!Array.isArray(toolCalls) || (toolCalls as unknown[]).length === 0) return [];
     return ((toolCalls as unknown[]) as ValidatedToolCall[]).map((toolCall) => {
@@ -554,16 +629,24 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   };
 
   const TOOL_IDS_CACHE_MS = 5 * 60 * 1000;
+  const TOOL_DISCOVERY_TIMEOUT_MS = 10000;
+  const TOOL_DISCOVERY_FAILURE_COOLDOWN_MS = 30000;
   let cachedToolIds: string[] | null = null;
   let cachedToolIdsAt = 0;
   let cachedDisabledToolOverrides: Record<string, boolean> | null = null;
   let cachedDisabledToolOverridesAt = 0;
+  let discoverySource = 'none';
+  let discoveryLastSuccessAt = 0;
+  let discoveryLastErrorAt = 0;
+  let discoveryLastError: string | null = null;
+  let discoveryCooldownUntil = 0;
   const internalToolMetrics: InternalToolMetrics = {
     externalBridgeRequests: 0,
     internalAllowlistRequests: 0,
     disabledRequests: 0,
     discoveryFailures: 0,
     fallbackToDisabled: 0,
+    overrideOmitted: 0,
   };
 
   const logInternalToolEvent = (event: unknown, details: unknown = {}): void => {
@@ -593,27 +676,66 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   };
 
   const getBackendToolIds = async (): Promise<string[] | null> => {
-    if (cachedToolIds && Date.now() - cachedToolIdsAt < TOOL_IDS_CACHE_MS) {
-      return cachedToolIds;
+    const now = Date.now();
+    if (cachedToolIds && now - cachedToolIdsAt < TOOL_IDS_CACHE_MS) {
+      const cachedNormalized = normalizeBackendToolIds(cachedToolIds);
+      if (cachedNormalized.length > 0) return cachedToolIds;
+      if (!DISABLE_TOOLS) return cachedToolIds;
     }
     const fixtureIds = normalizeConfiguredToolNames(INTERNAL_TOOL_DISCOVERY_FIXTURE);
     if (fixtureIds.length > 0) {
       cachedToolIds = fixtureIds;
       cachedToolIdsAt = Date.now();
-      logInternalToolEvent('backend-tool-ids-fixture-loaded', { count: fixtureIds.length, fixtureIds });
+      discoverySource = 'fixture';
+      discoveryLastSuccessAt = Date.now();
+      logInternalToolEvent('backend-tool-ids-fixture-loaded', { count: fixtureIds.length });
       return fixtureIds;
     }
+    if (now < discoveryCooldownUntil) {
+      return null;
+    }
     try {
-      const idsRes = (await client.tool.ids()) as unknown;
-      const data: unknown = asRecord(idsRes)['data'] ?? idsRes;
-      const ids = Array.isArray(data) ? (data as string[]) : [];
-      cachedToolIds = ids;
+      const idsRes = (await withTimeout(client.tool.ids(), TOOL_DISCOVERY_TIMEOUT_MS, 'tool discovery')) as unknown;
+      const idsRecord = asRecord(idsRes);
+      const tupleError: unknown = idsRecord['error'];
+      if (tupleError !== undefined && tupleError !== null) {
+        throw new Error(toErrorMessage(tupleError) || 'tool discovery returned error');
+      }
+      const data: unknown = idsRecord['data'] ?? idsRes;
+      if (!Array.isArray(data)) {
+        throw new Error('tool discovery returned malformed payload');
+      }
+      const normalized = normalizeBackendToolIds(data);
+      if (normalized.length === 0) {
+        // Fail-closed by design (locked by tests/tool-alias.test.js): an empty
+        // tool list under DISABLE_TOOLS=true is treated as unverifiable
+        // discovery, not as "zero tools, proceed". A real backend always exposes
+        // tools; empty almost certainly means a broken backend/proxy skew.
+        if (DISABLE_TOOLS) {
+          throw new Error('tool discovery returned empty ids');
+        }
+        cachedToolIds = normalized;
+        cachedToolIdsAt = Date.now();
+        discoverySource = 'live';
+        discoveryLastSuccessAt = Date.now();
+        logInternalToolEvent('backend-tool-ids-loaded', { count: 0 });
+        return normalized;
+      }
+      cachedToolIds = normalized;
       cachedToolIdsAt = Date.now();
-      logInternalToolEvent('backend-tool-ids-loaded', { count: ids.length });
-      return ids;
+      discoverySource = 'live';
+      discoveryLastSuccessAt = Date.now();
+      cachedDisabledToolOverrides = null;
+      cachedDisabledToolOverridesAt = 0;
+      logInternalToolEvent('backend-tool-ids-loaded', { count: normalized.length });
+      return normalized;
     } catch (e: unknown) {
       internalToolMetrics.discoveryFailures += 1;
-      logInternalToolEvent('backend-tool-ids-failed', { error: toErrorMessage(e) });
+      discoveryLastError = toErrorMessage(e).slice(0, 500);
+      discoveryLastErrorAt = Date.now();
+      discoveryCooldownUntil = Date.now() + TOOL_DISCOVERY_FAILURE_COOLDOWN_MS;
+      if (discoverySource !== 'live' && discoverySource !== 'fixture') discoverySource = 'none';
+      logInternalToolEvent('backend-tool-ids-failed', { error: discoveryLastError });
       return null;
     }
   };
@@ -668,16 +790,30 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   };
 
   const getDisabledToolOverrides = async (): Promise<Record<string, boolean> | null> => {
-    if (!DISABLE_TOOLS) return null;
+    if (!DISABLE_TOOLS) {
+      internalToolMetrics.overrideOmitted += 1;
+      logInternalToolEvent('disabled-tool-overrides-omitted', { reason: 'operator-allow' });
+      return null;
+    }
+    const ids = await getBackendToolIds();
+    if (!Array.isArray(ids)) {
+      cachedDisabledToolOverrides = null;
+      cachedDisabledToolOverridesAt = 0;
+      return null;
+    }
+    const normalized = normalizeBackendToolIds(ids);
+    if (normalized.length === 0) {
+      cachedDisabledToolOverrides = null;
+      cachedDisabledToolOverridesAt = 0;
+      return null;
+    }
     if (cachedDisabledToolOverrides && Date.now() - cachedDisabledToolOverridesAt < TOOL_IDS_CACHE_MS) {
       return cachedDisabledToolOverrides;
     }
-    const ids = await getBackendToolIds();
-    if (!Array.isArray(ids)) return null;
-    const overrides = buildDisabledToolOverrides(ids);
+    const overrides = buildDisabledToolOverrides(normalized);
     cachedDisabledToolOverrides = overrides;
     cachedDisabledToolOverridesAt = Date.now();
-    logInternalToolEvent('disabled-tool-overrides-loaded', { count: ids.length });
+    logInternalToolEvent('disabled-tool-overrides-loaded', { count: normalized.length });
     return overrides;
   };
 
@@ -696,10 +832,20 @@ export function createApp(config: ProxyConfig): CreateAppResult {
       return getDisabledToolOverrides();
     }
     if (toolMode !== TOOL_MODE.INTERNAL_ALLOWLIST) {
+      if (!DISABLE_TOOLS) {
+        internalToolMetrics.overrideOmitted += 1;
+      }
       return null;
     }
     const ids = await getBackendToolIds();
-    if (!Array.isArray(ids) || (ids as unknown[]).length === 0) return null;
+    const normalizedPre = normalizeBackendToolIds(ids);
+    if (!Array.isArray(ids) || normalizedPre.length === 0) {
+      if (!DISABLE_TOOLS) {
+        internalToolMetrics.overrideOmitted += 1;
+        logInternalToolEvent('internal-allowlist-omitted', { reason: 'operator-allow' });
+      }
+      return null;
+    }
     const resolution = resolveInternalAllowedToolIds(
       ids,
       (ctxRecord['allowedToolNames'] ?? SERVER_INTERNAL_ALLOWED_TOOL_NAMES) as unknown,
@@ -919,6 +1065,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     resolveToolMode,
     createRequestToolContext: createRequestToolContext as unknown as AppContext['createRequestToolContext'],
     finalizeValidatedToolCalls,
+    finalizeStreamToolCalls,
     toPublicToolCalls,
     createForcedToolCallRequester: createForcedToolCallRequester as unknown as AppContext['createForcedToolCallRequester'],
     TOOL_IDS_CACHE_MS,
@@ -944,6 +1091,10 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     proxyPollForAssistantResponse,
     getCachedToolIds: () => cachedToolIds,
     getCachedToolIdsAt: () => cachedToolIdsAt,
+    getDiscoverySource: () => discoverySource,
+    getDiscoveryLastSuccessAt: () => discoveryLastSuccessAt,
+    getDiscoveryLastErrorAt: () => discoveryLastErrorAt,
+    getDiscoveryLastError: () => discoveryLastError,
     translators: ensureTranslatorsRegistered(defaultTranslatorRegistry()),
   };
 

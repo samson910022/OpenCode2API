@@ -80,11 +80,37 @@ function normalizeSystemInstruction(value: unknown): string {
   return textOfContent(rec['parts'] ?? rec['content'] ?? rec['text']);
 }
 
+function createAbortError(): Error {
+  const error = new Error('Request aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
+async function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) throw createAbortError();
+  let removeAbortListener = (): void => {};
+  const abortPromise = new Promise<never>((_, reject) => {
+    const onAbort = (): void => reject(createAbortError());
+    removeAbortListener = (): void => signal.removeEventListener('abort', onAbort);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, abortPromise]);
+  } catch (error: unknown) {
+    if (signal.aborted) throw createAbortError();
+    throw error;
+  } finally {
+    removeAbortListener();
+  }
+}
+
 export function registerInteractionsRoutes(app: Application, ctx: AppContext): void {
   const {
     client,
     config,
     REQUEST_TIMEOUT_MS,
+    DISABLE_TOOLS,
     maxAttempts,
     resolveRequestedModel,
     logDebug,
@@ -105,8 +131,12 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
     proxyPollForAssistantResponse,
   } = ctx;
 
-  const handle = async (req: Request, res: Response): Promise<void> => {
-    // P3 bundle (direct unless the pool is already engaged).
+   const handle = async (req: Request, res: Response): Promise<void> => {
+     const requestAbortController = new AbortController();
+     let clientGone = false;
+     let ownedSessionId: string | null = null;
+     // P3 bundle (direct unless the pool is already engaged).
+
     let activeClient = client;
     let activePromptWithTimeout = promptWithTimeout;
     let activePollForAssistantResponse = pollForAssistantResponse;
@@ -132,8 +162,15 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       const systemInstruction: unknown = body['system_instruction'];
       const toolsRaw: unknown = body['tools'];
       const tools: unknown[] = Array.isArray(toolsRaw) ? (toolsRaw as unknown[]) : [];
-      const stream = body['stream'] === true;
-      const store = body['store'] !== false;
+       const stream = body['stream'] === true;
+       const store = body['store'] !== false;
+       const onClientClose = (): void => {
+         if (res.writableEnded) return;
+         clientGone = true;
+         requestAbortController.abort();
+       };
+       res.once('close', onClientClose);
+
       const previousInteractionId: unknown = body['previous_interaction_id'];
 
       if (!model && !agent) {
@@ -235,6 +272,17 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           toolOverrides = merged;
         }
       }
+      // Fail-closed by design (see chat.ts): null or verified-empty both 503.
+      if (DISABLE_TOOLS && (!toolOverrides || Object.keys(toolOverrides).length === 0)) {
+        res.status(503).json({
+          error: {
+            message: 'Tool discovery unavailable; backend tool IDs could not be verified',
+            type: 'tool_discovery_unavailable',
+            code: 'tool_discovery_unavailable',
+          },
+        });
+        return;
+      }
 
       let sessionId: string | null = previousState?.sessionId || null;
       // Only a session created by this request may be deleted by store:false;
@@ -243,8 +291,10 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       if (!sessionId) {
         sessionId =
           ((asRecord(asRecord(await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session'))['data'])['id'] as string | undefined) ?? null);
-        if (!sessionId) throw new Error('Failed to create OpenCode session');
-        sessionNewlyCreated = true;
+         if (!sessionId) throw new Error('Failed to create OpenCode session');
+         sessionNewlyCreated = true;
+         ownedSessionId = sessionId;
+
       }
 
       const parts: Record<string, unknown>[] = [];
@@ -260,9 +310,8 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         fullPromptText += `${text}\n\n`;
       }
       const systemWithGuard = buildSystemPrompt(
-        [systemText, ...systemTexts, hostedSearch.requested ? SEARCH_GROUNDING_INSTRUCTION : '']
-          .filter(Boolean)
-          .join('\n\n'),
+        [systemText, ...systemTexts].filter(Boolean).join('\n\n'),
+        hostedSearch.requested ? SEARCH_GROUNDING_INSTRUCTION : '',
         null,
         toolMode,
         internalToolContext.allowedToolNames,
@@ -284,6 +333,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       // Thin retry: free-limit errors engage the proxy pool and rotate the
       // session (bounded by maxAttempts like the other routes). Ordinary
       // errors throw immediately — no generic transient backoff here.
+      const parentSessionId = previousState?.sessionId ?? null;
       const promptAndPoll = async (): Promise<{
         content: string;
         reasoning: string;
@@ -294,20 +344,35 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
           if (res.destroyed || res.writableEnded) throw new Error('Client disconnected');
           if (attempt > 1) {
-            try {
-              await activeClient.session.delete({ path: { id: sessionId as string } });
-            } catch (e: unknown) {
-              logDebug('Failed to delete retried interaction session', { error: toErrorMessage(e) });
+            const currentId = sessionId as string;
+            const shouldDelete = sessionNewlyCreated || (parentSessionId ? currentId !== parentSessionId : true);
+            if (shouldDelete) {
+              try {
+                await activeClient.session.delete({ path: { id: currentId } });
+                if (ownedSessionId === currentId) ownedSessionId = null;
+              } catch (e: unknown) {
+                logDebug('Failed to delete retried interaction session', { error: toErrorMessage(e) });
+              }
             }
             const retryRes = (await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
             sessionId = (asRecord(asRecord(retryRes)['data'])['id'] as string | undefined) ?? null;
-            if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
-            promptParams.path.id = sessionId;
-            await sleep(computeRetryDelay(attempt - 1, lastErr));
+             if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
+             sessionNewlyCreated = true;
+             ownedSessionId = sessionId;
+             promptParams.path.id = sessionId;
+
+             await awaitWithAbort(sleep(computeRetryDelay(attempt - 1, lastErr)), requestAbortController.signal);
+
           }
           try {
-            await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-            const polled = await activePollForAssistantResponse(sessionId as string, REQUEST_TIMEOUT_MS);
+             await awaitWithAbort(activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS), requestAbortController.signal);
+             const polled = await activePollForAssistantResponse(
+               sessionId as string,
+               REQUEST_TIMEOUT_MS,
+               undefined,
+               requestAbortController.signal,
+             );
+
             if (polled.error && !polled.content && !polled.reasoning) throw normalizeBackendError(polled.error);
             return polled;
           } catch (e: unknown) {
@@ -320,14 +385,17 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       };
 
       const interactionId = `intr_${crypto.randomUUID()}`;
-      const deleteEphemeralSession = async (): Promise<void> => {
-        // Only sessions created by this request may be deleted; a reused
-        // parent session stays alive for its stored continuation chain.
-        if (store || !sessionNewlyCreated) return;
-        try {
-          await activeClient.session.delete({ path: { id: sessionId as string } });
-        } catch (e: unknown) {
-          logDebug('Failed to delete unstored interaction session', { error: toErrorMessage(e) });
+       const deleteEphemeralSession = async (force: boolean = false): Promise<void> => {
+         // Only sessions created by this request may be deleted; a reused
+         // parent session stays alive for its stored continuation chain.
+         if ((!force && store) || !sessionNewlyCreated) return;
+
+         try {
+           await activeClient.session.delete({ path: { id: sessionId as string } });
+           ownedSessionId = null;
+         } catch (e: unknown) {
+           logDebug('Failed to delete unstored interaction session', { error: toErrorMessage(e) });
+
         }
       };
       if (stream) {
@@ -338,11 +406,8 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         if (typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
         // Stream contract: interaction.created → step.delta* → interaction.completed
         // (no [DONE]; errors arrive as {type:'error'} like /v1/messages).
-        let clientGone = false;
-        res.once('close', () => {
-          if (!res.writableEnded) clientGone = true;
-        });
-        const heartbeat = setInterval(() => {
+         const heartbeat = setInterval(() => {
+
           if (!res.destroyed && !res.writableEnded) res.write(': heartbeat\n\n');
         }, 15000);
         if (typeof heartbeat.unref === 'function') heartbeat.unref();
@@ -353,10 +418,11 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         try {
         emit({ type: 'interaction.created', interaction: { id: interactionId, status: 'in_progress', model: `${pID}/${mID}` } });
         const polled = await promptAndPoll();
-        if (clientGone) {
-          await deleteEphemeralSession();
-          return;
-        }
+         if (clientGone) {
+           await deleteEphemeralSession(true);
+           return;
+         }
+
         // Parity with chat/responses/messages: strip tool-call markup when
         // DISABLE_TOOLS so a free-tier strip (no false entries in the tools map,
         // see selectPromptToolOverrides) cannot leak call syntax to clients.
@@ -382,8 +448,13 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           }
           steps.push({ type: 'model_output', text, annotations });
           emit({ type: 'interaction.completed', interaction: { id: interactionId, status: 'completed', output_text: text, steps } });
-          if (store) storeResponseState(interactionId, sessionId as string, `${pID}/${mID}`);
-          await deleteEphemeralSession();
+           if (store) {
+             // Text+grounding only: no function tool calls to persist, default [] is intentional.
+             storeResponseState(interactionId, sessionId as string, `${pID}/${mID}`);
+             ownedSessionId = null;
+           }
+           await deleteEphemeralSession();
+
         } finally {
           clearInterval(heartbeat);
         }
@@ -410,8 +481,13 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       }
       steps.push({ type: 'model_output', text, annotations });
       const groundingCount = searchCalls.length;
-      if (store) storeResponseState(interactionId, sessionId as string, `${pID}/${mID}`);
-      await deleteEphemeralSession();
+       if (store) {
+         // Text+grounding only: no function tool calls to persist, default [] is intentional.
+         storeResponseState(interactionId, sessionId as string, `${pID}/${mID}`);
+         ownedSessionId = null;
+       }
+       await deleteEphemeralSession();
+
       res.json({
         id: interactionId,
         status: 'completed',
@@ -421,8 +497,18 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         usage: { grounding_tool_count: [{ type: 'google_search', count: groundingCount }] },
       });
       return;
-    } catch (error: unknown) {
-      if (!fallbackToProxy) engageProxyFallback(error);
+     } catch (error: unknown) {
+       if (clientGone && ownedSessionId) {
+         try {
+           await activeClient.session.delete({ path: { id: ownedSessionId } });
+         } catch (cleanupError: unknown) {
+           logDebug('Failed to cleanup disconnected interaction session', { error: toErrorMessage(cleanupError) });
+         }
+         ownedSessionId = null;
+         return;
+       }
+       if (!fallbackToProxy) engageProxyFallback(error);
+
       console.error('[Proxy] Interactions API Error:', toErrorMessage(error));
       const transformed = transformUpstreamError(error);
       if (!res.headersSent) {

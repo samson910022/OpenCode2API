@@ -2,7 +2,41 @@
 import { startProxy, normalizeBool, resolveDisableTools } from './src/proxy.js';
 import { resolveMaxRetries } from './src/retry/policy.js';
 import { mergeApiKeySources } from './src/auth/keys.js';
-import { DEFAULT_PROXY_COOLDOWN_MS, normalizeProxyCooldownMs, normalizeProxyStrategy, parseProxyList, parseProxyNoProxyList } from './src/upstream-proxy/pool.js';
+import {
+  parseProxyList,
+  parseProxyNoProxyList,
+  normalizeProxyCooldownMs,
+  DEFAULT_PROXY_COOLDOWN_MS,
+  DEFAULT_PROXY_NO_PROXY,
+  DEFAULT_PROXY_STRATEGY,
+  PROXY_STRATEGIES,
+} from './src/upstream-proxy/pool.js';
+import {
+  DEFAULT_BIND_HOST,
+  DEFAULT_CLEANUP_INTERVAL_MS,
+  DEFAULT_CLEANUP_MAX_AGE_MS,
+  DEFAULT_EXTERNAL_TOOLS_CONFLICT_POLICY,
+  DEFAULT_EXTERNAL_TOOLS_MODE,
+  DEFAULT_EXTERNAL_TOOL_DEFAULT_RISK_LEVEL,
+  DEFAULT_EXTERNAL_TOOL_POLICY_MODE,
+  DEFAULT_OPENCODE_PATH,
+  DEFAULT_PROMPT_MODE,
+  DEFAULT_PROXY_PORT,
+  DEFAULT_SERVER_PORT,
+  EXTERNAL_TOOLS_CONFLICT_POLICIES,
+  EXTERNAL_TOOLS_MODES,
+  EXTERNAL_TOOL_POLICY_MODES,
+  EXTERNAL_TOOL_RISK_LEVEL_VALUES,
+  parseStrictPort,
+  resolveBoolSetting,
+  resolveDurationSetting,
+  resolveEnumSetting,
+  resolveListSetting,
+  resolvePortSetting,
+  resolveRetryCountSetting,
+  resolveStringSetting,
+  resolveUrlSetting,
+} from './src/config/proxy-config.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -11,76 +45,34 @@ import type { ProxyConfig } from './src/types/config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-function parseBool(value: unknown, fallback: boolean): boolean {
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'number') return value === 1;
-  if (typeof value === 'string') {
-    const v = value.trim().toLowerCase();
-    if (['1', 'true', 'yes', 'y', 'on'].includes(v)) return true;
-    if (['0', 'false', 'no', 'n', 'off'].includes(v)) return false;
-  }
-  if (value === undefined || value === null) return fallback;
-  return Boolean(value);
-}
-
-function parseToolAllowlist(value: unknown, fallback: string[] = []): string[] {
-  if (Array.isArray(value)) {
-    // NOTE: `||` (not `??`) matches the original JS verbatim: falsy entries
-    // (0/false) stringify to '' and are filtered out instead of becoming
-    // "0"/"false" allowlist entries.
-    return [...new Set((value as unknown[]).map((entry) => String((entry as unknown) || '').trim()).filter(Boolean))];
-  }
-  if (typeof value === 'string') {
-    return [...new Set(value.split(',').map((entry) => entry.trim()).filter(Boolean))];
-  }
-  if (value === undefined || value === null || value === '') return fallback;
-  return fallback;
-}
-
-function parsePort(value: unknown, fallback: number): number {
-  const n = typeof value === 'string' || typeof value === 'number' ? parseInt(String(value), 10) : NaN;
-  return Number.isFinite(n) && n > 0 ? n : fallback;
-}
-
 /** Resolve the multi-key list for one layer: canonical list + legacy aliases merge (empty never blocks). */
 function parseApiKeys(...sources: unknown[]): string[] {
   return mergeApiKeySources(...sources);
 }
 
-// Default configuration
-const defaultConfig = {
-  PORT: parsePort(process.env['OPENCODE_PROXY_PORT'], 10000),
-  API_KEY: '',
-  API_KEYS: [] as string[],
-  OPENCODE_SERVER_URL: `http://127.0.0.1:${process.env['OPENCODE_SERVER_PORT'] || 10001}`,
-  OPENCODE_SERVER_PASSWORD: process.env['OPENCODE_SERVER_PASSWORD'] || '',
-  MANAGE_BACKEND: parseBool(process.env['OPENCODE_PROXY_MANAGE_BACKEND'], false),
-  OPENCODE_PATH: 'opencode',
-  BIND_HOST: '0.0.0.0',
-  DISABLE_TOOLS: true,
-  EXTERNAL_TOOLS_MODE: 'proxy-bridge',
-  EXTERNAL_TOOLS_CONFLICT_POLICY: 'namespace',
-  INTERNAL_WEB_FETCH_ENABLED: parseBool(process.env['OPENCODE_INTERNAL_WEB_FETCH_ENABLED'], false),
-  INTERNAL_ALLOWED_TOOLS: parseToolAllowlist(process.env['OPENCODE_INTERNAL_ALLOWED_TOOLS'], []),
-  INTERNAL_TOOL_METRICS_ENABLED: parseBool(process.env['OPENCODE_INTERNAL_TOOL_METRICS_ENABLED'], true),
-  INTERNAL_TOOL_DISCOVERY_FIXTURE: parseToolAllowlist(process.env['OPENCODE_TOOL_DISCOVERY_FIXTURE'], []),
-  HEALTH_DETAILS_ENABLED: parseBool(process.env['OPENCODE_HEALTH_DETAILS_ENABLED'], true),
-  HEALTH_DETAILS_REQUIRE_AUTH: parseBool(process.env['OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH'], true),
-  METRICS_ENABLED: parseBool(process.env['OPENCODE_METRICS_ENABLED'], false),
-  METRICS_REQUIRE_AUTH: parseBool(process.env['OPENCODE_METRICS_REQUIRE_AUTH'], true),
-  PROMPT_MODE: process.env['OPENCODE_PROXY_PROMPT_MODE'] || 'standard',
-  OMIT_SYSTEM_PROMPT: parseBool(process.env['OPENCODE_PROXY_OMIT_SYSTEM_PROMPT'], false),
-  AUTO_CLEANUP_CONVERSATIONS: parseBool(process.env['OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS'], false),
-  CLEANUP_INTERVAL_MS: parsePort(process.env['OPENCODE_PROXY_CLEANUP_INTERVAL_MS'], 43200000),
-  CLEANUP_MAX_AGE_MS: parsePort(process.env['OPENCODE_PROXY_CLEANUP_MAX_AGE_MS'], 86400000),
-  UPSTREAM_PROXIES: parseProxyList([process.env['OPENCODE_UPSTREAM_PROXIES'], process.env['UPSTREAM_PROXIES']]),
-  UPSTREAM_PROXY_STRATEGY: 'failover-rr',
-  UPSTREAM_PROXY_COOLDOWN_MS: DEFAULT_PROXY_COOLDOWN_MS,
-  UPSTREAM_PROXY_NO_PROXY: parseProxyNoProxyList(
-    process.env['OPENCODE_UPSTREAM_PROXY_NO_PROXY'] ?? process.env['UPSTREAM_PROXY_NO_PROXY'],
-    ['localhost', '127.0.0.1', '::1'],
-  ),
-};
+function warnUnsupportedEnum(label: string, value: unknown, allowed: readonly string[], effective: string): void {
+  if (typeof value !== 'string' || !value.trim()) return;
+  const normalized = value.trim().toLowerCase();
+  if (allowed.includes(normalized)) return;
+  console.warn(
+    `[Config] Warning: ${label}="${value.trim()}" is not supported (supported: ${allowed.join(', ')}); using "${effective}"`,
+  );
+}
+
+function warnInvalidPort(label: string, value: unknown, effective: number): void {
+  if (value === undefined || value === null || value === '') return;
+  if (parseStrictPort(value) !== undefined) return;
+  console.warn(`[Config] Warning: ${label}="${String(value)}" is not a valid port (1-65535); using ${effective}`);
+}
+
+function warnInvalidUrl(label: string, value: unknown): void {
+  if (typeof value !== 'string' || !value.trim()) return;
+  try {
+    const protocol = new URL(value.trim()).protocol;
+    if (protocol === 'http:' || protocol === 'https:') return;
+  } catch {}
+  console.warn(`[Config] Warning: ${label}="${value.trim()}" is not a valid http(s) URL; falling back to the next source`);
+}
 
 // Load config from file.
 // NOTE: the lookup covers both layouts because the compiled entry moves:
@@ -107,48 +99,125 @@ if (configPath) {
   }
 }
 
-function readFileString(key: string, fallback: string): string {
-  const v: unknown = fileConfig[key];
-  return typeof v === 'string' && v ? v : fallback;
-}
-
-function readFileNumber(key: string, fallback: number): number {
-  const v: unknown = fileConfig[key];
-  // NOTE: `0` falls through to fallback to match the original
-  // `fileConfig.X || default` semantics verbatim.
-  if (typeof v === 'number' && Number.isFinite(v) && v !== 0) return v;
-  if (typeof v === 'string' && v.trim() !== '') {
-    const n = parseInt(v, 10);
-    if (Number.isFinite(n)) return n;
-  }
-  return fallback;
-}
-
-// Merge configs: env > file > default
-// Auth layers resolve independently; the env layer wins as a whole so a stale
-// file single-key can never pollute (or resurrect after rotation of) an
-// explicitly configured env list. Empty strings never block lower sources.
+// Merge configs: env canonical > env legacy alias > config.json > default.
+// Every layer is normalized before it is compared, so an invalid value falls
+// through to the next one instead of coercing (no `Boolean('garbage')`) and no
+// layer can silently shadow a lower one.
 const envApiKeys = parseApiKeys(process.env['OPENCODE_API_KEYS'], process.env['API_KEYS'], process.env['API_KEY']);
 const fileApiKeys = parseApiKeys(fileConfig['API_KEYS'], fileConfig['API_KEY']);
 const resolvedApiKeys = envApiKeys.length > 0 ? envApiKeys : fileApiKeys;
-const finalConfig: ProxyConfig = {  PORT:
-    parsePort(process.env['OPENCODE_PROXY_PORT'], NaN) ||
-    parsePort(process.env['PORT'], NaN) ||
-    readFileNumber('PORT', defaultConfig.PORT),
+
+const serverPort = resolvePortSetting([process.env['OPENCODE_SERVER_PORT']], DEFAULT_SERVER_PORT);
+warnInvalidPort('OPENCODE_SERVER_PORT', process.env['OPENCODE_SERVER_PORT'], serverPort);
+const defaultServerUrl = `http://127.0.0.1:${serverPort}`;
+
+const externalToolsMode = resolveEnumSetting(
+  [process.env['OPENCODE_EXTERNAL_TOOLS_MODE'], fileConfig['EXTERNAL_TOOLS_MODE']],
+  EXTERNAL_TOOLS_MODES,
+  DEFAULT_EXTERNAL_TOOLS_MODE,
+);
+warnUnsupportedEnum('OPENCODE_EXTERNAL_TOOLS_MODE', process.env['OPENCODE_EXTERNAL_TOOLS_MODE'], EXTERNAL_TOOLS_MODES, externalToolsMode);
+warnUnsupportedEnum('config.json EXTERNAL_TOOLS_MODE', fileConfig['EXTERNAL_TOOLS_MODE'], EXTERNAL_TOOLS_MODES, externalToolsMode);
+const externalToolsConflictPolicy = resolveEnumSetting(
+  [process.env['OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY'], fileConfig['EXTERNAL_TOOLS_CONFLICT_POLICY']],
+  EXTERNAL_TOOLS_CONFLICT_POLICIES,
+  DEFAULT_EXTERNAL_TOOLS_CONFLICT_POLICY,
+);
+warnUnsupportedEnum(
+  'OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY',
+  process.env['OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY'],
+  EXTERNAL_TOOLS_CONFLICT_POLICIES,
+  externalToolsConflictPolicy,
+);
+warnUnsupportedEnum(
+  'config.json EXTERNAL_TOOLS_CONFLICT_POLICY',
+  fileConfig['EXTERNAL_TOOLS_CONFLICT_POLICY'],
+  EXTERNAL_TOOLS_CONFLICT_POLICIES,
+  externalToolsConflictPolicy,
+);
+const externalToolPolicyMode = resolveEnumSetting(
+  [
+    process.env['OPENCODE_EXTERNAL_TOOL_POLICY_MODE'],
+    process.env['EXTERNAL_TOOL_POLICY_MODE'],
+    fileConfig['EXTERNAL_TOOL_POLICY_MODE'],
+  ],
+  EXTERNAL_TOOL_POLICY_MODES,
+  DEFAULT_EXTERNAL_TOOL_POLICY_MODE,
+);
+warnUnsupportedEnum(
+  'OPENCODE_EXTERNAL_TOOL_POLICY_MODE',
+  process.env['OPENCODE_EXTERNAL_TOOL_POLICY_MODE'],
+  EXTERNAL_TOOL_POLICY_MODES,
+  externalToolPolicyMode,
+);
+warnUnsupportedEnum('EXTERNAL_TOOL_POLICY_MODE', process.env['EXTERNAL_TOOL_POLICY_MODE'], EXTERNAL_TOOL_POLICY_MODES, externalToolPolicyMode);
+warnUnsupportedEnum(
+  'config.json EXTERNAL_TOOL_POLICY_MODE',
+  fileConfig['EXTERNAL_TOOL_POLICY_MODE'],
+  EXTERNAL_TOOL_POLICY_MODES,
+  externalToolPolicyMode,
+);
+const externalToolDefaultRiskLevel = resolveEnumSetting(
+  [
+    process.env['OPENCODE_EXTERNAL_TOOL_DEFAULT_RISK_LEVEL'],
+    process.env['EXTERNAL_TOOL_DEFAULT_RISK_LEVEL'],
+    fileConfig['EXTERNAL_TOOL_DEFAULT_RISK_LEVEL'],
+  ],
+  EXTERNAL_TOOL_RISK_LEVEL_VALUES,
+  DEFAULT_EXTERNAL_TOOL_DEFAULT_RISK_LEVEL,
+);
+warnUnsupportedEnum(
+  'OPENCODE_EXTERNAL_TOOL_DEFAULT_RISK_LEVEL',
+  process.env['OPENCODE_EXTERNAL_TOOL_DEFAULT_RISK_LEVEL'],
+  EXTERNAL_TOOL_RISK_LEVEL_VALUES,
+  externalToolDefaultRiskLevel,
+);
+warnUnsupportedEnum(
+  'EXTERNAL_TOOL_DEFAULT_RISK_LEVEL',
+  process.env['EXTERNAL_TOOL_DEFAULT_RISK_LEVEL'],
+  EXTERNAL_TOOL_RISK_LEVEL_VALUES,
+  externalToolDefaultRiskLevel,
+);
+warnUnsupportedEnum(
+  'config.json EXTERNAL_TOOL_DEFAULT_RISK_LEVEL',
+  fileConfig['EXTERNAL_TOOL_DEFAULT_RISK_LEVEL'],
+  EXTERNAL_TOOL_RISK_LEVEL_VALUES,
+  externalToolDefaultRiskLevel,
+);
+
+const proxyPort = resolvePortSetting(
+  [process.env['OPENCODE_PROXY_PORT'], process.env['PORT'], fileConfig['PORT']],
+  DEFAULT_PROXY_PORT,
+);
+warnInvalidPort('OPENCODE_PROXY_PORT', process.env['OPENCODE_PROXY_PORT'], proxyPort);
+warnInvalidPort('PORT', process.env['PORT'], proxyPort);
+warnInvalidUrl('OPENCODE_SERVER_URL', process.env['OPENCODE_SERVER_URL']);
+warnInvalidUrl('config.json OPENCODE_SERVER_URL', fileConfig['OPENCODE_SERVER_URL']);
+
+const finalConfig: ProxyConfig = {
+  PORT: proxyPort,
   API_KEY: resolvedApiKeys[0] ?? '',
   API_KEYS: resolvedApiKeys,
-  OPENCODE_SERVER_URL: process.env['OPENCODE_SERVER_URL'] || readFileString('OPENCODE_SERVER_URL', defaultConfig.OPENCODE_SERVER_URL),
-  OPENCODE_SERVER_PASSWORD:
-    process.env['OPENCODE_SERVER_PASSWORD'] || readFileString('OPENCODE_SERVER_PASSWORD', defaultConfig.OPENCODE_SERVER_PASSWORD),
-  MANAGE_BACKEND: parseBool(
-    process.env['OPENCODE_PROXY_MANAGE_BACKEND'],
-    parseBool(fileConfig['MANAGE_BACKEND'], defaultConfig.MANAGE_BACKEND),
+  OPENCODE_SERVER_URL: resolveUrlSetting(
+    [process.env['OPENCODE_SERVER_URL'], fileConfig['OPENCODE_SERVER_URL']],
+    defaultServerUrl,
   ),
-  OPENCODE_PATH: process.env['OPENCODE_PATH'] || readFileString('OPENCODE_PATH', defaultConfig.OPENCODE_PATH),
-  BIND_HOST:
-    process.env['BIND_HOST'] ||
-    process.env['OPENCODE_PROXY_BIND_HOST'] ||
-    readFileString('BIND_HOST', defaultConfig.BIND_HOST),
+  OPENCODE_SERVER_PASSWORD: resolveStringSetting(
+    [process.env['OPENCODE_SERVER_PASSWORD'], fileConfig['OPENCODE_SERVER_PASSWORD']],
+    '',
+  ),
+  MANAGE_BACKEND: resolveBoolSetting(
+    [process.env['OPENCODE_PROXY_MANAGE_BACKEND'], fileConfig['MANAGE_BACKEND']],
+    false,
+  ),
+  OPENCODE_PATH: resolveStringSetting(
+    [process.env['OPENCODE_PATH'], fileConfig['OPENCODE_PATH']],
+    DEFAULT_OPENCODE_PATH,
+  ),
+  BIND_HOST: resolveStringSetting(
+    [process.env['BIND_HOST'], process.env['OPENCODE_PROXY_BIND_HOST'], fileConfig['BIND_HOST']],
+    DEFAULT_BIND_HOST,
+  ),
   // Single contract via resolveDisableTools: env canonical > env legacy
   // alias > file > default. Each source is normalized first so invalid
   // values ('', 'garbage') fall through instead of blocking lower sources.
@@ -157,65 +226,106 @@ const finalConfig: ProxyConfig = {  PORT:
       DISABLE_TOOLS: process.env['OPENCODE_DISABLE_TOOLS'],
       disableTools: process.env['DISABLE_TOOLS'],
     },
-    (normalizeBool(fileConfig['DISABLE_TOOLS']) ?? defaultConfig.DISABLE_TOOLS) as boolean,
+    (normalizeBool(fileConfig['DISABLE_TOOLS']) ?? true) as boolean,
   ),
-  EXTERNAL_TOOLS_MODE:
-    process.env['OPENCODE_EXTERNAL_TOOLS_MODE'] || readFileString('EXTERNAL_TOOLS_MODE', defaultConfig.EXTERNAL_TOOLS_MODE),
-  EXTERNAL_TOOLS_CONFLICT_POLICY:
-    process.env['OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY'] ||
-    readFileString('EXTERNAL_TOOLS_CONFLICT_POLICY', defaultConfig.EXTERNAL_TOOLS_CONFLICT_POLICY),
-  INTERNAL_WEB_FETCH_ENABLED: parseBool(
-    process.env['OPENCODE_INTERNAL_WEB_FETCH_ENABLED'],
-    parseBool(fileConfig['INTERNAL_WEB_FETCH_ENABLED'], defaultConfig.INTERNAL_WEB_FETCH_ENABLED),
+  EXTERNAL_TOOLS_MODE: externalToolsMode,
+  EXTERNAL_TOOLS_CONFLICT_POLICY: externalToolsConflictPolicy,
+  EXTERNAL_TOOL_POLICY_MODE: externalToolPolicyMode,
+  EXTERNAL_TOOL_DEFAULT_RISK_LEVEL: externalToolDefaultRiskLevel,
+  EXTERNAL_TOOL_ALLOWLIST: resolveListSetting(
+    [
+      process.env['OPENCODE_EXTERNAL_TOOL_ALLOWLIST'],
+      process.env['EXTERNAL_TOOL_ALLOWLIST'],
+      fileConfig['EXTERNAL_TOOL_ALLOWLIST'],
+    ],
+    [],
   ),
-  INTERNAL_ALLOWED_TOOLS: parseToolAllowlist(
-    process.env['OPENCODE_INTERNAL_ALLOWED_TOOLS'],
-    parseToolAllowlist(fileConfig['INTERNAL_ALLOWED_TOOLS'], defaultConfig.INTERNAL_ALLOWED_TOOLS),
+  EXTERNAL_TOOL_DENYLIST: resolveListSetting(
+    [
+      process.env['OPENCODE_EXTERNAL_TOOL_DENYLIST'],
+      process.env['EXTERNAL_TOOL_DENYLIST'],
+      fileConfig['EXTERNAL_TOOL_DENYLIST'],
+    ],
+    [],
   ),
-  INTERNAL_TOOL_METRICS_ENABLED: parseBool(
-    process.env['OPENCODE_INTERNAL_TOOL_METRICS_ENABLED'],
-    parseBool(fileConfig['INTERNAL_TOOL_METRICS_ENABLED'], defaultConfig.INTERNAL_TOOL_METRICS_ENABLED),
+  EXTERNAL_TOOL_REQUIRE_CONFIRMATION_FOR: resolveListSetting(
+    [
+      process.env['OPENCODE_EXTERNAL_TOOL_REQUIRE_CONFIRMATION_FOR'],
+      process.env['EXTERNAL_TOOL_REQUIRE_CONFIRMATION_FOR'],
+      fileConfig['EXTERNAL_TOOL_REQUIRE_CONFIRMATION_FOR'],
+    ],
+    [],
   ),
-  INTERNAL_TOOL_DISCOVERY_FIXTURE: parseToolAllowlist(
-    process.env['OPENCODE_TOOL_DISCOVERY_FIXTURE'],
-    parseToolAllowlist(fileConfig['INTERNAL_TOOL_DISCOVERY_FIXTURE'], defaultConfig.INTERNAL_TOOL_DISCOVERY_FIXTURE),
+  INTERNAL_WEB_FETCH_ENABLED: resolveBoolSetting(
+    [process.env['OPENCODE_INTERNAL_WEB_FETCH_ENABLED'], fileConfig['INTERNAL_WEB_FETCH_ENABLED']],
+    false,
   ),
-  HEALTH_DETAILS_ENABLED: parseBool(
-    process.env['OPENCODE_HEALTH_DETAILS_ENABLED'],
-    parseBool(fileConfig['HEALTH_DETAILS_ENABLED'], defaultConfig.HEALTH_DETAILS_ENABLED),
+  INTERNAL_ALLOWED_TOOLS: resolveListSetting(
+    [process.env['OPENCODE_INTERNAL_ALLOWED_TOOLS'], fileConfig['INTERNAL_ALLOWED_TOOLS']],
+    [],
   ),
-  HEALTH_DETAILS_REQUIRE_AUTH: parseBool(
-    process.env['OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH'],
-    parseBool(fileConfig['HEALTH_DETAILS_REQUIRE_AUTH'], defaultConfig.HEALTH_DETAILS_REQUIRE_AUTH),
+  INTERNAL_TOOL_METRICS_ENABLED: resolveBoolSetting(
+    [process.env['OPENCODE_INTERNAL_TOOL_METRICS_ENABLED'], fileConfig['INTERNAL_TOOL_METRICS_ENABLED']],
+    true,
   ),
-  METRICS_ENABLED: parseBool(
-    process.env['OPENCODE_METRICS_ENABLED'],
-    parseBool(fileConfig['METRICS_ENABLED'], defaultConfig.METRICS_ENABLED),
+  INTERNAL_TOOL_DISCOVERY_FIXTURE: resolveListSetting(
+    [process.env['OPENCODE_TOOL_DISCOVERY_FIXTURE'], fileConfig['INTERNAL_TOOL_DISCOVERY_FIXTURE']],
+    [],
   ),
-  METRICS_REQUIRE_AUTH: parseBool(
-    process.env['OPENCODE_METRICS_REQUIRE_AUTH'],
-    parseBool(fileConfig['METRICS_REQUIRE_AUTH'], defaultConfig.METRICS_REQUIRE_AUTH),
+  HEALTH_DETAILS_ENABLED: resolveBoolSetting(
+    [process.env['OPENCODE_HEALTH_DETAILS_ENABLED'], fileConfig['HEALTH_DETAILS_ENABLED']],
+    true,
   ),
-  USE_ISOLATED_HOME: parseBool(process.env['OPENCODE_USE_ISOLATED_HOME'], parseBool(fileConfig['USE_ISOLATED_HOME'], false)),
-  REQUEST_TIMEOUT_MS: parsePort(process.env['OPENCODE_PROXY_REQUEST_TIMEOUT_MS'], 0) || readFileNumber('REQUEST_TIMEOUT_MS', 180000),
-  RETRY_MAX_RETRIES: process.env['OPENCODE_PROXY_RETRY_MAX_RETRIES'] ?? fileConfig['RETRY_MAX_RETRIES'] ?? 3,
-  DEBUG: parseBool(process.env['OPENCODE_PROXY_DEBUG'], parseBool(fileConfig['DEBUG'], false)),
-  ZEN_API_KEY: process.env['OPENCODE_ZEN_API_KEY'] || readFileString('ZEN_API_KEY', ''),
-  PROMPT_MODE: process.env['OPENCODE_PROXY_PROMPT_MODE'] || readFileString('PROMPT_MODE', defaultConfig.PROMPT_MODE),
-  OMIT_SYSTEM_PROMPT: parseBool(
-    process.env['OPENCODE_PROXY_OMIT_SYSTEM_PROMPT'],
-    parseBool(fileConfig['OMIT_SYSTEM_PROMPT'], defaultConfig.OMIT_SYSTEM_PROMPT),
+  HEALTH_DETAILS_REQUIRE_AUTH: resolveBoolSetting(
+    [process.env['OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH'], fileConfig['HEALTH_DETAILS_REQUIRE_AUTH']],
+    true,
   ),
-  AUTO_CLEANUP_CONVERSATIONS: parseBool(
-    process.env['OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS'],
-    parseBool(fileConfig['AUTO_CLEANUP_CONVERSATIONS'], defaultConfig.AUTO_CLEANUP_CONVERSATIONS),
+  METRICS_ENABLED: resolveBoolSetting(
+    [process.env['OPENCODE_METRICS_ENABLED'], fileConfig['METRICS_ENABLED']],
+    false,
   ),
-  CLEANUP_INTERVAL_MS:
-    parsePort(process.env['OPENCODE_PROXY_CLEANUP_INTERVAL_MS'], 0) ||
-    readFileNumber('CLEANUP_INTERVAL_MS', defaultConfig.CLEANUP_INTERVAL_MS),
-  CLEANUP_MAX_AGE_MS:
-    parsePort(process.env['OPENCODE_PROXY_CLEANUP_MAX_AGE_MS'], 0) ||
-    readFileNumber('CLEANUP_MAX_AGE_MS', defaultConfig.CLEANUP_MAX_AGE_MS),
+  METRICS_REQUIRE_AUTH: resolveBoolSetting(
+    [process.env['OPENCODE_METRICS_REQUIRE_AUTH'], fileConfig['METRICS_REQUIRE_AUTH']],
+    true,
+  ),
+  USE_ISOLATED_HOME: resolveBoolSetting(
+    [process.env['OPENCODE_USE_ISOLATED_HOME'], fileConfig['USE_ISOLATED_HOME']],
+    false,
+  ),
+  REQUEST_TIMEOUT_MS: resolveDurationSetting(
+    [process.env['OPENCODE_PROXY_REQUEST_TIMEOUT_MS'], fileConfig['REQUEST_TIMEOUT_MS']],
+    180000,
+  ),
+  RETRY_MAX_RETRIES: resolveRetryCountSetting(
+    [
+      process.env['OPENCODE_PROXY_RETRY_MAX_RETRIES'],
+      process.env['RETRY_MAX_RETRIES'],
+      fileConfig['RETRY_MAX_RETRIES'],
+    ],
+    3,
+  ),
+  DEBUG: resolveBoolSetting([process.env['OPENCODE_PROXY_DEBUG'], fileConfig['DEBUG']], false),
+  ZEN_API_KEY: resolveStringSetting([process.env['OPENCODE_ZEN_API_KEY'], fileConfig['ZEN_API_KEY']], ''),
+  PROMPT_MODE: resolveStringSetting(
+    [process.env['OPENCODE_PROXY_PROMPT_MODE'], fileConfig['PROMPT_MODE']],
+    DEFAULT_PROMPT_MODE,
+  ),
+  OMIT_SYSTEM_PROMPT: resolveBoolSetting(
+    [process.env['OPENCODE_PROXY_OMIT_SYSTEM_PROMPT'], fileConfig['OMIT_SYSTEM_PROMPT']],
+    false,
+  ),
+  AUTO_CLEANUP_CONVERSATIONS: resolveBoolSetting(
+    [process.env['OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS'], fileConfig['AUTO_CLEANUP_CONVERSATIONS']],
+    false,
+  ),
+  CLEANUP_INTERVAL_MS: resolveDurationSetting(
+    [process.env['OPENCODE_PROXY_CLEANUP_INTERVAL_MS'], fileConfig['CLEANUP_INTERVAL_MS']],
+    DEFAULT_CLEANUP_INTERVAL_MS,
+  ),
+  CLEANUP_MAX_AGE_MS: resolveDurationSetting(
+    [process.env['OPENCODE_PROXY_CLEANUP_MAX_AGE_MS'], fileConfig['CLEANUP_MAX_AGE_MS']],
+    DEFAULT_CLEANUP_MAX_AGE_MS,
+  ),
   OPENCODE_HOME_BASE: null,
   // Fallback proxy pool (P3): env layer wins as a whole, then file, then default.
   // Empty = direct-only (default, zero overhead; engagable only on free-limit).
@@ -223,19 +333,37 @@ const finalConfig: ProxyConfig = {  PORT:
     const env = parseProxyList([process.env['OPENCODE_UPSTREAM_PROXIES'], process.env['UPSTREAM_PROXIES']]);
     if (env.length > 0) return env;
     const file = parseProxyList(fileConfig['UPSTREAM_PROXIES']);
-    return file.length > 0 ? file : [...defaultConfig.UPSTREAM_PROXIES];
+    return file.length > 0 ? file : [];
   })(),
-  UPSTREAM_PROXY_STRATEGY: normalizeProxyStrategy(
-    process.env['OPENCODE_UPSTREAM_PROXY_STRATEGY'] ||
-      readFileString('UPSTREAM_PROXY_STRATEGY', defaultConfig.UPSTREAM_PROXY_STRATEGY),
+  UPSTREAM_PROXY_STRATEGY: resolveEnumSetting(
+    [
+      process.env['OPENCODE_UPSTREAM_PROXY_STRATEGY'],
+      process.env['UPSTREAM_PROXY_STRATEGY'],
+      fileConfig['UPSTREAM_PROXY_STRATEGY'],
+    ],
+    PROXY_STRATEGIES,
+    DEFAULT_PROXY_STRATEGY,
   ),
   UPSTREAM_PROXY_COOLDOWN_MS: normalizeProxyCooldownMs(
-    parsePort(process.env['OPENCODE_UPSTREAM_PROXY_COOLDOWN_MS'], 0) ||
-      readFileNumber('UPSTREAM_PROXY_COOLDOWN_MS', defaultConfig.UPSTREAM_PROXY_COOLDOWN_MS),
+    resolveDurationSetting(
+      [
+        process.env['OPENCODE_UPSTREAM_PROXY_COOLDOWN_MS'],
+        process.env['UPSTREAM_PROXY_COOLDOWN_MS'],
+        fileConfig['UPSTREAM_PROXY_COOLDOWN_MS'],
+      ],
+      DEFAULT_PROXY_COOLDOWN_MS,
+    ),
   ),
   UPSTREAM_PROXY_NO_PROXY: parseProxyNoProxyList(
-    process.env['OPENCODE_UPSTREAM_PROXY_NO_PROXY'] ?? process.env['UPSTREAM_PROXY_NO_PROXY'] ?? fileConfig['UPSTREAM_PROXY_NO_PROXY'],
-    defaultConfig.UPSTREAM_PROXY_NO_PROXY,
+    resolveListSetting(
+      [
+        process.env['OPENCODE_UPSTREAM_PROXY_NO_PROXY'],
+        process.env['UPSTREAM_PROXY_NO_PROXY'],
+        fileConfig['UPSTREAM_PROXY_NO_PROXY'],
+      ],
+      [],
+    ),
+    DEFAULT_PROXY_NO_PROXY,
   ),
 };
 
@@ -261,6 +389,7 @@ console.log('[Config] Starting with configuration:');
 console.log(`  - Port: ${finalConfig.PORT}`);
 console.log(`  - Bind Host: ${finalConfig.BIND_HOST}`);
 console.log(`  - Backend: ${finalConfig.OPENCODE_SERVER_URL}`);
+console.log(`  - Backend Port: ${serverPort} (OPENCODE_SERVER_PORT; only bakes the default loopback URL)`);
 console.log(`  - Backend Password: ${finalConfig.OPENCODE_SERVER_PASSWORD ? 'Configured' : 'Not configured'}`);
 console.log(`  - OpenCode Path: ${finalConfig.OPENCODE_PATH}`);
 console.log(`  - API Key: ${finalConfig.API_KEY ? 'Configured' : 'Not configured (no auth)'}`);
@@ -274,6 +403,17 @@ console.log(`  - Zen API Key: ${finalConfig.ZEN_API_KEY ? 'Configured' : 'Not co
 console.log(`  - Disable Tools: ${finalConfig.DISABLE_TOOLS ? 'Yes' : 'No'}`);
 console.log(`  - External Tools Mode: ${finalConfig.EXTERNAL_TOOLS_MODE}`);
 console.log(`  - External Tools Conflict Policy: ${finalConfig.EXTERNAL_TOOLS_CONFLICT_POLICY}`);
+console.log(`  - External Tool Policy Mode: ${finalConfig.EXTERNAL_TOOL_POLICY_MODE}`);
+console.log(`  - External Tool Default Risk Level: ${finalConfig.EXTERNAL_TOOL_DEFAULT_RISK_LEVEL}`);
+console.log(
+  `  - External Tool Allowlist: ${finalConfig.EXTERNAL_TOOL_ALLOWLIST.length ? finalConfig.EXTERNAL_TOOL_ALLOWLIST.join(', ') : '(none)'}`,
+);
+console.log(
+  `  - External Tool Denylist: ${finalConfig.EXTERNAL_TOOL_DENYLIST.length ? finalConfig.EXTERNAL_TOOL_DENYLIST.join(', ') : '(none)'}`,
+);
+console.log(
+  `  - External Tool Confirmation Required: ${finalConfig.EXTERNAL_TOOL_REQUIRE_CONFIRMATION_FOR.length ? finalConfig.EXTERNAL_TOOL_REQUIRE_CONFIRMATION_FOR.join(', ') : '(none)'}`,
+);
 console.log(`  - Internal web_fetch Enabled: ${finalConfig.INTERNAL_WEB_FETCH_ENABLED ? 'Yes' : 'No'}`);
 console.log(
   `  - Internal Allowed Tools: ${finalConfig.INTERNAL_ALLOWED_TOOLS.length ? finalConfig.INTERNAL_ALLOWED_TOOLS.join(', ') : '(none)'}`,
@@ -289,7 +429,7 @@ console.log(`  - Metrics Require Auth: ${finalConfig.METRICS_REQUIRE_AUTH ? 'Yes
 console.log(`  - Use Isolated Home: ${finalConfig.USE_ISOLATED_HOME ? 'Yes' : 'No'}`);
 console.log(`  - Request Timeout: ${finalConfig.REQUEST_TIMEOUT_MS}ms`);
 console.log(
-  `  - Max Retries: ${resolveMaxRetries(finalConfig.RETRY_MAX_RETRIES)} (raw: ${String(finalConfig.RETRY_MAX_RETRIES)}, total attempts 1+n)`,
+  `  - Max Retries: ${resolveMaxRetries(finalConfig.RETRY_MAX_RETRIES)} (merged: ${String(finalConfig.RETRY_MAX_RETRIES)}, total attempts 1+n)`,
 );
 console.log(`  - Prompt Mode: ${finalConfig.PROMPT_MODE}`);
 console.log(`  - Omit System Prompt: ${finalConfig.OMIT_SYSTEM_PROMPT ? 'Yes' : 'No'}`);

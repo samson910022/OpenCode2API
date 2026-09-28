@@ -8,7 +8,9 @@
 
 ## 📌 配置方式
 
-> 配置优先级：**环境变量 > config.json > 默认值**
+> 配置优先级：**canonical 环境变量 > 兼容别名（legacy raw env） > `config.json` > 程序内默认值**
+
+> 每一层都会先做严格正规化再比较：**无效值一律让位给下一层**（不会 `Boolean('garbage')` 之类的强制转换，也不会静默遮蔽下层）。详见 [合并与正规化规则](#-合并与正规化规则)。
 
 > 📖 [Docs Index](./README.md) | 🏠 [Main README](../README.md)
 
@@ -20,21 +22,27 @@
 
 | 变量 | 默认值 | 说明 |
 |:-----|:-------|:-----|
-| `PORT` / `OPENCODE_PROXY_PORT` | `10000` | 代理服务端口 |
-| `OPENCODE_SERVER_PORT` | `10001` | OpenCode 后端服务端口 |
+| `OPENCODE_PROXY_PORT` / `PORT` | `10000` | 代理服务端口（canonical 优先，legacy `PORT` 其次，`config.json` 短键 `PORT` 第三）；严格校验 `1..65535`，无效值让位给下一层 |
+| `OPENCODE_SERVER_PORT` | `10001` | OpenCode 后端服务端口；严格校验 `1..65535`，无效值回落 `10001`（不会把 `abc` 拼进 URL 或传给 `opencode serve --port`）。**只用于生成默认回环 URL** `http://127.0.0.1:<port>`，显式 `OPENCODE_SERVER_URL` 永远优先 |
+| `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode 后端地址；只接受可解析的 `http(s)` URL，非法值让位给 `config.json`（短键同名）/ 默认值 |
 | `API_KEY` | - | Bearer Token 认证密钥 |
 | `API_KEYS` / `OPENCODE_API_KEYS` | - | 多 client keys（逗号分隔，任一通过；与 `API_KEY` 合并；为空回退免认证） |
 | `BIND_HOST` | `0.0.0.0` | 绑定地址（`BIND_HOST` 优先，`OPENCODE_PROXY_BIND_HOST` 为后备） |
-| `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode 后端地址 |
 | `OPENCODE_SERVER_PASSWORD` | - | OpenCode 后端密码 |
+| `OPENCODE_PATH` | `opencode` | OpenCode 可执行文件路径（空白/非字符串让位给 `config.json` / 默认值） |
 
 ### 功能配置
 
 | 变量 | 默认值 | 说明 |
 |:-----|:-------|:-----|
 | `OPENCODE_DISABLE_TOOLS` / `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用（兼容别名；`OPENCODE_DISABLE_TOOLS` 优先，二者无效值都会让位给下一顺位：canonical env > legacy env > `config.json` > 默认）。例外：① 疑似免费 Zen 模型（`opencode` provider 且 `-free` 后缀、`big-pickle`、`union-alpha`）剔除 prompt `tools` 映射中的 `false` 项（仅保留 `true` 项；全 `false` 则省略整个映射）以避开上游 `FreeTierError` 403（任意 `false` 均触发，`{}`/省略/`true`-only 通过），被剔除的工具回落服务端 agent 默认，此时仅靠 system prompt 禁用语 + 输出侧 markup 剥离承载禁用姿态；② `/v1/responses` 的 `web_search` 与 Interactions 的 `google_search` 会以 `hosted-search-grant` 单独放行 `websearch`（输出仅 `web_search_call` + 引文，不经过外部桥接） |
-| `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式；当前仅支持 `proxy-bridge` |
-| `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 外部工具冲突隔离策略；当前仅支持 `namespace` |
+| `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式；当前仅支持 `proxy-bridge`。非法值（env 或 `config.json`）打印 `[Config] Warning` 后让位给下一层，不会静默遮蔽 `config.json`；library 侧显式传入的 `options.EXTERNAL_TOOLS_MODE` 非法则直接抛错（fail-fast） |
+| `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 外部工具冲突隔离策略；当前仅支持 `namespace`，处理规则同上 |
+| `OPENCODE_EXTERNAL_TOOL_POLICY_MODE` | `enforce` | 外部工具策略模式：`enforce`（命中 `REQUIRE_CONFIRMATION_FOR` 时拦截）/ `report-only`（只记日志放行）。legacy raw env `EXTERNAL_TOOL_POLICY_MODE` 次之，`config.json` 短键同名第三 |
+| `OPENCODE_EXTERNAL_TOOL_DEFAULT_RISK_LEVEL` | `low` | 外部工具未声明风险时的兜底等级：`low`/`medium`/`high`/`critical`（大小写不敏感）。legacy raw env `EXTERNAL_TOOL_DEFAULT_RISK_LEVEL` 次之，`config.json` 短键同名第三 |
+| `OPENCODE_EXTERNAL_TOOL_ALLOWLIST` | `(none)` | 外部工具白名单，逗号分隔；非空时不在名单内的外部工具调用一律拦截。legacy raw env `EXTERNAL_TOOL_ALLOWLIST` 次之，`config.json` 短键同名第三（数组写法） |
+| `OPENCODE_EXTERNAL_TOOL_DENYLIST` | `(none)` | 外部工具黑名单，逗号分隔；优先级最高（命中即拒绝，不看白名单）。legacy raw env `EXTERNAL_TOOL_DENYLIST` 次之，`config.json` 短键同名第三 |
+| `OPENCODE_EXTERNAL_TOOL_REQUIRE_CONFIRMATION_FOR` | `(none)` | 需要确认才执行的外部工具名单，逗号分隔（`report-only` 模式只记录不拦截）。legacy raw env `EXTERNAL_TOOL_REQUIRE_CONFIRMATION_FOR` 次之，`config.json` 短键同名第三 |
 | `OPENCODE_INTERNAL_WEB_FETCH_ENABLED` | `false` | 兼容旧开关；未显式配置 allowlist 时，启用后默认放行 `web_fetch` |
 | `OPENCODE_INTERNAL_ALLOWED_TOOLS` | `(none)` | 当请求未传入 `tools` 时允许使用的 OpenCode 内置工具列表，逗号分隔（例 `websearch,webfetch`；`web_fetch` 等旧写法仍可匹配，大小写/分隔符不敏感） |
 | `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED` | `true` | 输出 internal allowlist 模式的调试/指标日志 |
@@ -43,14 +51,14 @@
 | `OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH` | `true` | 控制 `/health/details` 是否要求 Bearer 认证 |
 | `OPENCODE_METRICS_ENABLED` | `false` | 控制 Prometheus `/metrics` 是否暴露 |
 | `OPENCODE_METRICS_REQUIRE_AUTH` | `true` | 控制 `/metrics` 是否要求 Bearer 认证 |
-| `OPENCODE_USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录（`config.json` 中用短键 `USE_ISOLATED_HOME`） |
+| `OPENCODE_USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录（`config.json` 中用短键 `USE_ISOLATED_HOME`；裸 `USE_ISOLATED_HOME` 只是 file 短键，不读同名 env） |
 | `OPENCODE_PROXY_PROMPT_MODE` | `standard` | 提示词处理模式（`config.json` 中用短键 `PROMPT_MODE`） |
 | `OPENCODE_PROXY_OMIT_SYSTEM_PROMPT` | `false` | 忽略传入的 system prompt（`config.json` 中用短键 `OMIT_SYSTEM_PROMPT`） |
 | `OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS` | `false` | 自动清理会话存储（`config.json` 中用短键 `AUTO_CLEANUP_CONVERSATIONS`） |
 | `OPENCODE_PROXY_CLEANUP_INTERVAL_MS` | `43200000` | 清理间隔 (毫秒)（`config.json` 中用短键 `CLEANUP_INTERVAL_MS`） |
 | `OPENCODE_PROXY_CLEANUP_MAX_AGE_MS` | `86400000` | 最大存储时间 (毫秒)（`config.json` 中用短键 `CLEANUP_MAX_AGE_MS`） |
 | `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `180000` | 请求超时时间 (毫秒)（`config.json` 中用短键 `REQUEST_TIMEOUT_MS`） |
-| `OPENCODE_PROXY_RETRY_MAX_RETRIES` | `3` | 首次失败后重试次数 (0-5，总尝试 1+n；退避指数+jitter 并优先 `retry-after`)（`config.json` 中用短键 `RETRY_MAX_RETRIES`） |
+| `OPENCODE_PROXY_RETRY_MAX_RETRIES` | `3` | 首次失败后重试次数 (0-5，总尝试 1+n；退避指数+jitter 并优先 `retry-after`)（`config.json` 中用短键 `RETRY_MAX_RETRIES`，legacy raw env `RETRY_MAX_RETRIES` 亦可）。合并时按**严格整数**解析：`'3abc'`/`'2.9'`/`'1e1'` 视为无效并让位给下一层（不会被 `parseInt` 截断成 `3`/`2`/`1`）；0-5 的 clamp 仍由 `resolveMaxRetries` 统一执行 |
 
 > 重试退避移植自上游 `session/retry.ts`（`2s×2ⁿ⁻¹` +25% jitter），但 `retry-after` 等待 clamp 在 30s（上游近无界；网关面对自带超时的客户端不宜久睡）。旧部署注意：默认总尝试由 3 次变为 1+3=4 次，如需接近旧次数可设 `2`。
 
@@ -62,10 +70,10 @@
 
 | 变量 | 默认值 | 说明 |
 |:-----|:-------|:-----|
-| `OPENCODE_UPSTREAM_PROXIES` | `(none)` | 逗号分隔的代理 URL（`socks5://` 优先，亦支持 `http(s)://`；`config.json` 中用短键 `UPSTREAM_PROXIES` 数组） |
-| `OPENCODE_UPSTREAM_PROXY_STRATEGY` | `failover-rr` | `failover-rr` / `round-robin` / `random`（连续限流即轮换下一个） |
-| `OPENCODE_UPSTREAM_PROXY_COOLDOWN_MS` | `300000` |  engaged 粘滞时长（毫秒），到期回直连 |
-| `OPENCODE_UPSTREAM_PROXY_NO_PROXY` | `localhost,127.0.0.1,::1` | 永不走代理的目标 host（默认后端 `127.0.0.1` 恒直连） |
+| `OPENCODE_UPSTREAM_PROXIES` / `UPSTREAM_PROXIES` | `(none)` | 逗号分隔的代理 URL（`socks5://` 优先，亦支持 `http(s)://`；`config.json` 中用短键 `UPSTREAM_PROXIES` 数组） |
+| `OPENCODE_UPSTREAM_PROXY_STRATEGY` / `UPSTREAM_PROXY_STRATEGY` | `failover-rr` | `failover-rr` / `round-robin` / `random`（连续限流即轮换下一个）。非法值让位给下一层（`config.json` 短键 `UPSTREAM_PROXY_STRATEGY`） |
+| `OPENCODE_UPSTREAM_PROXY_COOLDOWN_MS` / `UPSTREAM_PROXY_COOLDOWN_MS` | `300000` |  engaged 粘滞时长（毫秒），到期回直连；非法/非正数让位给下一层（`config.json` 短键同名） |
+| `OPENCODE_UPSTREAM_PROXY_NO_PROXY` / `UPSTREAM_PROXY_NO_PROXY` | `localhost,127.0.0.1,::1` | 永不走代理的目标 host（默认后端 `127.0.0.1` 恒直连）；空字符串视为未设置，让位给别名/`config.json` |
 
 > 注意：`GET /health/details` 的 `internal_tools.fallback_proxies` 可观察 engaged 状态；`/metrics` 有 `opencode_fallback_proxy_engaged` gauge。流式 SSE 不走自定义 fetch（上游 SDK 缺口），fallback 自动降级为轮询。
 
@@ -86,7 +94,55 @@
 
 ---
 
+## 🧮 合并与正规化规则
+
+配置矩阵的合并与正规化逻辑集中在 `src/config/proxy-config.ts` 的纯函数里（`resolveStringSetting` / `resolveBoolSetting` / `resolveIntSetting` / `resolvePortSetting` / `resolveDurationSetting` / `resolveRetryCountSetting` / `resolveListSetting` / `resolveEnumSetting` / `resolveUrlSetting`），`index.ts`（生产入口）与 `buildProxyConfig`（library 入口）共用同一套实现，因此两边行为一致、且可被单元测试直接覆盖（`index.ts` 本身不可 import，会启动服务）。
+
+### 每层的判定顺序
+
+1. caller options（仅 library：`startProxy(...)` / `buildProxyConfig(...)` 传入值）
+2. env canonical（`OPENCODE_*`）
+3. env legacy raw alias（如 `PORT`、`DISABLE_TOOLS`、`RETRY_MAX_RETRIES`、`UPSTREAM_PROXY_*`、`EXTERNAL_TOOL_*`）
+4. `config.json` 短键
+5. 程序内硬编码默认值
+
+任何一层取值后都会先经过正规化，**无效即视为未设置**并让位给下一层；空字符串/空数组以外的非法值（`'garbage'`、`'2'`、`'yes '` 之类拼写错误、`0`/负数端口、不可解析 URL）都不会强制转换，也不会静默遮蔽下层。
+
+### 正规化细则
+
+| 类型 | 认可的写法 | 无效示例（让位下一层） |
+|:-----|:-----------|:-----------------------|
+| 布尔 | `1/true/yes/y/on` → true，`0/false/no/n/off` → false（大小写不敏感、自动 trim）；数字仅 `0`/`1` | `garbage`、`2`、`-1`、``（空串）、`   ` |
+| 整数（时长/重试等） | 整数字面量或纯整数字符串（可带 `+`/`-`、首尾空白） | `3abc`、`2.9`、`1e3`、`43200000ms`、空串 |
+| 端口 | 严格 `1..65535` 的整数 | `0`、`65536`、`-1`、`100 01`、`abc` |
+| URL | 可被 `URL` 解析且协议为 `http:`/`https:` | `not-a-url`、`127.0.0.1:10001`、`ftp://…` |
+| 枚举 | 大小写不敏感命中允许集合 | `yolo`、`urgent`（→ 打印 warning 并让位） |
+| 列表 | 逗号分隔字符串或字符串数组（trim + 去重 + 去空） | 非字符串/非数组（数字、对象）；空字符串视为未设置，显式 `[]` 视为「明确为空」 |
+
+### 双入口差异（已知，勿静默「修正」）
+
+| 项 | 生产入口 `index.ts` | library 入口 `buildProxyConfig` |
+|:---|:--------------------|:------------------------------|
+| `REQUEST_TIMEOUT_MS` 默认 | `180000` | `300000` |
+| `MANAGE_BACKEND` 默认 | `false` | `true` |
+| `OMIT_SYSTEM_PROMPT` 默认 | 恒定 `false` | `PROMPT_MODE=plugin-inject` 时自动 `true` |
+
+library 入口会额外读取 env 矩阵（非法值同样让位）：`OPENCODE_PROXY_PORT`/`PORT`、`OPENCODE_SERVER_PORT`（仅用于生成默认回环 URL）、`OPENCODE_SERVER_URL`、`OPENCODE_PATH`、`OPENCODE_PROXY_MANAGE_BACKEND`、`OPENCODE_USE_ISOLATED_HOME`、`OPENCODE_PROXY_RETRY_MAX_RETRIES`/`RETRY_MAX_RETRIES`，以及 `UPSTREAM_PROXIES`/`UPSTREAM_PROXY_STRATEGY`/`UPSTREAM_PROXY_COOLDOWN_MS`/`UPSTREAM_PROXY_NO_PROXY` 与 `EXTERNAL_TOOL_*` 别名。
+
+### Docker / Compose 为什么一律留空
+
+`Dockerfile` 的 `ENV` 与 `docker-compose.yml` 的 `environment` 对所有配置项都写成**空值**（`ENV X=` / `${X:-}`）。因为合并顺序是 env > file > default，镜像里写死非空默认值会**遮蔽挂载进来的 `config.json` 与 legacy 别名**（例如镜像内写死 `OPENCODE_PROXY_PORT=10000` 会让挂载的 `config.json` 里 `PORT: 8090` 永远不生效）。默认值由代码持有，因此「env 空 + 无 file」与旧的「env 非空默认值」表现完全一致。
+
+`docker-compose.yml` 的 `ports` 映射与 `healthcheck` 统一使用 `${OPENCODE_PROXY_PORT:-${PORT:-10000}}`，因此 legacy `PORT` 也能正确映射并探活，不会固定打在 `10000`。
+
+### entrypoint 端口校验
+
+`entrypoint.sh` 会对 `OPENCODE_PROXY_PORT`（回退到合法 legacy `PORT`）与 `OPENCODE_SERVER_PORT` 做 `1..65535` 校验。`OPENCODE_PROXY_PORT` 为空或非法时不会 export，让 `config.json` 的 `PORT` 有机会生效，脚本内部仅用 `10000` 打日志；`OPENCODE_SERVER_PORT` 仍会 export 正规化后的值，保证 invalid 端口不会被传给 `opencode serve --port`。
+
+---
+
 ## 📄 config.json 示例
+
 
 ```json
 {
@@ -97,6 +153,11 @@
     "DISABLE_TOOLS": true,
     "EXTERNAL_TOOLS_MODE": "proxy-bridge",
     "EXTERNAL_TOOLS_CONFLICT_POLICY": "namespace",
+    "EXTERNAL_TOOL_POLICY_MODE": "enforce",
+    "EXTERNAL_TOOL_DEFAULT_RISK_LEVEL": "low",
+    "EXTERNAL_TOOL_ALLOWLIST": [],
+    "EXTERNAL_TOOL_DENYLIST": [],
+    "EXTERNAL_TOOL_REQUIRE_CONFIRMATION_FOR": [],
     "INTERNAL_WEB_FETCH_ENABLED": false,
     "INTERNAL_ALLOWED_TOOLS": ["web_fetch"],
     "INTERNAL_TOOL_METRICS_ENABLED": true,
@@ -145,6 +206,20 @@ OpenCode2API 现在支持把外部客户端传入的 OpenAI-compatible `tools` �
 - OpenCode 内置工具仍按现有 `DISABLE_TOOLS` 机制管理，不会因为客户端传入同名工具而被误触发。
 - 代理内部会使用类似 `external__web_fetch` 的命名空间名避免冲突。
 - 这些内部命名空间名称不会作为公开 API 的一部分暴露给客户端。
+
+### 外部工具策略（allowlist / denylist / 确认）
+
+外部工具调用在执行前会过一层策略判定，五个开关都已正式接入配置矩阵（canonical `OPENCODE_EXTERNAL_TOOL_*` > legacy raw env `EXTERNAL_TOOL_*` > `config.json` 同名短键 > 默认值，非法值让位下一层）：
+
+| 判定顺序 | 配置项 | 行为 |
+|:---------|:-------|:-----|
+| 1（最高） | `EXTERNAL_TOOL_DENYLIST` | 命中即拒绝（`tool_denied_by_policy`），不再看白名单 |
+| 2 | `EXTERNAL_TOOL_ALLOWLIST` | 非空时，未命中即拒绝（`tool_not_allowed_by_policy`）；为空表示不限制 |
+| 3 | `EXTERNAL_TOOL_REQUIRE_CONFIRMATION_FOR` | 命中（或工具自身声明 `requiresConfirmation`）且 `EXTERNAL_TOOL_POLICY_MODE=enforce` 时返回 `require_confirmation`，该工具调用不会执行 |
+| 4 | `EXTERNAL_TOOL_POLICY_MODE` | `enforce`（默认，命中确认名单即拦截）/ `report-only`（只记 debug 日志并放行） |
+| 兜底 | `EXTERNAL_TOOL_DEFAULT_RISK_LEVEL` | 工具未声明风险等级时返回的 `effectiveRisk`（默认 `low`） |
+
+> 名单按客户端声明名 / 命名空间名（`external__<name>`）/ 原始名任一精确命中即可（exact-match only，不支持 `*` 通配符，例如用 `delete_repo,write_file` 而非 `delete_*,write_*`）；三个列表默认为空，即不改变现有行为。library 调用方也可直接传 `EXTERNAL_TOOL_ALLOWLIST: [...]` 等 options 覆盖。外部桥接工具由客户端执行，代理仅返回调用契约；名称推断的 sideEffect/risk 只做元数据，不自动触发 confirmation，operator 需用显式 confirmation 名单、deny/allowlist 控制。
 
 ### 内置工具 allowlist
 

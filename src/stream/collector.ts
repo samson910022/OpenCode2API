@@ -98,6 +98,104 @@ function extractMessagesList(messagesRes: unknown): unknown[] {
   return [];
 }
 
+function createAbortError(): Error {
+  const error = new Error('Request aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
+function toolPartStatus(part: unknown): unknown {
+  const record = asRecord(part);
+  const state = asRecord(record['state']);
+  return state['status'] ?? record['status'];
+}
+
+function isActiveToolPart(part: unknown): boolean {
+  const status = toolPartStatus(part);
+  return status === 'pending' || status === 'running';
+}
+
+function readSessionEventError(properties: unknown): unknown {
+  const props = asRecord(properties);
+  const direct = props['error'];
+  if (direct != null) return direct;
+  const data = asRecord(props['data']);
+  if (data['error'] != null) return data['error'];
+  const message = props['message'] ?? data['message'];
+  if (message != null) {
+    return { name: typeof props['name'] === 'string' ? props['name'] : 'SessionError', data: { message: String(message) } };
+  }
+  return { name: 'SessionError', data: { message: 'OpenCode session error' } };
+}
+
+async function readSessionMessages(
+  client: ProxyClient,
+  sessionId: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  if (signal?.aborted) throw createAbortError();
+  const controller = new AbortController();
+  const onAbort = (): void => controller.abort();
+  signal?.addEventListener('abort', onAbort, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let removeAbortListener = (): void => {};
+  let request: Promise<unknown>;
+  try {
+    request = Promise.resolve(client.session.messages({ path: { id: sessionId }, signal: controller.signal }));
+  } catch (error: unknown) {
+    request = Promise.reject(error);
+  }
+  request.catch(() => {});
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`Request timeout after ${timeoutMs}ms (poll messages)`));
+    }, Math.max(1, timeoutMs));
+  });
+  const abortPromise = signal
+    ? new Promise<never>((_, reject) => {
+        const onExternalAbort = (): void => reject(createAbortError());
+        removeAbortListener = (): void => signal.removeEventListener('abort', onExternalAbort);
+        if (signal.aborted) onExternalAbort();
+        else signal.addEventListener('abort', onExternalAbort, { once: true });
+      })
+    : null;
+  try {
+    return await Promise.race(abortPromise ? [request, timeoutPromise, abortPromise] : [request, timeoutPromise]);
+  } catch (error: unknown) {
+    if (signal?.aborted) throw createAbortError();
+    throw error;
+   } finally {
+     if (timer !== undefined) clearTimeout(timer);
+     removeAbortListener();
+     signal?.removeEventListener('abort', onAbort);
+   }
+
+}
+
+async function waitForPollDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) {
+    await sleep(ms);
+    return;
+  }
+  if (signal.aborted) throw createAbortError();
+  await new Promise<void>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      reject(createAbortError());
+    };
+    timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+}
+
 /**
  * Create per-instance collector closing over the OpenCode client + logDebug
  * (same closure semantics as the original createApp inner functions).
@@ -116,6 +214,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     sessionId: string,
     timeoutMs: number,
     intervalMs: number = DEFAULT_POLL_INTERVAL_MS,
+    signal?: AbortSignal,
   ): Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[] }> {
     // Drift signal only: backend-minted ses_* IDs should match the canonical
     // shape (see src/session/ids.ts). Never block on mismatch — the schema
@@ -130,8 +229,13 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     // a timeout fallback and otherwise wait for the message to actually finish.
     let lastPartial: { content: string; reasoning: string; error: null; toolParts: unknown[] } | null = null;
     while (Date.now() - startedAt < timeoutMs) {
-      const messagesRes: unknown = await client.session.messages({ path: { id: sessionId } });
-      const messages = extractMessagesList(messagesRes);
+      if (signal?.aborted) throw createAbortError();
+      const remainingMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
+       const messagesRes: unknown = await readSessionMessages(client, sessionId, remainingMs, signal);
+       const responseError = asRecord(messagesRes)['error'];
+       if (responseError != null) return { content: '', reasoning: '', error: responseError, toolParts: [] };
+       const messages = extractMessagesList(messagesRes);
+
       if (Array.isArray(messages) && messages.length) {
         for (let i = messages.length - 1; i >= 0; i -= 1) {
           const entry = asRecord(messages[i]);
@@ -139,12 +243,16 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
           if (info['role'] !== 'assistant') continue;
           const { content, reasoning, toolParts } = extractFromParts(entry['parts'] ?? []);
           const error: unknown = info['error'] ?? null;
-          // finish === 'tool' marks an intermediate turn that pauses for a tool
-          // result; the assistant is not done producing output yet.
-          const finish: unknown = info['finish'];
-          const time = asRecord(info['time']);
-          const finished = info['finish'] != null && finish !== 'tool';
-          const done = Boolean(finished || time['completed'] || error);
+          // finish === 'tool' and 'tool-calls' mark an intermediate turn that pauses for a
+          // tool result; the assistant is not done producing output yet, even when the
+          // message snapshot already carries a completion timestamp.
+           const finish: unknown = info['finish'];
+           const time = asRecord(info['time']);
+           const activeToolParts = toolParts.filter((part) => isActiveToolPart(part));
+           const awaitingTool = finish === 'tool' || finish === 'tool-calls' || activeToolParts.length > 0;
+           const finished = info['finish'] != null && !awaitingTool;
+           const done = Boolean(finished || (!awaitingTool && time['completed']) || error);
+
           if (toolParts.length > 0) {
             logDebug('Polling found tool parts', {
               sessionId,
@@ -183,7 +291,9 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
           break;
         }
       }
-      await sleep(intervalMs);
+       const remainingAfterSnapshot = Math.max(1, timeoutMs - (Date.now() - startedAt));
+       await waitForPollDelay(Math.min(intervalMs, remainingAfterSnapshot), signal);
+
     }
     if (lastPartial) {
       logDebug('Polling timeout with partial response', {
@@ -204,10 +314,31 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     onDelta?: ((delta: string, isReasoning?: boolean) => void) | null,
     firstDeltaTimeoutMs?: number | null,
     idleTimeoutMs?: number | null,
+    signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
     if (!isValidSessionId(sessionId)) logDebug('Unexpected backend session ID format', { sessionId });
+    if (signal?.aborted) return { content: '', reasoning: '', cancelled: true };
     const controller = new AbortController();
-    const eventStreamResult: unknown = await client.event.subscribe({ signal: controller.signal });
+    const CANCELLED = Symbol('collector-cancelled');
+    let removeSubscribeAbortListener = (): void => {};
+    const subscribePromise = Promise.resolve().then(() => client.event.subscribe({ signal: controller.signal }));
+    const subscribeAbortPromise = new Promise<typeof CANCELLED>((resolve) => {
+      const onAbort = (): void => {
+        controller.abort();
+        resolve(CANCELLED);
+      };
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener('abort', onAbort, { once: true });
+      removeSubscribeAbortListener = (): void => signal?.removeEventListener('abort', onAbort);
+    });
+     let eventStreamResult: unknown;
+     try {
+       eventStreamResult = await Promise.race([subscribePromise, subscribeAbortPromise]);
+     } finally {
+       removeSubscribeAbortListener();
+     }
+     if (eventStreamResult === CANCELLED) return { content: '', reasoning: '', cancelled: true };
+
     const eventStream = asRecord(eventStreamResult)['stream'] as AsyncIterable<BackendEvent>;
     let finished = false;
     let content = '';
@@ -219,10 +350,75 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     // tool call is active, the stream must stay open even if no text deltas arrive
     // (the backend is executing the tool). Resolving early here is what previously
     // truncated streaming responses that relied on internal tool execution.
-    const activeToolCallIds = new Set<string>();
-    const startedAt = Date.now();
+     const activeToolCallIds = new Set<string>();
+      // ID-less backend tool parts carry no stable `id` (older servers / some
+      // internal tools). A cumulative counter inflates here because
+      // `message.part.updated` fires repeatedly for the same logical tool while
+      // it stays pending (N pendings, 1 terminal) and `message.updated`
+      // snapshots re-deliver the same part on every update — pinning the idle
+      // exemption until REQUEST_TIMEOUT_MS. Track ID-less activity as a Set
+      // keyed by tool name instead: idempotent on repeats, concurrent across
+      // distinct tool names. Same-name concurrent ID-less tools share a bucket
+      // (accepted: rarer than repeat snapshots; degrades to boolean, not hang).
+      const activeNoidToolKeys = new Set<string>();
+      // Terminals already observed. `message.updated` snapshots re-deliver the
+      // same completed part on every update, so a replayed terminal must be
+      // ignored instead of falling through to the mismatch path below (which
+      // would delete an innocent still-running bucket).
+      const settledNoidKeys = new Set<string>();
+      const noidKeyFor = (pr: Record<string, unknown>): string => {
+        const tool = pr['tool'];
+        return typeof tool === 'string' && tool.trim() ? `noid:${tool.trim()}` : 'noid:unknown';
+      };
+      const hasActiveTools = (): boolean => activeToolCallIds.size > 0 || activeNoidToolKeys.size > 0;
+      // Bucket count for debug logging only (not a tool count: same-name
+      // concurrent ID-less tools share one bucket by design).
+      const activeToolCount = (): number => activeToolCallIds.size + activeNoidToolKeys.size;
+      const trackToolState = (part: unknown): void => {
+        // Unknown statuses are ignored (neither active nor terminal) to avoid
+        // false idle exemption.
+        const pr = asRecord(part);
+        if (pr['type'] !== 'tool') return;
+        const status = toolPartStatus(pr);
+        const id = typeof pr['id'] === 'string' ? (pr['id'] as string) : null;
+        if (status === 'pending' || status === 'running') {
+          if (id) activeToolCallIds.add(id);
+          else {
+            const key = noidKeyFor(pr);
+            // A re-run of the same tool after completion is a new logical tool.
+            settledNoidKeys.delete(key);
+            activeNoidToolKeys.add(key);
+          }
+        } else if (status === 'completed' || status === 'error') {
+          if (id) activeToolCallIds.delete(id);
+          else {
+            const key = noidKeyFor(pr);
+            if (activeNoidToolKeys.has(key)) {
+              activeNoidToolKeys.delete(key);
+              settledNoidKeys.add(key);
+            } else if (settledNoidKeys.has(key)) {
+              // Replayed terminal snapshot for an already-settled tool: ignore.
+            } else if (activeNoidToolKeys.size === 1) {
+              // Single-bucket name mismatch between pending and terminal (e.g.
+              // one side omits `tool`): clear the only bucket so a single
+              // completion cannot pin the stream open forever.
+              const first = activeNoidToolKeys.values().next();
+              if (!first.done) {
+                settledNoidKeys.add(first.value);
+                activeNoidToolKeys.delete(first.value);
+              }
+            }
+            // Multi-bucket ambiguity (size !== 1, unknown key): ignore rather
+            // than deleting an innocent tool. Truncating an answer via an early
+            // idle/stop is worse than waiting for the real terminal.
+          }
+        }
+      };
+     const startedAt = Date.now();
+     let removeCollectAbortListener = (): void => {};
 
-    const finishPromise = new Promise<Record<string, unknown>>((resolve, reject) => {
+     const finishPromise = new Promise<Record<string, unknown>>((resolve, reject) => {
+
       const timeoutId = setTimeout(() => {
         if (finished) return;
         finished = true;
@@ -240,8 +436,23 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
           }, firstDeltaTimeoutMs)
         : null;
 
-      let idleTimer: ReturnType<typeof setTimeout> | null = null;
-      const scheduleIdleTimer = (): void => {
+       let idleTimer: ReturnType<typeof setTimeout> | null = null;
+       const onSignalAbort = (): void => {
+         if (finished) return;
+         finished = true;
+         clearTimeout(timeoutId);
+         if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
+         if (idleTimer) clearTimeout(idleTimer);
+         controller.abort();
+         resolve({ content, reasoning, cancelled: true });
+       };
+       if (signal) {
+         signal.addEventListener('abort', onSignalAbort, { once: true });
+         removeCollectAbortListener = (): void => signal.removeEventListener('abort', onSignalAbort);
+         if (signal.aborted) onSignalAbort();
+       }
+       const scheduleIdleTimer = (): void => {
+
         if (!idleTimeoutMs) return;
         if (idleTimer) clearTimeout(idleTimer);
         idleTimer = setTimeout(() => {
@@ -249,11 +460,11 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
           // A tool call is still executing on the backend. Keep the stream open
           // and wait instead of cutting the response short; the follow-up text
           // (or the final completion) will arrive once the tool finishes.
-          if (activeToolCallIds.size > 0) {
+          if (hasActiveTools()) {
             logDebug('Event idle while internal tool call is active, continuing to wait', {
               sessionId,
               ms: Date.now() - startedAt,
-              activeTools: activeToolCallIds.size,
+              activeTools: activeToolCount(),
             });
             scheduleIdleTimer();
             return;
@@ -274,18 +485,11 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
         }, idleTimeoutMs);
       };
 
-      const trackToolActivity = (part: unknown): void => {
-        const pr = asRecord(part);
-        if (pr['type'] !== 'tool') return;
-        const state = asRecord(pr['state']);
-        const status = state['status'];
-        const id = typeof pr['id'] === 'string' ? (pr['id'] as string) : null;
-        if (status === 'pending' || status === 'running') {
-          if (id) activeToolCallIds.add(id);
-        } else if (status === 'completed' || status === 'error') {
-          if (id) activeToolCallIds.delete(id);
-        }
-        // Tool activity means the session is still working; treat it as progress
+       const trackToolActivity = (part: unknown): void => {
+         trackToolState(part);
+
+         // Tool activity means the session is still working; treat it as progress
+
         // so the idle timer does not terminate the stream mid-execution.
         receivedDelta = true;
         if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
@@ -330,16 +534,34 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
       (async (): Promise<void> => {
         try {
           for await (const event of eventStream) {
-            const evType: unknown = (event as Record<string, unknown>)['type'];
-            const props = asRecord((event as Record<string, unknown>)['properties']);
-            if (evType === 'message.part.updated' && asRecord(props['part'])['sessionID'] === sessionId) {
+             const evType: unknown = (event as Record<string, unknown>)['type'];
+             const props = asRecord((event as Record<string, unknown>)['properties']);
+             if (finished) break;
+             if (evType === 'session.error' && (props['sessionID'] == null || props['sessionID'] === sessionId)) {
+               const sessionError = readSessionEventError(props);
+               finished = true;
+               clearTimeout(timeoutId);
+               if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
+               if (idleTimer) clearTimeout(idleTimer);
+               controller.abort();
+               logDebug('SSE session error', { sessionId, ms: Date.now() - startedAt });
+               resolve({ content, reasoning, error: sessionError });
+               break;
+             }
+             if (evType === 'message.part.updated' && asRecord(props['part'])['sessionID'] === sessionId) {
+
               const part = asRecord(props['part']);
               rememberPartType(part);
               trackToolActivity(part);
               // Older OpenCode servers carried the streaming delta directly on
               // message.part.updated; newer servers emit message.part.delta.
-              const delta: unknown = props['delta'];
-              if (typeof delta === 'string' && delta) applyTextDelta(part['type'], delta);
+               const delta: unknown = props['delta'];
+               if (
+                 typeof delta === 'string' &&
+                 delta &&
+                 (part['type'] === 'text' || part['type'] === 'reasoning')
+               ) applyTextDelta(part['type'], delta);
+
               continue;
             }
             if (evType === 'message.part.delta' && props['sessionID'] === sessionId) {
@@ -363,7 +585,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
               // this, the collector waits out the whole first-delta window before
               // polling rediscovers the same error.
               const infoError: unknown = info['error'];
-              if (infoError && !finish) {
+              if (infoError != null) {
                 finished = true;
                 clearTimeout(timeoutId);
                 if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
@@ -381,19 +603,12 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
               if (Array.isArray(info['parts'])) {
                 for (const part of info['parts'] as unknown[]) {
                   rememberPartType(part);
-                  const pr = asRecord(part);
-                  if (pr['type'] === 'tool') {
-                    const status = asRecord(pr['state'])['status'];
-                    const id = typeof pr['id'] === 'string' ? (pr['id'] as string) : null;
-                    if (status === 'pending' || status === 'running') {
-                      if (id) activeToolCallIds.add(id);
-                    } else if (status === 'completed' || status === 'error') {
-                      if (id) activeToolCallIds.delete(id);
-                    }
-                  }
+                   trackToolState(part);
+
+
                 }
               }
-              if (finish === 'tool') {
+              if (finish === 'tool' || finish === 'tool-calls') {
                 // Assistant turn ended pending a tool call; keep waiting for the result.
                 if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
                 scheduleIdleTimer();
@@ -403,10 +618,10 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                 // Only treat the stream as completed when no tool call is still
                 // pending. OpenCode may emit an intermediate 'stop' snapshot while a
                 // tool call is in flight; resolving on it would drop the final answer.
-                if (activeToolCallIds.size > 0) {
+                if (hasActiveTools()) {
                   logDebug('Ignoring intermediate stop while tools are active', {
                     sessionId,
-                    activeTools: activeToolCallIds.size,
+                    activeTools: activeToolCount(),
                   });
                   continue;
                 }
@@ -420,7 +635,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                     ms: Date.now() - startedAt,
                     deltaChars,
                   });
-                  resolve({ content, reasoning });
+                  resolve(content || reasoning ? { content, reasoning } : { content, reasoning, noData: true });
                 }
                 break;
               }
@@ -440,9 +655,11 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
 
     try {
       return await finishPromise;
-    } finally {
-      controller.abort();
-    }
+     } finally {
+       removeCollectAbortListener();
+       controller.abort();
+     }
+
   }
 
   return { extractFromParts, promptWithTimeout, pollForAssistantResponse, collectFromEvents };

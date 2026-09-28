@@ -2,6 +2,10 @@ import { describe, expect, test } from '@jest/globals';
 import { buildExternalToolRegistry } from '../src/tool-runtime/registry.js';
 import {
     parseExternalToolCallsFromText,
+    parseExternalToolCallsFromJoinedText,
+    mergeToolCallArtifacts,
+    assertToolCallArtifactIntegrity,
+    stripExternalToolCallMarkupFromJoinedText,
     stripFunctionCallMarkup,
     createToolCallFilter,
     createExternalToolCallStreamParser
@@ -333,10 +337,9 @@ describe('XML child element arguments', () => {
         expect(stripFunctionCallMarkup(text, true, { registry: xmlRegistry })).toBe('Let me look:');
     });
 
-    test('still yields empty arguments when the body has no recognizable children', () => {
+    test('does not call a named tag whose body is neither JSON nor declared XML', () => {
         const text = '<read>just some prose</read>';
-        const { args } = firstCall(parseExternalToolCallsFromText(xmlRegistry, text));
-        expect(args).toEqual({});
+        expect(parseExternalToolCallsFromText(xmlRegistry, text)).toEqual([]);
     });
 });
 
@@ -524,6 +527,10 @@ describe('streaming: tool calls are extracted mid-stream', () => {
         expect(calls).toHaveLength(2);
         expect(calls[0].id).not.toBe(calls[1].id);
     });
+
+    test.each(['<external__read>', '<function=read>'])('does not flush an empty call for partial tag %s', (partial) => {
+        expect(runParser([partial])).toEqual([]);
+    });
 });
 
 describe('cross-channel blocks', () => {
@@ -551,6 +558,28 @@ describe('cross-channel blocks', () => {
     test('bare JSON in one channel still parses when that channel is passed alone', () => {
         const calls = parseExternalToolCallsFromText(registry, '{"name":"bash","arguments":{"command":"ls"}}');
         expect(calls).toHaveLength(1);
+    });
+
+    test('named tag split between reasoning and content completes in the joined view', () => {
+        const calls = parseExternalToolCallsFromJoinedText(
+            registry,
+            'before <external__read>',
+            '{"file":"a.txt"}</external__read> after'
+        );
+        expect(calls).toHaveLength(1);
+        expect(calls[0].function.name).toBe('read');
+        expect(JSON.parse(calls[0].function.arguments)).toEqual({ file: 'a.txt' });
+    });
+
+    test('function-equals tag split between reasoning and content completes in the joined view', () => {
+        const calls = parseExternalToolCallsFromJoinedText(
+            registry,
+            'before <function=read>',
+            '<parameter=file>a.txt</parameter></function> after'
+        );
+        expect(calls).toHaveLength(1);
+        expect(calls[0].function.name).toBe('read');
+        expect(JSON.parse(calls[0].function.arguments)).toEqual({ file: 'a.txt' });
     });
 });
 
@@ -604,5 +633,418 @@ describe('<function=name>/<parameter=key> markup (Qwen/GLM native dialect)', () 
         expect(stripped).not.toContain('<parameter=');
         expect(stripped).not.toContain('</function>');
         expect(stripped).toContain('Let me run a command');
+    });
+
+    test('joined parsing keeps a cross-channel call and per-channel calls', () => {
+        const reasoning = '<function_calls>{"name":"bash","arguments":{"command":"ls"';
+        const content = '}}</function_calls>';
+        const calls = parseExternalToolCallsFromJoinedText(registry, reasoning, content);
+        expect(calls).toHaveLength(1);
+        expect(JSON.parse(calls[0].function.arguments)).toEqual({ command: 'ls' });
+    });
+
+    test('joining does not double-count a complete channel call', () => {
+        const content = '<function_calls>{"name":"bash","arguments":{"command":"ls"}}</function_calls>';
+        const calls = parseExternalToolCallsFromJoinedText(registry, '', content);
+        expect(calls).toHaveLength(1);
+    });
+
+    test('merging retains different explicit ids and deduplicates generated artifacts', () => {
+        const first = parseExternalToolCallsFromText(registry, '<function_calls>{"id":"call_a","name":"bash","arguments":{"command":"ls"}}</function_calls>');
+        const second = parseExternalToolCallsFromText(registry, '<function_calls>{"id":"call_b","name":"bash","arguments":{"command":"ls"}}</function_calls>');
+        const generated = parseExternalToolCallsFromText(registry, '<function_calls>{"name":"bash","arguments":{"command":"pwd"}}</function_calls>');
+        const merged = mergeToolCallArtifacts(first, second, generated, generated);
+        expect(merged.map((call) => call.id)).toEqual(['call_a', 'call_b', expect.any(String)]);
+        expect(new Set(merged.map((call) => call.id)).size).toBe(3);
+    });
+
+    test('collect and merge retain same-call explicit ids and same-id argument conflicts', () => {
+        const calls = parseExternalToolCallsFromText(
+            registry,
+            '<function_calls>[{"id":"call_a","name":"read","arguments":{"file":"a.txt"}},{"id":"call_b","name":"read","arguments":{"file":"a.txt"}},{"id":"call_a","name":"read","arguments":{"file":"b.txt"}}]</function_calls>'
+        );
+        const merged = mergeToolCallArtifacts(calls);
+        expect(merged.map((call) => call.id)).toEqual(['call_a', 'call_b', 'call_a']);
+        expect(merged.map((call) => JSON.parse(call.function.arguments))).toEqual([
+            { file: 'a.txt' },
+            { file: 'a.txt' },
+            { file: 'b.txt' }
+        ]);
+        expect(() => assertToolCallArtifactIntegrity(merged, registry, '')).toThrow(/duplicate external tool call id/);
+    });
+
+    test('does not deduplicate a generated artifact against an explicit call', () => {
+        const explicit = parseExternalToolCallsFromText(registry, '<function_calls>{"id":"call_explicit","name":"read","arguments":{"file":"a.txt"}}</function_calls>');
+        const generated = parseExternalToolCallsFromText(registry, '<function_calls>{"name":"read","arguments":{"file":"a.txt"}}</function_calls>');
+        expect(mergeToolCallArtifacts(explicit, generated)).toHaveLength(2);
+    });
+
+    test('deduplicates explicit ids with canonical argument key order', () => {
+        const first = parseExternalToolCallsFromText(registry, '<function_calls>{"id":"same","name":"read","arguments":{"file":"a.txt","offset":1}}</function_calls>');
+        const second = parseExternalToolCallsFromText(registry, '<function_calls>{"id":"same","name":"read","arguments":{"offset":1,"file":"a.txt"}}</function_calls>');
+        const merged = mergeToolCallArtifacts(first, second);
+        expect(merged).toHaveLength(1);
+        expect(() => assertToolCallArtifactIntegrity(merged, registry, '')).not.toThrow();
+    });
+
+    test('generated artifacts with different arguments receive unique merged ids', () => {
+        const first = parseExternalToolCallsFromText(registry, '<function_calls>{"name":"read","arguments":{"file":"a.txt"}}</function_calls>');
+        const second = parseExternalToolCallsFromText(registry, '<function_calls>{"name":"read","arguments":{"file":"b.txt"}}</function_calls>');
+        const merged = mergeToolCallArtifacts(first, second);
+        expect(merged).toHaveLength(2);
+        expect(new Set(merged.map((call) => call.id)).size).toBe(2);
+    });
+
+    test('retains different explicit ids with the same arguments', () => {
+        const calls = parseExternalToolCallsFromText(
+            registry,
+            '<function_calls>[{"id":"call_a","name":"read","arguments":{"file":"a.txt"}},{"id":"call_b","name":"read","arguments":{"file":"a.txt"}}]</function_calls>'
+        );
+        const merged = mergeToolCallArtifacts(calls);
+        expect(merged.map((call) => call.id)).toEqual(['call_a', 'call_b']);
+    });
+
+    test('retains generated parallel calls with identical arguments', () => {
+        const calls = parseExternalToolCallsFromText(
+            registry,
+            '<function_calls>[{"name":"read","arguments":{"file":"a.txt"}},{"name":"read","arguments":{"file":"a.txt"}}]</function_calls>'
+        );
+        expect(calls).toHaveLength(2);
+        const merged = mergeToolCallArtifacts(calls);
+        expect(merged).toHaveLength(2);
+        expect(new Set(merged.map((call) => call.id)).size).toBe(2);
+    });
+
+    test('deduplicates a repeated generated artifact to a single call', () => {
+        const single = parseExternalToolCallsFromText(registry, '<function_calls>{"name":"read","arguments":{"file":"a.txt"}}</function_calls>');
+        const merged = mergeToolCallArtifacts(single, single);
+        expect(merged).toHaveLength(1);
+    });
+});
+
+describe('malformed envelope gate', () => {
+    const gate = (text) => {
+        try {
+            assertToolCallArtifactIntegrity(
+                parseExternalToolCallsFromJoinedText(registry, '', text),
+                registry,
+                text
+            );
+            return null;
+        } catch (error) {
+            return error.code;
+        }
+    };
+
+    test.each([
+        ['an unclosed DSML container', '<tool_calls>{"name":"bash","arguments":{"command":"ls"}}'],
+        [
+            'an unclosed DSML marker container',
+            '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="bash"><｜｜DSML｜｜parameter name="command" string="true">ls</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>'
+        ],
+        ['an unclosed <tool_call> wrapper', '<tool_call>{"name":"bash","arguments":{"command":"ls"}}'],
+        [
+            'a bare array with an invalid member',
+            '[{"name":"bash","arguments":{"command":"ls"}},{"arguments":{"command":"pwd"}}]'
+        ],
+        [
+            'a bare array with an unknown member',
+            '[{"name":"bash","arguments":{"command":"ls"}},{"name":"missing","arguments":{}}]'
+        ],
+        ['a bare array with a trailing member', '[{"name":"bash","arguments":{"command":"ls"}},"junk"]'],
+        [
+            'a valid canonical block followed by an unclosed DSML container',
+            '<function_calls>{"name":"bash","arguments":{"command":"ls"}}</function_calls><tool_calls>{"name":"bash"'
+        ],
+        [
+            'a valid DSML container followed by an unclosed <tool_call> wrapper',
+            '<tool_calls><invoke name="bash"><parameter name="command" string="true">ls</parameter></invoke></tool_calls><tool_call>{"name":"bash"'
+        ],
+        [
+            'a valid bare call followed by a bare array with a bad member',
+            '{"name":"bash","arguments":{"command":"ls"}}\n[{"name":"bash","arguments":{"command":"pwd"}},7]'
+        ]
+    ])('rejects %s', (_label, text) => {
+        expect(gate(text)).toBe('malformed_external_tool_call');
+    });
+
+    test('rejects a nested canonical exception followed by another unclosed block', () => {
+        const text = '<function_calls><function_calls>{"name":"bash","arguments":{"command":"ls"}}</function_calls><function_calls>{"name":"bash"';
+        expect(gate(text)).toBe('malformed_external_tool_call');
+    });
+
+    test.each([
+        ['<tool_calls>', '<tool_calls>'],
+        ['<\u200btool_call>', '<\u200btool_call>']
+    ])('does not treat %s inside a JSON string as an envelope', (_label, marker) => {
+        const text = `<function_calls>{"name":"external__bash","arguments":{"command":"printf '%s'"}}</function_calls>`;
+        const marked = text.replace('printf', `printf ${marker}`);
+        const calls = parseExternalToolCallsFromText(registry, marked);
+        expect(calls).toHaveLength(1);
+        expect(JSON.parse(calls[0].function.arguments).command).toContain(marker);
+        expect(gate(marked)).toBeNull();
+    });
+
+    test('accepts a complete zero-argument function dialect call', () => {
+        const pingRegistry = buildExternalToolRegistry([{
+            type: 'function',
+            function: { name: 'ping', parameters: { type: 'object', properties: {}, required: [] } }
+        }]);
+        const text = '<function=ping></function>';
+        const calls = parseExternalToolCallsFromText(pingRegistry, text);
+        expect(calls).toHaveLength(1);
+        expect(calls[0].function.name).toBe('ping');
+        expect(JSON.parse(calls[0].function.arguments)).toEqual({});
+        expect(() => assertToolCallArtifactIntegrity(calls, pingRegistry, text)).not.toThrow();
+    });
+
+    test.each([
+        ['an ordinary JSON object', '{"ordinaryLeading":true}'],
+        ['an ordinary array', '[1,2,3]'],
+        ['a named JSON body outside the registry', '{"name":"totally_other","arguments":{}}'],
+        ['a valid canonical block', '<function_calls>{"name":"bash","arguments":{"command":"ls"}}</function_calls>'],
+        ['an explicit nested canonical wrapper', '<function_calls>\n<function_calls>\n{"name":"bash","arguments":{"command":"ls"}}\n</function_calls>'],
+        ['a prefixed canonical payload', '<function_calls>calling tool: {"name":"bash","arguments":{"command":"pwd"}}</function_calls>'],
+        ['a valid bare call', '{"name":"bash","arguments":{"command":"ls"}}'],
+        ['a valid bare array', '[{"name":"bash","arguments":{"command":"ls"}},{"name":"read","arguments":{"file":"a.txt"}}]'],
+        [
+            'a valid DSML container',
+            '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="bash"><｜｜DSML｜｜parameter name="command" string="true">ls</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>'
+        ],
+        ['prose', 'just some prose about running commands']
+    ])('accepts %s', (_label, text) => {
+        expect(gate(text)).toBeNull();
+    });
+
+    test.each([
+        [
+            'canonical JSON with a conflicting payload',
+            '<function_calls>[{"id":"same","name":"bash","arguments":{"command":"ls"}},{"id":"same","name":"bash","arguments":{"command":"pwd"}}]</function_calls>'
+        ],
+        [
+            'canonical JSON with an unknown trailing payload',
+            '<function_calls>{"name":"bash","arguments":{"command":"ls"}}{"name":"missing","arguments":{}}</function_calls>'
+        ],
+        [
+            'canonical JSON with malformed trailing text',
+            '<function_calls>{"name":"bash","arguments":{"command":"ls"}}{"name":"bash" arguments</function_calls>'
+        ],
+        [
+            'DSML with a later unclosed invoke',
+            '<tool_calls><invoke name="bash"><parameter name="command">ls</parameter></invoke><invoke name="read"><parameter name="file">a.txt</parameter></tool_calls>'
+        ],
+        [
+            'DSML with an unclosed parameter',
+            '<tool_calls><invoke name="bash"><parameter name="command">ls</invoke></tool_calls>'
+        ],
+        [
+            'tool wrapper JSON with an unknown trailing payload',
+            '<tool_call>{"name":"bash","arguments":{"command":"ls"}}{"name":"missing","arguments":{}}</tool_call>'
+        ],
+        [
+            'tool wrapper JSON with malformed trailing text',
+            '<tool_call>{"name":"bash","arguments":{"command":"ls"}} trailing</tool_call>'
+        ],
+        [
+            'tool wrapper function call with trailing text',
+            '<tool_call><function=bash><parameter=command>ls</parameter></function> trailing</tool_call>'
+        ],
+        [
+            'tool wrapper tag call with trailing text',
+            '<tool_call><external__bash>{"command":"ls"}</external__bash> trailing</tool_call>'
+        ],
+        [
+            'bare array without its closing bracket',
+            '[{"name":"bash","arguments":{"command":"ls"}}'
+        ],
+        [
+            'bare array followed by a second payload',
+            '[{"name":"bash","arguments":{"command":"ls"}}] {"name":"bash","arguments":{"command":"pwd"}}'
+        ],
+        [
+            'bare array with an unknown member',
+            '[{"name":"bash","arguments":{"command":"ls"}},{"name":"missing","arguments":{}}]'
+        ],
+        [
+            'a valid canonical block followed by a second bare payload',
+            '<function_calls>{"name":"bash","arguments":{"command":"ls"}}</function_calls>{"name":"bash","arguments":{"command":"pwd"}}'
+        ],
+        [
+            'a valid DSML container followed by a second bare payload',
+            '<tool_calls><invoke name="bash"><parameter name="command">ls</parameter></invoke></tool_calls>{"name":"bash","arguments":{"command":"pwd"}}'
+        ],
+        [
+            'a valid <tool_call> wrapper followed by a second bare payload',
+            '<tool_call>{"name":"bash","arguments":{"command":"ls"}}</tool_call>{"name":"bash","arguments":{"command":"pwd"}}'
+        ],
+        [
+            'a bare payload truncated behind a fuzzy tool alias',
+            '{"name":"externalbash","arguments":{"command":"ls"'
+        ],
+        [
+            'a bare array truncated behind a fuzzy tool alias',
+            '[{"name":"externalbash","arguments":{"command":'
+        ]
+    ])('rejects %s', (_label, text) => {
+        expect(gate(text)).not.toBeNull();
+    });
+
+    test('does not emit or hide a non-JSON wrapper call with trailing content', () => {
+        const text = '<tool_call><function=read><parameter=file>a.txt</parameter></function> trailing</tool_call>';
+        expect(parseExternalToolCallsFromText(registry, text)).toEqual([]);
+        expect(stripFunctionCallMarkup(text, false, { registry })).toContain('trailing');
+    });
+
+    test('never parses a second bare payload after a canonical block', () => {
+        const text = '<function_calls>{"name":"bash","arguments":{"command":"ls"}}</function_calls>{"name":"bash","arguments":{"command":"pwd"}}';
+        expect(gate(text)).toBe('malformed_external_tool_call');
+        expect(parseExternalToolCallsFromText(registry, text)).toHaveLength(1);
+    });
+
+    test('resolves a fuzzy tool alias in a bare payload through the registry', () => {
+        const calls = parseExternalToolCallsFromText(registry, '{"name":"externalbash","arguments":{"command":"ls"}}');
+        expect(calls).toHaveLength(1);
+        expect(calls[0].function.name).toBe('bash');
+        expect(gate('{"name":"externalbash","arguments":{"command":"ls"}}')).toBeNull();
+    });
+
+    test('does not leak an unclosed naked invoke', () => {
+        const text = '<invoke name="bash"><parameter name="command">ls';
+        expect(parseExternalToolCallsFromText(registry, text)).toEqual([]);
+        expect(stripFunctionCallMarkup(text)).toBe('');
+        expect(gate(text)).toBe('malformed_external_tool_call');
+    });
+});
+
+describe('joined bare tool-call sanitizer', () => {
+    const bare = '{"name":"bash","arguments":{"command":"ls"}}';
+
+    test('removes a bare call from the content channel and keeps reasoning text', () => {
+        expect(stripExternalToolCallMarkupFromJoinedText(registry, 'let me check that', bare)).toEqual({
+            reasoning: 'let me check that',
+            content: ''
+        });
+    });
+
+    test('removes a bare call from the reasoning channel and keeps content text', () => {
+        expect(stripExternalToolCallMarkupFromJoinedText(registry, bare, 'here is the answer')).toEqual({
+            reasoning: '',
+            content: 'here is the answer'
+        });
+    });
+
+    test('removes a bare call from the content channel with a trailing space', () => {
+        expect(stripExternalToolCallMarkupFromJoinedText(registry, 'thinking', `  ${bare}  `, true)).toEqual({
+            reasoning: 'thinking',
+            content: ''
+        });
+    });
+
+    test('removes a bare call that is the only content of both channels', () => {
+        expect(stripExternalToolCallMarkupFromJoinedText(registry, bare, 'plain tail')).toEqual({
+            reasoning: '',
+            content: 'plain tail'
+        });
+    });
+
+    test.each([
+        ['an ordinary JSON object', '{"ordinaryLeading":true}'],
+        ['a non-tool array', '[1,2,3]'],
+        ['a named JSON body outside the registry', '{"name":"totally_other","arguments":{}}']
+    ])('keeps %s in the content channel', (_label, text) => {
+        expect(stripExternalToolCallMarkupFromJoinedText(registry, 'thinking', text)).toEqual({
+            reasoning: 'thinking',
+            content: text
+        });
+    });
+
+    test('keeps an ordinary JSON body in the reasoning channel', () => {
+        expect(stripExternalToolCallMarkupFromJoinedText(registry, '{"ordinaryLeading":true}', 'answer')).toEqual({
+            reasoning: '{"ordinaryLeading":true}',
+            content: 'answer'
+        });
+    });
+
+    test('still strips a bare call from the joined single-channel view', () => {
+        expect(stripExternalToolCallMarkupFromJoinedText(registry, '', bare, true)).toEqual({
+            reasoning: '',
+            content: ''
+        });
+    });
+});
+
+describe('bare payload source views', () => {
+    const bare = '{"name":"bash","arguments":{"command":"ls"}}';
+    const gateChannels = (channels) => {
+        try {
+            assertToolCallArtifactIntegrity(
+                parseExternalToolCallsFromJoinedText(registry, channels[0] ?? '', channels[1] ?? ''),
+                registry,
+                channels
+            );
+            return null;
+        } catch (error) {
+            return error.code;
+        }
+    };
+    const gateGroups = (groups) => {
+        try {
+            assertToolCallArtifactIntegrity(
+                mergeToolCallArtifacts(...groups.map((group) => parseExternalToolCallsFromJoinedText(registry, group[0] ?? '', group[1] ?? ''))),
+                registry,
+                groups
+            );
+            return null;
+        } catch (error) {
+            return error.code;
+        }
+    };
+
+    test('accepts a bare payload split across the reasoning and content channels', () => {
+        const reasoning = '{"name":"bash","arguments":{"command":';
+        const content = '"ls"}}';
+        const calls = parseExternalToolCallsFromJoinedText(registry, reasoning, content);
+        expect(calls).toHaveLength(1);
+        expect(JSON.parse(calls[0].function.arguments)).toEqual({ command: 'ls' });
+        expect(gateChannels([reasoning, content])).toBeNull();
+        expect(stripExternalToolCallMarkupFromJoinedText(registry, reasoning, content, true)).toEqual({
+            reasoning: '',
+            content: ''
+        });
+    });
+
+    test('rejects a split bare payload that never closes in the joined view', () => {
+        expect(gateChannels(['{"name":"bash","arguments":{"command":', '"ls"'])).toBe('malformed_external_tool_call');
+    });
+
+    test('keeps ordinary JSON and arrays in either channel', () => {
+        expect(gateChannels(['{"ordinaryLeading":true}', '[1,2,3]'])).toBeNull();
+        expect(stripExternalToolCallMarkupFromJoinedText(registry, '{"ordinaryLeading":true}', '[1,2,3]', true)).toEqual({
+            reasoning: '{"ordinaryLeading":true}',
+            content: '[1,2,3]'
+        });
+    });
+
+    test('keeps a bare payload that owns one channel while the other carries prose', () => {
+        expect(gateChannels([bare, 'the result is 42'])).toBeNull();
+        expect(stripExternalToolCallMarkupFromJoinedText(registry, bare, 'the result is 42', true)).toEqual({
+            reasoning: '',
+            content: 'the result is 42'
+        });
+    });
+
+    test('separates the joined view from the per-channel view', () => {
+        const opener = '<function_calls>{"name":"bash","arguments":{"command":"ls"}}';
+        const closer = '</function_calls>';
+        expect(gateChannels([opener, closer])).toBeNull();
+        expect(gateGroups([[opener], [closer]])).toBe('malformed_external_tool_call');
+    });
+
+    test('checks each grouped document on its own joined view', () => {
+        expect(gateGroups([[bare], ['answer text']])).toBeNull();
+        expect(gateGroups([['{"ordinaryLeading":true}'], [bare]])).toBeNull();
+        expect(
+            gateGroups([['<function_calls>{"name":"bash","arguments":{"command":"ls"}}</function_calls>{"name":"bash","arguments":{"command":"pwd"}}']])
+        ).toBe('malformed_external_tool_call');
     });
 });

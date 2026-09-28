@@ -56,14 +56,16 @@ export interface CollectorHandle {
   pollForAssistantResponse: (
     sessionId: string,
     timeoutMs: number,
-    intervalMs?: number
+    intervalMs?: number,
+    signal?: AbortSignal
   ) => Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[] }>;
   collectFromEvents: (
     sessionId: string,
     timeoutMs: number,
     onDelta?: ((delta: string, isReasoning?: boolean) => void) | null,
     firstDeltaTimeoutMs?: number | null,
-    idleTimeoutMs?: number | null
+    idleTimeoutMs?: number | null,
+    signal?: AbortSignal
   ) => Promise<Record<string, unknown>>;
 }
 
@@ -73,6 +75,7 @@ export interface InternalToolMetrics {
   disabledRequests: number;
   discoveryFailures: number;
   fallbackToDisabled: number;
+  overrideOmitted: number;
 }
 
 /** Per-instance context threaded through route registrars (same names as closures). */
@@ -109,7 +112,7 @@ export interface AppContext {
   logDebug: (...args: unknown[]) => void;
   responseState: Map<string, ResponseStateEntry>;
   getResponseState: (responseId: unknown) => ResponseStateEntry | null;
-  storeResponseState: (responseId: unknown, sessionId: unknown, model: unknown) => void;
+  storeResponseState: (responseId: unknown, sessionId: unknown, model: unknown, toolCalls?: unknown) => void;
   sweepResponseState: () => Promise<void>;
   TOOL_MODE: ToolModeSet;
   TOOL_GUARD_MESSAGE: string;
@@ -118,7 +121,7 @@ export interface AppContext {
   getEffectiveInternalAllowedTools: () => string[];
   SERVER_INTERNAL_ALLOWED_TOOL_NAMES: string[];
   buildInternalAllowlistPrompt: (allowedToolNames?: unknown) => string;
-  buildSystemPrompt: (systemMsg: unknown, reasoningEffort?: unknown, toolMode?: unknown, internalAllowedTools?: unknown) => string | undefined;
+  buildSystemPrompt: (systemMsg: unknown, externalToolPrompt?: unknown, reasoningEffort?: unknown, toolMode?: unknown, internalAllowedTools?: unknown) => string | undefined;
   selectPromptToolOverrides: (overrides: unknown, providerID?: unknown, modelID?: unknown) => Record<string, boolean> | null;
   normalizeReasoningEffort: (value: unknown, fallback?: unknown) => string | null;
   stripFunctionCalls: (text: unknown, trim?: boolean) => string;
@@ -132,6 +135,7 @@ export interface AppContext {
     parsedToolCalls: unknown,
     registry: unknown
   ) => { validCalls: ValidatedToolCall[]; invalidCalls: Array<{ call: unknown; validation: unknown }> };
+  finalizeStreamToolCalls: (parsedToolCalls: unknown, registry: unknown, toolChoice: unknown, sourceText?: unknown, parallelToolCalls?: unknown) => ValidatedToolCall[];
   toPublicToolCalls: (toolCalls: unknown) => FinalToolCall[];
   createForcedToolCallRequester: (options: ForcedToolCallRequesterOptions) => () => Promise<Record<string, unknown> | null>;
   TOOL_IDS_CACHE_MS: number;
@@ -161,6 +165,10 @@ export interface AppContext {
   proxyPollForAssistantResponse: CollectorHandle['pollForAssistantResponse'];
   getCachedToolIds: () => string[] | null;
   getCachedToolIdsAt: () => number;
+  getDiscoverySource: () => string;
+  getDiscoveryLastSuccessAt: () => number;
+  getDiscoveryLastErrorAt: () => number;
+  getDiscoveryLastError: () => string | null;
   /** Wired N×N translator registry (Phase 1 wiring; optional so manual test ctx still compiles). */
   translators?: TranslatorRegistry;
 }

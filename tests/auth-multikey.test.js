@@ -8,7 +8,7 @@ const sdkMocks = {
         }
     })),
     configUpdate: jest.fn(async () => ({})),
-    toolIds: jest.fn(async () => ({ data: [] })),
+    toolIds: jest.fn(async () => ({ data: ['web_fetch', 'filesystem', 'bash'] })),
     sessionCreate: jest.fn(async () => ({ data: { id: 'mk-session' } })),
     sessionPrompt: jest.fn(async () => ({ data: { parts: [{ type: 'text', text: 'ok' }] } })),
     sessionMessages: jest.fn(async () => ([{ info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'ok' }] }])),

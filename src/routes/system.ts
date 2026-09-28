@@ -11,6 +11,7 @@ export function registerSystemRoutes(app: Application, ctx: AppContext): void {
   const {
     API_KEY,
     API_KEYS = [],
+    DISABLE_TOOLS,
     INTERNAL_TOOL_METRICS_ENABLED,
     INTERNAL_TOOL_DISCOVERY_FIXTURE,
     HEALTH_DETAILS_ENABLED,
@@ -24,6 +25,10 @@ export function registerSystemRoutes(app: Application, ctx: AppContext): void {
     internalToolMetrics,
     getCachedToolIds,
     getCachedToolIdsAt,
+    getDiscoverySource,
+    getDiscoveryLastSuccessAt,
+    getDiscoveryLastErrorAt,
+    getDiscoveryLastError,
     proxyPool,
   } = ctx;
   // ctx.API_KEYS is already the effective list built by createApp; the merge
@@ -82,6 +87,15 @@ export function registerSystemRoutes(app: Application, ctx: AppContext): void {
     const metricsSnapshot = INTERNAL_TOOL_METRICS_ENABLED ? { ...internalToolMetrics } : null;
     const cached = getCachedToolIds();
     const cachedAt = getCachedToolIdsAt();
+    const discoverySource = typeof getDiscoverySource === 'function' ? getDiscoverySource() : 'none';
+    const discoverySuccessAt = typeof getDiscoveryLastSuccessAt === 'function' ? getDiscoveryLastSuccessAt() : 0;
+    const discoveryErrorAt = typeof getDiscoveryLastErrorAt === 'function' ? getDiscoveryLastErrorAt() : 0;
+    const discoveryError = typeof getDiscoveryLastError === 'function' ? getDiscoveryLastError() : null;
+    const idsCount = cached ? cached.length : 0;
+    const cacheAgeMs = cachedAt ? Date.now() - cachedAt : null;
+    const liveVerified = discoverySource === 'live' && idsCount > 0;
+    const discoveryReady = liveVerified;
+    const fixtureConfigured = normalizeConfiguredToolNames(INTERNAL_TOOL_DISCOVERY_FIXTURE).length > 0;
     res.json({
       status: 'ok',
       proxy: true,
@@ -96,6 +110,23 @@ export function registerSystemRoutes(app: Application, ctx: AppContext): void {
           tool_ids_cached: !!cached,
           tool_id_count: cached ? cached.length : 0,
           age_ms: cachedAt ? Date.now() - cachedAt : null,
+        },
+        tool_discovery: {
+          source: discoverySource,
+          live_verified: liveVerified,
+          ready: discoveryReady,
+          fixture_configured: fixtureConfigured,
+          disable_tools: Boolean(DISABLE_TOOLS),
+          ids_count: idsCount,
+          cache_age_ms: cacheAgeMs,
+          last_success_at: discoverySuccessAt || null,
+          last_error_at: discoveryErrorAt || null,
+          last_error: discoveryError,
+          override_omitted_total: internalToolMetrics.overrideOmitted ?? 0,
+        },
+        readiness: {
+          tool_discovery_ready: discoveryReady,
+          live_backend_verified: liveVerified,
         },
         audit: {
           available: true,
@@ -124,7 +155,15 @@ export function registerSystemRoutes(app: Application, ctx: AppContext): void {
     }
 
     const cached = getCachedToolIds();
+    const cachedAt = getCachedToolIdsAt();
     const proxyStatus = proxyPool ? proxyPool.getStatus() : null;
+    const metricsSource = typeof getDiscoverySource === 'function' ? getDiscoverySource() : 'none';
+    const metricsSuccessAt = typeof getDiscoveryLastSuccessAt === 'function' ? getDiscoveryLastSuccessAt() : 0;
+    const metricsErrorAt = typeof getDiscoveryLastErrorAt === 'function' ? getDiscoveryLastErrorAt() : 0;
+    const metricsIdsCount = cached ? cached.length : 0;
+    const metricsCacheAge = cachedAt ? Date.now() - cachedAt : -1;
+    const metricsLiveVerified = metricsSource === 'live' && metricsIdsCount > 0 ? 1 : 0;
+    const metricsReady = metricsLiveVerified;
     const metricsLines = [
       '# HELP opencode_internal_tool_mode_requests_total Count of internal tool mode selections by mode.',
       '# TYPE opencode_internal_tool_mode_requests_total counter',
@@ -137,9 +176,33 @@ export function registerSystemRoutes(app: Application, ctx: AppContext): void {
       '# HELP opencode_internal_tool_fallback_disabled_total Count of allowlist resolutions that fell back to disabled.',
       '# TYPE opencode_internal_tool_fallback_disabled_total counter',
       `opencode_internal_tool_fallback_disabled_total ${internalToolMetrics.fallbackToDisabled}`,
+      '# HELP opencode_internal_tool_overrides_omitted_total Count of tool override omissions under operator allow.',
+      '# TYPE opencode_internal_tool_overrides_omitted_total counter',
+      `opencode_internal_tool_overrides_omitted_total ${internalToolMetrics.overrideOmitted ?? 0}`,
       '# HELP opencode_internal_tool_cache_ids Number of cached backend tool IDs.',
       '# TYPE opencode_internal_tool_cache_ids gauge',
       `opencode_internal_tool_cache_ids ${cached ? cached.length : 0}`,
+      '# HELP opencode_internal_tool_discovery_ids_count Number of discovered backend tool IDs.',
+      '# TYPE opencode_internal_tool_discovery_ids_count gauge',
+      `opencode_internal_tool_discovery_ids_count ${metricsIdsCount}`,
+      '# HELP opencode_internal_tool_discovery_cache_age_ms Age of cached backend tool IDs in milliseconds.',
+      '# TYPE opencode_internal_tool_discovery_cache_age_ms gauge',
+      `opencode_internal_tool_discovery_cache_age_ms ${metricsCacheAge}`,
+      '# HELP opencode_internal_tool_discovery_live_verified Whether live backend tool discovery is verified.',
+      '# TYPE opencode_internal_tool_discovery_live_verified gauge',
+      `opencode_internal_tool_discovery_live_verified ${metricsLiveVerified}`,
+      '# HELP opencode_internal_tool_discovery_ready Whether tool discovery readiness holds.',
+      '# TYPE opencode_internal_tool_discovery_ready gauge',
+      `opencode_internal_tool_discovery_ready ${metricsReady}`,
+      '# HELP opencode_internal_tool_discovery_source_info Tool discovery source.',
+      '# TYPE opencode_internal_tool_discovery_source_info gauge',
+      `opencode_internal_tool_discovery_source_info{source="${metricsSource}"} 1`,
+      '# HELP opencode_internal_tool_discovery_last_success_timestamp_seconds Last tool discovery success time.',
+      '# TYPE opencode_internal_tool_discovery_last_success_timestamp_seconds gauge',
+      `opencode_internal_tool_discovery_last_success_timestamp_seconds ${metricsSuccessAt ? Math.floor(metricsSuccessAt / 1000) : 0}`,
+      '# HELP opencode_internal_tool_discovery_last_error_timestamp_seconds Last tool discovery error time.',
+      '# TYPE opencode_internal_tool_discovery_last_error_timestamp_seconds gauge',
+      `opencode_internal_tool_discovery_last_error_timestamp_seconds ${metricsErrorAt ? Math.floor(metricsErrorAt / 1000) : 0}`,
       '# HELP opencode_fallback_proxy_configured Number of configured fallback proxies.',
       '# TYPE opencode_fallback_proxy_configured gauge',
       `opencode_fallback_proxy_configured ${proxyStatus ? proxyStatus.configured : 0}`,

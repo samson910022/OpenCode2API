@@ -19,6 +19,9 @@ export const SEARCH_GROUNDING_INSTRUCTION =
   'only from the conversation plus the search results. ' +
   'Include the source URLs you relied on verbatim in your answer so they can be cited.';
 
+/** Declaration type that nests further tool declarations (Codex namespace tree). */
+const NAMESPACE_TOOL_TYPE = 'namespace';
+
 function toolTypeOf(def: unknown): string {
   return typeof asRecord(def)['type'] === 'string' ? String(asRecord(def)['type']) : '';
 }
@@ -28,21 +31,29 @@ export interface HostedSearchRequest {
   kinds: string[];
 }
 
-/** Detect OpenAI/Gemini/Anthropic hosted search tools in a `tools` array. */
+/**
+ * Detect OpenAI/Gemini/Anthropic hosted search tools in a `tools` array.
+ *
+ * Recurses into namespace containers: a hosted grant nested in a namespace is
+ * the same grant, so it must not fall through as an unsupported declaration.
+ */
 export function detectHostedSearchTools(tools: unknown): HostedSearchRequest {
   if (!Array.isArray(tools)) return { requested: false, kinds: [] };
   const kinds: string[] = [];
   for (const def of tools as unknown[]) {
+    const record = asRecord(def);
     const t = toolTypeOf(def).toLowerCase();
-    if (isHostedSearchType(t) && !kinds.includes(t)) kinds.push(t);
+    if (isHostedSearchType(t)) {
+      if (!kinds.includes(t)) kinds.push(t);
+      continue;
+    }
+    if (t === NAMESPACE_TOOL_TYPE && Array.isArray(record['tools'])) {
+      for (const kind of detectHostedSearchTools(record['tools']).kinds) {
+        if (!kinds.includes(kind)) kinds.push(kind);
+      }
+    }
   }
   return { requested: kinds.length > 0, kinds };
-}
-
-/** Remove hosted search defs so the external-tool registry stays function-only. */
-export function stripHostedSearchTools(tools: unknown): unknown[] {
-  if (!Array.isArray(tools)) return [];
-  return (tools as unknown[]).filter((def) => !isHostedSearchType(toolTypeOf(def).toLowerCase()));
 }
 
 export interface SearchSource {
