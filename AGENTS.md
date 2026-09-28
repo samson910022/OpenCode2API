@@ -7,9 +7,9 @@
 ## 1. Project overview
 
 - **What:** OpenAI-, Anthropic-, and Gemini-compatible gateway in front of a local [OpenCode](https://opencode.ai) runtime. Endpoints: `GET /health`, `GET /health/details`, `GET /metrics`, `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/messages` (Anthropic-compatible), `POST /v1beta/interactions` (alias `POST /v1/interactions`, Gemini-compatible thin layer).
-- **Production entry:** `index.ts` (env > file > default merge, `index.ts:199-370`, then `startProxy`, `index.ts:465`). Never import `index.ts` from tests — it boots the server on import.
-- **Library entry:** `startProxy` / `createApp` in `src/proxy.ts` (`startProxy` at `src/proxy.ts:1035-1069`); test/library config builder is `buildProxyConfig` in `src/config/proxy-config.ts:229-434` (shared pure resolvers at `:100-179`).
-- **Runtime matrix:** local dev `tsx watch index.ts` vs prod `node dist/index.js` vs Docker (multi-stage `Dockerfile`, backend owned by `entrypoint.sh`). `index.ts:85-90` probes three `config.json` locations to cover the `index.ts` ↔ `dist/index.js` directory shift.
+- **Production entry:** `index.ts` (env > file > default merge, `index.ts:197-368`, then `startProxy`, `index.ts:463`). Never import `index.ts` from tests — it boots the server on import.
+- **Library entry:** `startProxy` / `createApp` in `src/proxy.ts` (`startProxy` at `src/proxy.ts:1115-1149`); test/library config builder is `buildProxyConfig` in `src/config/proxy-config.ts:229-432` (shared pure resolvers at `:90-187`).
+- **Runtime matrix:** local dev `tsx watch index.ts` vs prod `node dist/index.js` vs Docker (multi-stage `Dockerfile`, backend owned by `entrypoint.sh`). `index.ts:83-88` probes three `config.json` locations to cover the `index.ts` ↔ `dist/index.js` directory shift.
 
 ## 2. Tech stack & commands (single source of truth)
 
@@ -28,11 +28,11 @@
 ## 3. Directory structure
 
 ```
-index.ts                 # prod bootstrap + config merge (489 lines)
-src/proxy.ts             # createApp/startProxy (894 lines; god file, see §9)
+index.ts                 # prod bootstrap + config merge (487 lines)
+src/proxy.ts             # createApp/startProxy (1149 lines; god file, see §9)
 src/config/proxy-config.ts # buildProxyConfig + shared pure normalizers (bool/int/port/url/list/enum)
-src/routes/              # chat.ts (953) / responses.ts (1144) / messages.ts (635) / interactions.ts (439) / system.ts
-src/tool-runtime/        # contracts / registry / router / parser (945) / validator / policy
+src/routes/              # chat.ts (1215) / responses.ts (1798) / messages.ts (978) / interactions.ts (534) / system.ts
+src/tool-runtime/        # contracts / registry / router / parser (1934) / validator / policy
 src/backend/manager.ts   # backend lifecycle + request lock/queue
 src/stream/collector.ts  # prompt/poll/collect SSE pipeline
 src/retry/policy.ts      # pure retry helpers (resolveMaxRetries, backoff+jitter)
@@ -48,7 +48,7 @@ config.json.example / .env.example   # examples only, never real secrets
 
 ## 4. Configuration principle: env canonical > env legacy alias > file > default
 
-- Lookup order for `config.json`: `<entrydir>/config.json` → `<entrydir>/../config.json` → `cwd/config.json` (`index.ts:85-90`).
+- Lookup order for `config.json`: `<entrydir>/config.json` → `<entrydir>/../config.json` → `cwd/config.json` (`index.ts:83-88`).
 - Merge order: **env canonical > env legacy alias > file short key > hardcoded default**. Invalid env values fall through to the next source (do not coerce garbage to `false`).
 - Canonical env names (use these in `.env` / compose / Dockerfile / docs; file keys are the short forms in `config.json.example`):
 
@@ -73,12 +73,12 @@ config.json.example / .env.example   # examples only, never real secrets
 | Auth multi-key (A) | `OPENCODE_API_KEYS` canonical, `API_KEYS` legacy alias (merge; empty never blocks) | `API_KEYS` | `(none, merges with API_KEY)` |
 | Fallback proxies | `OPENCODE_UPSTREAM_PROXIES` / `OPENCODE_UPSTREAM_PROXY_STRATEGY` / `OPENCODE_UPSTREAM_PROXY_COOLDOWN_MS` / `OPENCODE_UPSTREAM_PROXY_NO_PROXY` (legacy raw env `UPSTREAM_*` merged in **both** entries) | `UPSTREAM_*` short forms | `(none)` / `failover-rr` / `300000` / `localhost,127.0.0.1,::1` |
 
-- `DISABLE_TOOLS` resolution: `OPENCODE_DISABLE_TOOLS > DISABLE_TOOLS > file > true` via `resolveDisableTools` (`src/config/proxy-config.ts:76-88`); covered by `tests/env-alias.test.js`. Never `??`-chain booleans by hand; call the helper. Note: `true` still resolves `true` — the free-tier strip (`selectPromptToolOverrides`, `src/proxy.ts:75-91`) is a post-resolution prompt-body filter for `isFreeTierSuspectModel` only (guard text + output markup stripping stay active).
-- Out-of-matrix backend identity (do NOT add to the six-way matrix): `OPENCODE_CLIENT` is read directly in `src/backend/manager.ts:41-44` (allowlist `cli/desktop/acp/app`, default `cli`, foreign values overwritten), never enters `ProxyConfig`/`buildProxyConfig`; documented in `docs/configuration.md` backend-identity subsection + `CHANGELOG.md`. Same for the `OPENCODE_API_KEY="public"` strip and best-effort jail `git init`.
+- `DISABLE_TOOLS` resolution: `OPENCODE_DISABLE_TOOLS > DISABLE_TOOLS > file > true` via `resolveDisableTools` (`src/config/proxy-config.ts:76-86`); covered by `tests/env-alias.test.js`. Never `??`-chain booleans by hand; call the helper. Note: `true` still resolves `true` — the free-tier strip (`selectPromptToolOverrides`, `src/proxy.ts:75-91`) is a post-resolution prompt-body filter for `isFreeTierSuspectModel` only (guard text + output markup stripping stay active).
+- Out-of-matrix backend identity (do NOT add to the six-way matrix): `OPENCODE_CLIENT` is read directly in `src/backend/manager.ts:41-45` (allowlist `cli/desktop/acp/app`, default `cli`, foreign values overwritten), never enters `ProxyConfig`/`buildProxyConfig`; documented in `docs/configuration.md` backend-identity subsection + `CHANGELOG.md`. Same for the `OPENCODE_API_KEY="public"` strip and best-effort jail `git init`.
 - `RETRY`: strict-merged by `resolveRetryCountSetting` (options > `OPENCODE_PROXY_RETRY_MAX_RETRIES` > legacy `RETRY_MAX_RETRIES` > file > `3`; partial numerics like `3abc`/`2.9` are invalid and fall through — never `parseInt`-truncated), then clamped by `resolveMaxRetries` (`src/retry/policy.ts:51-58`, clamp 0–5, total attempts `1+n`, `2s×2ⁿ⁻¹` + 25% jitter, `retry-after` clamped to 30s). Covered by `tests/env-alias.test.js` + `tests/retry-policy.test.js`.
 - **Single merge contract:** every key goes through the pure resolvers in `src/config/proxy-config.ts` (`resolveStringSetting` / `resolveBoolSetting` / `resolveIntSetting` / `resolvePortSetting` / `resolveDurationSetting` / `resolveRetryCountSetting` / `resolveListSetting` / `resolveEnumSetting` / `resolveUrlSetting`, plus parsers `parseStrictInteger` / `parseStrictPort` / `parseHttpUrl` / `parseToolNameList`). `index.ts` and `buildProxyConfig` share them, so never re-implement a local `parseBool`/`parsePort`/list parser in either entry — add a resolver there instead. Recognized bool tokens are exactly `1/true/yes/y/on` and `0/false/no/n/off` (case-insensitive, trimmed); everything else is *unset* and falls through (no `Boolean()` coercion).
 - Docker/Compose declare **empty** defaults (`ENV X=` / `${X:-}`) for every config item: a non-empty image/compose default would outrank a mounted `config.json` or a legacy alias (env > file > default). Code owns the documented defaults, so empty env + no file is behaviorally identical. Compose `ports` + `healthcheck` both use `${OPENCODE_PROXY_PORT:-${PORT:-10000}}` (never a hardcoded 10000). `entrypoint.sh` validates `OPENCODE_PROXY_PORT` (falling back to legacy `PORT`) and `OPENCODE_SERVER_PORT` against `1..65535`, warns, and exports the normalized value so an invalid port never reaches `opencode serve --port`.
-- **Known dual-entry drifts (do NOT silently "fix" defaults — they change behavior; unify explicitly with tests):** `REQUEST_TIMEOUT_MS` prod `180000` (`index.ts:299`, docs) vs library `300000` (`src/config/proxy-config.ts:16`); `MANAGE_BACKEND` prod `false` (`index.ts:211-214`) vs library `true` (`src/config/proxy-config.ts:310`); `OMIT_SYSTEM_PROMPT` prod unconditional `false` (`index.ts:315-319`) vs library auto-`true` under `plugin-inject` (`src/config/proxy-config.ts:375-379`); bool parsing is now **unified** (both entries use `normalizeBool` through `resolveBoolSetting`; the old loose `index.ts` parser and the `DEBUG`/`USE_ISOLATED_HOME` exact-match chains are gone — behavior change: env/options `'yes'`/`'on'`/`'TRUE '` and numeric-string booleans are now recognized everywhere, garbage never coerces). Any new env must update all six: `.env.example`, `config.json.example`, `Dockerfile`, `docker-compose.yml`, `index.ts`, `docs/configuration.md` + this table.
+- **Known dual-entry drifts (do NOT silently "fix" defaults — they change behavior; unify explicitly with tests):** `REQUEST_TIMEOUT_MS` prod `180000` (`index.ts:295`, docs) vs library `300000` (`src/config/proxy-config.ts:16`); `MANAGE_BACKEND` prod `false` (`index.ts:209-212`) vs library `true` (`src/config/proxy-config.ts:308`); `OMIT_SYSTEM_PROMPT` prod unconditional `false` (`index.ts:313-316`) vs library auto-`true` under `plugin-inject` (`src/config/proxy-config.ts:374-377`); bool parsing is now **unified** (both entries use `normalizeBool` through `resolveBoolSetting`; the old loose `index.ts` parser and the `DEBUG`/`USE_ISOLATED_HOME` exact-match chains are gone — behavior change: env/options `'yes'`/`'on'`/`'TRUE '` and numeric-string booleans are now recognized everywhere, garbage never coerces). Any new env must update all six: `.env.example`, `config.json.example`, `Dockerfile`, `docker-compose.yml`, `index.ts`, `docs/configuration.md` + this table.
 
 ## 5. Tool safety principle (default-deny)
 
