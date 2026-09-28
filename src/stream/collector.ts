@@ -351,24 +351,67 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     // (the backend is executing the tool). Resolving early here is what previously
     // truncated streaming responses that relied on internal tool execution.
      const activeToolCallIds = new Set<string>();
-      let activeToolWithoutIdCount = 0;
-      const hasActiveTools = (): boolean => activeToolCallIds.size > 0 || activeToolWithoutIdCount > 0;
+      // ID-less backend tool parts carry no stable `id` (older servers / some
+      // internal tools). A cumulative counter inflates here because
+      // `message.part.updated` fires repeatedly for the same logical tool while
+      // it stays pending (N pendings, 1 terminal) and `message.updated`
+      // snapshots re-deliver the same part on every update — pinning the idle
+      // exemption until REQUEST_TIMEOUT_MS. Track ID-less activity as a Set
+      // keyed by tool name instead: idempotent on repeats, concurrent across
+      // distinct tool names. Same-name concurrent ID-less tools share a bucket
+      // (accepted: rarer than repeat snapshots; degrades to boolean, not hang).
+      const activeNoidToolKeys = new Set<string>();
+      // Terminals already observed. `message.updated` snapshots re-deliver the
+      // same completed part on every update, so a replayed terminal must be
+      // ignored instead of falling through to the mismatch path below (which
+      // would delete an innocent still-running bucket).
+      const settledNoidKeys = new Set<string>();
+      const noidKeyFor = (pr: Record<string, unknown>): string => {
+        const tool = pr['tool'];
+        return typeof tool === 'string' && tool.trim() ? `noid:${tool.trim()}` : 'noid:unknown';
+      };
+      const hasActiveTools = (): boolean => activeToolCallIds.size > 0 || activeNoidToolKeys.size > 0;
+      // Bucket count for debug logging only (not a tool count: same-name
+      // concurrent ID-less tools share one bucket by design).
+      const activeToolCount = (): number => activeToolCallIds.size + activeNoidToolKeys.size;
       const trackToolState = (part: unknown): void => {
-        // Pairing assumption: each ID-less pending/running is later matched by one
-        // completed/error without an id; repeated snapshots of the same logical tool
-        // may inflate the count (id path dedupes via Set, ID-less path cannot), in
-        // which case idle exemption simply waits until timeout. Unknown statuses are
-        // ignored (neither active nor terminal) to avoid false idle exemption.
+        // Unknown statuses are ignored (neither active nor terminal) to avoid
+        // false idle exemption.
         const pr = asRecord(part);
         if (pr['type'] !== 'tool') return;
         const status = toolPartStatus(pr);
         const id = typeof pr['id'] === 'string' ? (pr['id'] as string) : null;
         if (status === 'pending' || status === 'running') {
           if (id) activeToolCallIds.add(id);
-          else activeToolWithoutIdCount += 1;
+          else {
+            const key = noidKeyFor(pr);
+            // A re-run of the same tool after completion is a new logical tool.
+            settledNoidKeys.delete(key);
+            activeNoidToolKeys.add(key);
+          }
         } else if (status === 'completed' || status === 'error') {
           if (id) activeToolCallIds.delete(id);
-          else activeToolWithoutIdCount = Math.max(0, activeToolWithoutIdCount - 1);
+          else {
+            const key = noidKeyFor(pr);
+            if (activeNoidToolKeys.has(key)) {
+              activeNoidToolKeys.delete(key);
+              settledNoidKeys.add(key);
+            } else if (settledNoidKeys.has(key)) {
+              // Replayed terminal snapshot for an already-settled tool: ignore.
+            } else if (activeNoidToolKeys.size === 1) {
+              // Single-bucket name mismatch between pending and terminal (e.g.
+              // one side omits `tool`): clear the only bucket so a single
+              // completion cannot pin the stream open forever.
+              const first = activeNoidToolKeys.values().next();
+              if (!first.done) {
+                settledNoidKeys.add(first.value);
+                activeNoidToolKeys.delete(first.value);
+              }
+            }
+            // Multi-bucket ambiguity (size !== 1, unknown key): ignore rather
+            // than deleting an innocent tool. Truncating an answer via an early
+            // idle/stop is worse than waiting for the real terminal.
+          }
         }
       };
      const startedAt = Date.now();
@@ -421,7 +464,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
             logDebug('Event idle while internal tool call is active, continuing to wait', {
               sessionId,
               ms: Date.now() - startedAt,
-              activeTools: activeToolCallIds.size + activeToolWithoutIdCount,
+              activeTools: activeToolCount(),
             });
             scheduleIdleTimer();
             return;
@@ -578,7 +621,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                 if (hasActiveTools()) {
                   logDebug('Ignoring intermediate stop while tools are active', {
                     sessionId,
-                    activeTools: activeToolCallIds.size + activeToolWithoutIdCount,
+                    activeTools: activeToolCount(),
                   });
                   continue;
                 }

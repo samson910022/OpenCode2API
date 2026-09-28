@@ -228,6 +228,135 @@ describe('collector terminal state', () => {
     );
 });
 
+describe('collector ID-less tool tracking', () => {
+    const run = (events, firstDeltaTimeoutMs = null) => {
+        const client = {
+            event: {
+                subscribe: async () => ({
+                    stream: (async function* () {
+                        for (const event of events) {
+                            if (typeof event.delay === 'number') {
+                                await new Promise((resolve) => setTimeout(resolve, event.delay));
+                            }
+                            yield event;
+                        }
+                    })()
+                })
+            }
+        };
+        return createCollector({ client, logDebug: () => {} })
+            .collectFromEvents('collector-session', 1000, null, firstDeltaTimeoutMs);
+    };
+    const noidPart = (tool, status) => ({
+        type: 'message.part.updated',
+        properties: {
+            part: tool == null
+                ? { type: 'tool', sessionID: 'collector-session', state: { status } }
+                : { type: 'tool', tool, sessionID: 'collector-session', state: { status } },
+        },
+    });
+    const textDelta = (delta) => ({
+        type: 'message.part.updated',
+        properties: { part: { type: 'text', sessionID: 'collector-session' }, delta },
+    });
+    const stop = () => ({
+        type: 'message.updated',
+        properties: { info: { sessionID: 'collector-session', finish: 'stop' } },
+    });
+
+    test('repeat pending snapshots of one ID-less tool resolve on its terminal', async () => {
+        const result = await run([
+            noidPart('web_fetch', 'pending'),
+            noidPart('web_fetch', 'pending'),
+            noidPart('web_fetch', 'pending'),
+            noidPart('web_fetch', 'completed'),
+            textDelta('done'),
+            stop(),
+        ]);
+        expect(result).toMatchObject({ content: 'done' });
+        expect(result.noData).toBeUndefined();
+    });
+
+    test('distinct ID-less tools stay active until each completes', async () => {
+        const result = await run([
+            noidPart('web_fetch', 'pending'),
+            noidPart('bash', 'pending'),
+            noidPart('web_fetch', 'completed'),
+            // Intermediate stop while bash is still running must be ignored.
+            stop(),
+            textDelta('final'),
+            noidPart('bash', 'completed'),
+            stop(),
+        ]);
+        expect(result).toMatchObject({ content: 'final' });
+        expect(result.noData).toBeUndefined();
+    });
+
+    test('replayed terminal snapshot does not clear a still-running tool', async () => {
+        const result = await run([
+            noidPart('web_fetch', 'pending'),
+            noidPart('bash', 'pending'),
+            noidPart('web_fetch', 'completed'),
+            // Snapshot replay re-delivers the settled web_fetch terminal alongside
+            // bash. Pending-first order matters: the replayed terminal is processed
+            // last, so a naive drop-one-bucket fallback deletes bash's bucket.
+            {
+                type: 'message.updated',
+                properties: {
+                    info: {
+                        sessionID: 'collector-session',
+                        parts: [
+                            { type: 'tool', tool: 'bash', state: { status: 'pending' } },
+                            { type: 'tool', tool: 'web_fetch', state: { status: 'completed' } },
+                        ],
+                    },
+                },
+            },
+            // Intermediate stop while bash is still running must be ignored.
+            stop(),
+            textDelta('final'),
+            noidPart('bash', 'completed'),
+            stop(),
+        ]);
+        expect(result).toMatchObject({ content: 'final' });
+        expect(result.noData).toBeUndefined();
+    });
+
+    test('single-bucket mismatch clears without hanging (named pending, unnamed terminal)', async () => {
+        const result = await run([
+            noidPart('web_fetch', 'pending'),
+            noidPart(undefined, 'completed'),
+            textDelta('done'),
+            stop(),
+        ]);
+        expect(result).toMatchObject({ content: 'done' });
+        expect(result.noData).toBeUndefined();
+    });
+
+    test('single-bucket mismatch clears without hanging (unnamed pending, named terminal)', async () => {
+        const result = await run([
+            noidPart(undefined, 'pending'),
+            noidPart('web_fetch', 'completed'),
+            textDelta('done'),
+            stop(),
+        ]);
+        expect(result).toMatchObject({ content: 'done' });
+        expect(result.noData).toBeUndefined();
+    });
+
+    test('same-name concurrent ID-less tools share one bucket (documented limitation)', async () => {
+        const result = await run([
+            noidPart('web_fetch', 'pending'),
+            noidPart('web_fetch', 'pending'),
+            noidPart('web_fetch', 'completed'),
+            textDelta('done'),
+            stop(),
+        ]);
+        expect(result).toMatchObject({ content: 'done' });
+        expect(result.noData).toBeUndefined();
+    });
+});
+
 describe('collector event error and tool deltas', () => {
     const run = (events, signal) => {
         const client = {
