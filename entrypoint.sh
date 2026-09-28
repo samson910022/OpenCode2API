@@ -68,7 +68,23 @@ fi
 
 if [[ "$1" == "opencode" && "$2" == "serve" ]]; then
     echo "Initializing OpenCode-to-OpenAI (Server + Proxy)"
-    
+
+    # opencode serve rewrites <project>/config.json on (nearly) every API call
+    # (ConfigHttpApi.update) and its own file watcher treats that as a config
+    # change: it disposes/recreates the project instance, aborting in-flight
+    # session work. Under concurrent/rapid proxy traffic this becomes a
+    # self-sustaining abort storm (backend MessageAbortedError -> proxy
+    # response.failed "Aborted" -> client retries -> more reloads).
+    # Pin a skeleton config.json root-owned/read-only for the node user so the
+    # write fails (EACCES, logged by the backend, otherwise harmless) without
+    # changing mtime, which keeps the watcher quiet. No real settings live in
+    # this file (backend state stays under /home/node/.local/share/opencode).
+    if [ ! -f /home/node/project/config.json ]; then
+        printf '{\n  "$schema": "https://opencode.ai/config.json"\n}\n' > /home/node/project/config.json
+    fi
+    chown root:root /home/node/project/config.json
+    chmod 644 /home/node/project/config.json
+
     echo "Starting OpenCode Server on internal port ${SERVER_PORT}..."
     gosu node opencode serve --hostname 0.0.0.0 --port ${SERVER_PORT} &
     SERVER_PID=$!
