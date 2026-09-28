@@ -25,13 +25,13 @@ normalize_port() {
     local value="$2"
     local fallback="$3"
     if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 1 ] && [ "$value" -le 65535 ]; then
-        echo "$value"
+        printf '%s\n' "$value"
         return 0
     fi
     if [ -n "$value" ]; then
         echo "[Config] Warning: ${label}=\"${value}\" is not a valid port (1-65535); using ${fallback}" >&2
     fi
-    echo "$fallback"
+    printf '%s\n' "$fallback"
 }
 
 PROXY_PORT=$(normalize_port "OPENCODE_PROXY_PORT" "${OPENCODE_PROXY_PORT:-}" "")

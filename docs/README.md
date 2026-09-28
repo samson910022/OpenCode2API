@@ -27,7 +27,7 @@ Welcome to the OpenCode2API documentation.
 | 📄 [Main README](../README.md) | English canonical entrypoint |
 | 📄 [README (简体中文)](../README.zh-CN.md) | Simplified Chinese mirror of the main README |
 
-Detailed endpoint diagnostics live with the configuration guide for now: `/health/details` and `/metrics` are specified in [Configuration](./configuration.md) and summarized in the [Main README](../README.md#api-reference). A dedicated section in [API Reference](./api-reference.md) is tracked below.
+Detailed endpoint diagnostics live with the configuration guide for now: `/health/details` and `/metrics` are specified in [Configuration](./configuration.md) and summarized in the [Main README](../README.md#api-reference).
 
 ---
 
@@ -38,8 +38,8 @@ Docs are migrating to **English-first**: the root [`README.md`](../README.md) is
 | Guide | Current language | English version |
 |:------|:-----------------|:----------------|
 | Getting Started | 简体中文 | tracked |
-| Configuration | 简体中文 | tracked (canonical env names fixed; see `AGENTS.md` §4) |
-| API Reference | 简体中文 + EN examples | tracked (needs `/health/details` + `/metrics` sections) |
+| Configuration | 简体中文 | tracked (canonical env names documented; see `AGENTS.md` §4) |
+| API Reference | 简体中文 + EN examples | tracked (needs English canonical + dedicated `/health/details` + `/metrics` sections, currently in Configuration) |
 | Docker Deployment | 简体中文 | tracked |
 | Troubleshooting | 简体中文 | tracked (smallest, do first) |
 | Development | 简体中文 | tracked (dedupe with `CONTRIBUTING.md`) |
