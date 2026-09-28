@@ -330,6 +330,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
             REQUEST_TIMEOUT_MS,
             'load tool overrides',
           )) as Record<string, boolean> | null;
+          // Fail-closed by design (see chat.ts): null or verified-empty both 503.
           if (DISABLE_TOOLS && (!toolOverrides || Object.keys(toolOverrides).length === 0)) {
             try {
               await activeClient.session.delete({ path: { id: sessionId as string } });
@@ -449,6 +450,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
               if (error && !content && !reasoning && attempt < maxAttempts && isTransientUpstreamError(error)) continue;
               break;
             }
+              // Fail-closed: any backend error fails even with partial content (see chat.ts).
                           if (error != null) {
               const t = transformUpstreamError(error);
               res.status(t.statusCode).json({
@@ -538,6 +540,9 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           let rawContent = '';
           let rawReasoning = '';
            const streamedToolCalls: FinalToolCall[] = [];
+           // Intentional: buffer while any external tool contract is declared so tool
+           // markup is never emitted as incremental `content_block_delta` before it
+           // can be classified. Pure-text turns with tools declared also batch.
            const shouldBufferExternalStream = externalToolRegistry.length > 0;
            const filterContent = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
            const filterReasoning = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });

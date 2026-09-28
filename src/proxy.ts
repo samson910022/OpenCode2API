@@ -707,6 +707,10 @@ export function createApp(config: ProxyConfig): CreateAppResult {
       }
       const normalized = normalizeBackendToolIds(data);
       if (normalized.length === 0) {
+        // Fail-closed by design (locked by tests/tool-alias.test.js): an empty
+        // tool list under DISABLE_TOOLS=true is treated as unverifiable
+        // discovery, not as "zero tools, proceed". A real backend always exposes
+        // tools; empty almost certainly means a broken backend/proxy skew.
         if (DISABLE_TOOLS) {
           throw new Error('tool discovery returned empty ids');
         }

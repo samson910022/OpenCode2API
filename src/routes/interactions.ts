@@ -272,6 +272,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           toolOverrides = merged;
         }
       }
+      // Fail-closed by design (see chat.ts): null or verified-empty both 503.
       if (DISABLE_TOOLS && (!toolOverrides || Object.keys(toolOverrides).length === 0)) {
         res.status(503).json({
           error: {

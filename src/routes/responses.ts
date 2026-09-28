@@ -729,6 +729,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           return;
         }
       }
+      // Fail-closed by design (see chat.ts): null or verified-empty both 503.
       if (DISABLE_TOOLS && (!toolOverrides || Object.keys(toolOverrides).length === 0)) {
         await cleanupOwnedResponsesSession();
         if (stream) {
@@ -1007,6 +1008,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           }
         };
         responseState.finalize = () => finalizeOutputItems();
+        // Intentional: buffer while any external tool contract is declared so tool
+        // markup is never streamed before classification. Pure-text turns also batch.
         const shouldBufferExternalStream = externalToolRegistry.length > 0;
         const deferVisibleOutput = shouldBufferExternalStream || hostedSearch.requested;
         let filterContentDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });

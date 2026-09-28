@@ -432,6 +432,8 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               REQUEST_TIMEOUT_MS,
               'load tool overrides',
             )) as Record<string, boolean> | null;
+            // Fail-closed by design: null (discovery failed) or verified-empty (no
+            // tool IDs to disable) both 503. A real backend always exposes tools.
             if (DISABLE_TOOLS && (!toolOverrides || Object.keys(toolOverrides).length === 0)) {
               try {
                 await activeClient.session.delete({ path: { id: sessionId as string } });
@@ -484,8 +486,12 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
              };
            }
 
-           if (stream) {
-
+            if (stream) {
+              // Intentional: buffer visible text while any external tool contract is
+              // declared so `<function_calls>` / `<external__*>` markup fragments are
+              // never streamed incrementally before the parser can classify them.
+              // Trade-off: pure-text turns with tools declared also emit in one batch
+              // at completion instead of incrementally.
               const shouldBufferExternalStream = externalToolRegistry.length > 0;
               let filterContentDelta = createToolCallFilter({
                 disableTools: DISABLE_TOOLS,
@@ -1032,6 +1038,10 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 }
                 break;
               }
+              // Fail-closed: any backend error fails even when partial content exists.
+              // Returning partial text as success would hide the upstream failure and
+              // diverge from stream paths (which throw on snapshot.error). Retry above
+              // already covers the no-output transient case.
               if (error != null) {
                 if (/^Request timeout after/.test(toErrorMessage(error))) throw error;
                 const normalizedDiscovery = normalizeBackendError(error);
