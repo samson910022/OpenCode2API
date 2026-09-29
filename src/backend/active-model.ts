@@ -36,10 +36,21 @@ export async function ensureActiveModel(
 ): Promise<void> {
   const key = activeModelKey(providerID, modelID);
   if (lastActiveModelByClient.get(client as object) === key) return;
-  await client.config.update({
-    body: {
-      activeModel: { providerID, modelID },
-    },
-  });
+  // Record intent synchronously: concurrent same-model callers share one PUT
+  // instead of each missing the cache mid-flight and re-admitting the storm.
   lastActiveModelByClient.set(client as object, key);
+  try {
+    await client.config.update({
+      body: {
+        activeModel: { providerID, modelID },
+      },
+    });
+  } catch (error: unknown) {
+    // Roll back only if still ours: a concurrent newer model must keep its
+    // intent; failures are never cached so the next request retries the PUT.
+    if (lastActiveModelByClient.get(client as object) === key) {
+      lastActiveModelByClient.delete(client as object);
+    }
+    throw error;
+  }
 }

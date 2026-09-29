@@ -485,6 +485,21 @@ export async function ensureBackend(config: unknown): Promise<void> {
           OPENCODE_PROJECT_DIR: workspace,
         });
 
+        // Backend permission lockdown, applied in every prompt mode: the
+        // headless backend must never `ask` (hangs forever) nor silently
+        // execute unlisted tools. Same generator as entrypoint.sh (single
+        // source: src/backend/backend-permission.ts).
+        const backendPermission = buildBackendPermission(
+          (cfg as Record<string, unknown>)['INTERNAL_ALLOWED_TOOLS'],
+          (cfg as Record<string, unknown>)['INTERNAL_WEB_FETCH_ENABLED'],
+          workspace,
+        );
+        const backendOpencodeJson: Record<string, unknown> = {
+          instructions: [],
+          theme: 'system',
+          permission: backendPermission,
+        };
+
         if (PROMPT_MODE === 'plugin-inject') {
           const configDir = path.join(fakeHome, '.config', 'opencode');
           const pluginDir = path.join(configDir, 'plugin', 'opencode2api-empty');
@@ -494,29 +509,21 @@ export async function ensureBackend(config: unknown): Promise<void> {
             `export const Opencode2apiEmptyPlugin = async () => ({})\nexport default Opencode2apiEmptyPlugin\n`,
             'utf8',
           );
+          backendOpencodeJson['plugin'] = [path.join(pluginDir, 'index.js')];
           fs.writeFileSync(
             path.join(configDir, 'opencode.json'),
-            JSON.stringify(
-              {
-                plugin: [path.join(pluginDir, 'index.js')],
-                instructions: [],
-                theme: 'system',
-                // Backend permission lockdown: headless backend must never
-                // `ask` (hangs forever) nor silently execute unlisted tools.
-                // Same generator as entrypoint.sh (single source:
-                // src/backend/backend-permission.ts).
-                permission: buildBackendPermission(
-                  (cfg as Record<string, unknown>)['INTERNAL_ALLOWED_TOOLS'],
-                  (cfg as Record<string, unknown>)['INTERNAL_WEB_FETCH_ENABLED'],
-                  workspace,
-                ),
-              },
-              null,
-              2,
-            ),
+            JSON.stringify(backendOpencodeJson, null, 2),
             'utf8',
           );
           console.log('[Proxy] Using plugin-inject prompt mode');
+        } else {
+          const configDir = path.join(fakeHome, '.config', 'opencode');
+          fs.mkdirSync(configDir, { recursive: true });
+          fs.writeFileSync(
+            path.join(configDir, 'opencode.json'),
+            JSON.stringify(backendOpencodeJson, null, 2),
+            'utf8',
+          );
         }
         console.log('[Proxy] Using isolated home for OpenCode');
       } else {

@@ -17,7 +17,9 @@
 /** Backend project dir inside the container (session working scope). */
 export const BACKEND_PROJECT_DIR = '/home/node/project';
 
-/** Schema-valid opencode permission keys (PermissionConfig). */
+/** Schema-valid opencode permission keys (PermissionConfig). Flat-action keys
+ * (todowrite/question/webfetch/websearch/doom_loop) take a bare
+ * "allow"/"deny" string, never an object. */
 export const BACKEND_PERMISSION_TOOL_KEYS: readonly string[] = [
   'read',
   'edit',
@@ -35,15 +37,6 @@ export const BACKEND_PERMISSION_TOOL_KEYS: readonly string[] = [
   'doom_loop',
   'skill',
 ];
-
-/** Flat-action keys take a bare "allow"/"deny" string, never an object. */
-const FLAT_ACTION_KEYS: ReadonlySet<string> = new Set([
-  'todowrite',
-  'question',
-  'webfetch',
-  'websearch',
-  'doom_loop',
-]);
 
 function normalizeToolName(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;

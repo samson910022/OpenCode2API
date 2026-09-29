@@ -234,7 +234,7 @@ OpenCode2API 现在支持把外部客户端传入的 OpenAI-compatible `tools` �
 
 ### 后端权限锁定（headless 防 hang）
 
-后端（`opencode serve`）是无人值守的：任何 `ask` 都没有人批准，会卡住整个 prompt 直到代理 180s 超时；同时免费模型的 tools map 会被剥掉（见上），后端回退到 agent 全开，可能静默执行调用方没授权的工具。为此容器启动（`entrypoint.sh`，`USE_ISOLATED_HOME` 下由 `src/backend/manager.ts` 同步）会给后端 `opencode.json` 写入生成的 `permission`（单一来源 `src/backend/backend-permission.ts`）：
+后端（`opencode serve`）是无人值守的：任何 `ask` 都没有人批准，会卡住整个 prompt 直到代理 180s 超时；同时免费模型的 tools map 会被剥掉（见上），后端回退到 agent 全开，可能静默执行调用方没授权的工具。为此容器启动（`entrypoint.sh`，`USE_ISOLATED_HOME` 下由 `src/backend/manager.ts` 同步）会给后端 `opencode.json` 写入生成的 `permission`（单一来源 `src/backend/backend-permission.ts`，所有 prompt 模式生效）：
 
 - 默认 deny-all；只放行 `OPENCODE_INTERNAL_ALLOWED_TOOLS` 明确列出的工具（`web_fetch` 等别名归一；未知名忽略，不会写坏 schema）。
 - 未显式配置 allowlist 时 `OPENCODE_INTERNAL_WEB_FETCH_ENABLED=true` 沿用旧兼容：放行 `webfetch`。

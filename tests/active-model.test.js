@@ -71,6 +71,41 @@ describe('ensureActiveModel unit', () => {
         await ensureActiveModel(client, 'opencode', 'm1');
         expect(update).toHaveBeenCalledTimes(2);
     });
+
+    test('concurrent same-model callers share one PUT (no TOCTOU storm)', async () => {
+        let release;
+        const gate = new Promise((resolve) => { release = resolve; });
+        const update = jest.fn(() => gate.then(() => ({})));
+        const client = fakeClient(update);
+        const both = Promise.all([
+            ensureActiveModel(client, 'opencode', 'm1'),
+            ensureActiveModel(client, 'opencode', 'm1'),
+        ]);
+        await Promise.resolve();
+        await Promise.resolve();
+        release();
+        await both;
+        expect(update).toHaveBeenCalledTimes(1);
+    });
+
+    test('failure rolls back only its own intent, preserving a newer one', async () => {
+        let releaseA;
+        const gateA = new Promise((resolve) => { releaseA = resolve; });
+        const update = jest.fn((args) => {
+            const m = args && args.body && args.body.activeModel && args.body.activeModel.modelID;
+            return m === 'm1' ? gateA.then(() => { throw new Error('m1 failed'); }) : Promise.resolve({});
+        });
+        const client = fakeClient(update);
+        const p1 = ensureActiveModel(client, 'opencode', 'm1');
+        await Promise.resolve();
+        await Promise.resolve();
+        await ensureActiveModel(client, 'opencode', 'm2');
+        releaseA();
+        await expect(p1).rejects.toThrow('m1 failed');
+        // m2 intent survived m1's rollback: no extra PUT.
+        await ensureActiveModel(client, 'opencode', 'm2');
+        expect(update).toHaveBeenCalledTimes(2);
+    });
 });
 
 const sdkMocks = {
