@@ -4,6 +4,7 @@ import { findExternalToolByName } from '../tool-runtime/registry.js';
 import { EXTERNAL_TOOL_PREFIX } from '../tool-runtime/contracts.js';
 import { preflightExternalToolChoice } from '../tool-runtime/router.js';
 import { computeRetryDelay } from '../retry/policy.js';
+import { ensureActiveModel } from '../backend/active-model.js';
 import {
   validateMessagesRequest,
   mapFinishToStopReason,
@@ -305,7 +306,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           );
           await ensureBackend(config);
           try {
-            await activeClient.config.update({ body: { activeModel: { providerID: pID, modelID: mID } } });
+            await ensureActiveModel(activeClient, pID, mID);
           } catch (e: unknown) {
             logDebug('Failed to set active model', { error: toErrorMessage(e) });
           }

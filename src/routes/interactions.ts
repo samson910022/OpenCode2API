@@ -16,6 +16,7 @@
 import crypto from 'crypto';
 import { withTimeout } from '../config/proxy-config.js';
 import { computeRetryDelay } from '../retry/policy.js';
+import { ensureActiveModel } from '../backend/active-model.js';
 import { normalizeBackendError, transformUpstreamError } from '../errors/upstream.js';
 import { engageFallbackForFreeLimit } from '../upstream-proxy/fallback.js';
 import {
@@ -225,9 +226,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       await ensureBackend(config);
 
       try {
-        await activeClient.config.update({
-          body: { activeModel: { providerID: pID, modelID: mID } },
-        });
+        await ensureActiveModel(activeClient, pID, mID);
       } catch {
         // ignore
       }

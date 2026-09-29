@@ -4,6 +4,7 @@ import { findExternalToolByName } from '../tool-runtime/registry.js';
 import { EXTERNAL_TOOL_PREFIX } from '../tool-runtime/contracts.js';
 import { preflightExternalToolChoice } from '../tool-runtime/router.js';
 import { computeRetryDelay } from '../retry/policy.js';
+import { ensureActiveModel } from '../backend/active-model.js';
 import {
   assertToolCallArtifactIntegrity,
   stripExternalToolCallMarkupFromJoinedText,
@@ -391,13 +392,10 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
             // Ensure backend is running
             await ensureBackend(config);
 
-            // Set active model
+            // Set active model (change-only: every PUT disposes the backend
+            // project instance, aborting in-flight work).
             try {
-              await activeClient.config.update({
-                body: {
-                  activeModel: { providerID: pID, modelID: mID },
-                },
-              });
+              await ensureActiveModel(activeClient, pID, mID);
             } catch (confError: unknown) {
               logDebug('Failed to set active model:', toErrorMessage(confError));
             }

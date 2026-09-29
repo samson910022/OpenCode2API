@@ -49,6 +49,29 @@ else
 fi
 export OPENCODE_SERVER_PORT="$SERVER_PORT"
 
+# Backend permission lockdown (single source: src/backend/backend-permission.ts,
+# mirrored in src/backend/manager.ts for the isolated-home path): the headless
+# backend must never `ask` (nobody approves -> prompt hangs until the proxy
+# 180s timeout) nor silently execute tools the proxy did not authorize (the
+# free-tier strip omits the prompt tools map -> backend agent defaults on).
+# Deny-all by default; only explicitly allowlisted internal tools are allowed.
+# Applies in every prompt mode (standard and plugin-inject alike).
+BACKEND_PERM_JSON=""
+if [ -f ./dist/src/backend/backend-permission.js ]; then
+    BACKEND_PERM_JSON=$(node --input-type=module -e "
+import('./dist/src/backend/backend-permission.js').then((m) => {
+  const rawList = process.env['OPENCODE_INTERNAL_ALLOWED_TOOLS'] ?? '';
+  const rawFetch = (process.env['OPENCODE_INTERNAL_WEB_FETCH_ENABLED'] ?? '').trim().toLowerCase();
+  const list = String(rawList).split(',').map((s) => s.trim()).filter(Boolean);
+  const fetchOn = ['1', 'true', 'yes', 'y', 'on'].includes(rawFetch);
+  console.log(JSON.stringify(m.buildBackendPermission(list, fetchOn)));
+}).catch((e) => { console.error(String(e && e.message || e)); process.exit(1); });" 2>/dev/null) || BACKEND_PERM_JSON=""
+fi
+if [ -z "$BACKEND_PERM_JSON" ]; then
+    echo "[Config] Warning: backend permission generator unavailable; using static deny-all fallback" >&2
+    BACKEND_PERM_JSON='{"read":"deny","edit":"deny","glob":"deny","grep":"deny","list":"deny","bash":"deny","task":"deny","todowrite":"deny","question":"deny","webfetch":"deny","websearch":"deny","lsp":"deny","doom_loop":"deny","skill":"deny","external_directory":{"/home/node/project/**":"allow","*":"deny"}}'
+fi
+PLUGIN_JSON_LINE=""
 if [[ "${OPENCODE_PROXY_PROMPT_MODE:-standard}" == "plugin-inject" ]]; then
     echo "Preparing opencode2api plugin-inject prompt mode..."
     mkdir -p /home/node/.config/opencode/plugin/opencode2api-empty
@@ -56,15 +79,20 @@ if [[ "${OPENCODE_PROXY_PROMPT_MODE:-standard}" == "plugin-inject" ]]; then
 export const Opencode2apiEmptyPlugin = async () => ({})
 export default Opencode2apiEmptyPlugin
 EOF
-    cat > /home/node/.config/opencode/opencode.json <<'EOF'
-{
-  "plugin": ["/home/node/.config/opencode/plugin/opencode2api-empty/index.js"],
-  "instructions": [],
-  "theme": "system"
-}
-EOF
-    chown -R node:node /home/node/.config/opencode
+    PLUGIN_JSON_LINE='  "plugin": ["/home/node/.config/opencode/plugin/opencode2api-empty/index.js"],'
 fi
+mkdir -p /home/node/.config/opencode
+# printf-built (never an interpolated heredoc): generated JSON cannot be
+# shell-expanded into the config even if it ever contains $, backticks, or \.
+{
+printf '%s\n' '{'
+if [ -n "$PLUGIN_JSON_LINE" ]; then printf '%s\n' "$PLUGIN_JSON_LINE"; fi
+printf '%s\n' '  "instructions": [],'
+printf '%s\n' '  "theme": "system",'
+printf '  "permission": %s\n' "$BACKEND_PERM_JSON"
+printf '%s\n' '}'
+} > /home/node/.config/opencode/opencode.json
+chown -R node:node /home/node/.config/opencode
 
 if [[ "$1" == "opencode" && "$2" == "serve" ]]; then
     echo "Initializing OpenCode-to-OpenAI (Server + Proxy)"
