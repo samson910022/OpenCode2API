@@ -113,6 +113,10 @@ services:
     cpus: 4.0
 ```
 
+### 改變出口 IP（後端走代理）
+
+後端（Bun）認標準代理環境變數（`ALL_PROXY` / `HTTP_PROXY` / `HTTPS_PROXY`，大小寫皆可，`NO_PROXY` 跳過直連），用 compose `environment` 或 `.env` 傳入即可（不要提交帶值的 `.env`）。兩點注意：`NO_PROXY` 必須含 `localhost,127.0.0.1,::1`（否則 proxy↔後端的 loopback 也被送進代理而中斷）；Bun 不支援 `socks5(h)://`（會報 `UnsupportedProxyProtocol`），只認 http/https 代理——SOCKS 需求先在外層轉成 HTTP CONNECT 入口。
+
 ---
 
 ## 📊 日志管理
