@@ -7,6 +7,8 @@ import { spawn, execFileSync } from 'child_process';
 import type { ChildProcess } from 'child_process';
 import type { ProxyConfig } from '../types/config.js';
 import type { BackendState, OpencodeResolveResult } from '../types/backend.js';
+import { buildBackendPermission } from './backend-permission.js';
+import { resetActiveModelCache } from './active-model.js';
 
 interface QueuedTask {
   task: () => Promise<unknown>;
@@ -499,6 +501,15 @@ export async function ensureBackend(config: unknown): Promise<void> {
                 plugin: [path.join(pluginDir, 'index.js')],
                 instructions: [],
                 theme: 'system',
+                // Backend permission lockdown: headless backend must never
+                // `ask` (hangs forever) nor silently execute unlisted tools.
+                // Same generator as entrypoint.sh (single source:
+                // src/backend/backend-permission.ts).
+                permission: buildBackendPermission(
+                  (cfg as Record<string, unknown>)['INTERNAL_ALLOWED_TOOLS'],
+                  (cfg as Record<string, unknown>)['INTERNAL_WEB_FETCH_ENABLED'],
+                  workspace,
+                ),
               },
               null,
               2,
@@ -551,6 +562,9 @@ export async function ensureBackend(config: unknown): Promise<void> {
     // basename is enough to correlate; the full path stays out of stdout.
     console.log(`[Proxy] Backend project dir: <jail>/${path.basename(cwd)} (isolated git-backed jail)`);
     state.process = spawn(opencodeBin, spawnArgs, spawnOptions);
+    // A fresh backend reverts to its default model: drop cached
+    // set-active-model state so the next request PUTs again.
+    resetActiveModelCache();
 
     // Handle spawn errors
     state.process.on('error', (spawnErr: unknown) => {

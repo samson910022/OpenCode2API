@@ -31,9 +31,11 @@
 index.ts                 # prod bootstrap + config merge (487 lines)
 src/proxy.ts             # createApp/startProxy (1149 lines; god file, see §9)
 src/config/proxy-config.ts # buildProxyConfig + shared pure normalizers (bool/int/port/url/list/enum)
-src/routes/              # chat.ts (1215) / responses.ts (1798) / messages.ts (978) / interactions.ts (534) / system.ts
+src/routes/              # chat.ts (1213) / responses.ts (1798) / messages.ts (979) / interactions.ts (533) / system.ts
 src/tool-runtime/        # contracts / registry / router / parser (1934) / validator / policy
-src/backend/manager.ts   # backend lifecycle + request lock/queue
+src/backend/manager.ts   # backend lifecycle + request lock/queue (601 lines)
+src/backend/active-model.ts # ensureActiveModel change-only PUT per client + reset on respawn, pure (45 lines)
+src/backend/backend-permission.ts # buildBackendPermission deny-all generator, single source for entrypoint.sh + manager.ts isolated path, pure (97 lines)
 src/stream/collector.ts  # prompt/poll/collect SSE pipeline
 src/retry/policy.ts      # pure retry helpers (resolveMaxRetries, backoff+jitter)
 src/errors/upstream.ts   # normalizeBackendError, transformUpstreamError, isTransient*

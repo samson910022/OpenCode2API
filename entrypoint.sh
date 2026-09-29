@@ -56,11 +56,33 @@ if [[ "${OPENCODE_PROXY_PROMPT_MODE:-standard}" == "plugin-inject" ]]; then
 export const Opencode2apiEmptyPlugin = async () => ({})
 export default Opencode2apiEmptyPlugin
 EOF
-    cat > /home/node/.config/opencode/opencode.json <<'EOF'
+    # Backend permission lockdown (single source: src/backend/backend-permission.ts,
+    # mirrored in src/backend/manager.ts for the isolated-home path): the headless
+    # backend must never `ask` (nobody approves -> prompt hangs until the proxy
+    # 180s timeout) nor silently execute tools the proxy did not authorize (the
+    # free-tier strip omits the prompt tools map -> backend agent defaults on).
+    # Deny-all by default; only explicitly allowlisted internal tools are allowed.
+    BACKEND_PERM_JSON=""
+    if [ -f ./dist/src/backend/backend-permission.js ]; then
+        BACKEND_PERM_JSON=$(node --input-type=module -e "
+import('./dist/src/backend/backend-permission.js').then((m) => {
+  const rawList = process.env['OPENCODE_INTERNAL_ALLOWED_TOOLS'] ?? '';
+  const rawFetch = (process.env['OPENCODE_INTERNAL_WEB_FETCH_ENABLED'] ?? '').trim().toLowerCase();
+  const list = String(rawList).split(',').map((s) => s.trim()).filter(Boolean);
+  const fetchOn = ['1', 'true', 'yes', 'y', 'on'].includes(rawFetch);
+  console.log(JSON.stringify(m.buildBackendPermission(list, fetchOn)));
+}).catch((e) => { console.error(String(e && e.message || e)); process.exit(1); });" 2>/dev/null) || BACKEND_PERM_JSON=""
+    fi
+    if [ -z "$BACKEND_PERM_JSON" ]; then
+        echo "[Config] Warning: backend permission generator unavailable; using static deny-all fallback" >&2
+        BACKEND_PERM_JSON='{"read":"deny","edit":"deny","glob":"deny","grep":"deny","list":"deny","bash":"deny","task":"deny","todowrite":"deny","question":"deny","webfetch":"deny","websearch":"deny","lsp":"deny","doom_loop":"deny","skill":"deny","external_directory":{"/home/node/project/**":"allow","*":"deny"}}'
+    fi
+    cat > /home/node/.config/opencode/opencode.json <<EOF
 {
   "plugin": ["/home/node/.config/opencode/plugin/opencode2api-empty/index.js"],
   "instructions": [],
-  "theme": "system"
+  "theme": "system",
+  "permission": $BACKEND_PERM_JSON
 }
 EOF
     chown -R node:node /home/node/.config/opencode

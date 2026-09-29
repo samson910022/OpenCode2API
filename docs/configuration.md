@@ -232,6 +232,15 @@ OpenCode2API 现在支持把外部客户端传入的 OpenAI-compatible `tools` �
 - `OPENCODE_TOOL_DISCOVERY_FIXTURE` 可在集成测试或本地调试时绕过真实 `client.tool.ids()`，直接提供固定工具 ID 列表。
 - 一旦客户端传入 `tools`，请求立即切回外部工具桥接模式，所有 OpenCode 内置工具继续保持禁用。
 
+### 后端权限锁定（headless 防 hang）
+
+后端（`opencode serve`）是无人值守的：任何 `ask` 都没有人批准，会卡住整个 prompt 直到代理 180s 超时；同时免费模型的 tools map 会被剥掉（见上），后端回退到 agent 全开，可能静默执行调用方没授权的工具。为此容器启动（`entrypoint.sh`，`USE_ISOLATED_HOME` 下由 `src/backend/manager.ts` 同步）会给后端 `opencode.json` 写入生成的 `permission`（单一来源 `src/backend/backend-permission.ts`）：
+
+- 默认 deny-all；只放行 `OPENCODE_INTERNAL_ALLOWED_TOOLS` 明确列出的工具（`web_fetch` 等别名归一；未知名忽略，不会写坏 schema）。
+- 未显式配置 allowlist 时 `OPENCODE_INTERNAL_WEB_FETCH_ENABLED=true` 沿用旧兼容：放行 `webfetch`。
+- `external_directory` 永远 jail 在 `/home/node/project/**`，之外一律 deny（快速失败，不会 hang；模型转而走外部桥接，由客户端执行并经用户确认）。
+- 空 allowlist = 后端零执行（与“全部内置禁用”安全模式一致）。
+
 ### 请求级 allowlist 覆盖 (Request-Level Override)
 
 在请求未传入 `tools` 的前提下，客户端可以在请求体中传入自定义字段 `opencode.internal_allowed_tools` 来覆盖服务端的默认内置工具列表。

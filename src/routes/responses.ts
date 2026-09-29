@@ -11,6 +11,7 @@ import { qualifyToolName } from '../converters/chat-responses/request.js';
 import { EXTERNAL_TOOL_PREFIX } from '../tool-runtime/contracts.js';
 import { preflightExternalToolChoice } from '../tool-runtime/router.js';
 import { computeRetryDelay } from '../retry/policy.js';
+import { ensureActiveModel } from '../backend/active-model.js';
 import {
   assertToolCallArtifactIntegrity,
   createDuplicateToolCallIdError,
@@ -642,10 +643,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
 
       await ensureBackend(config);
 
+      // Change-only: every PUT disposes the backend project instance.
       try {
-        await activeClient.config.update({
-          body: { activeModel: { providerID: pID, modelID: mID } },
-        });
+        await ensureActiveModel(activeClient, pID, mID);
       } catch {
         // ignore
       }
