@@ -77,6 +77,8 @@
 
 > 注意：`GET /health/details` 的 `internal_tools.fallback_proxies` 可观察 engaged 状态；`/metrics` 有 `opencode_fallback_proxy_engaged` gauge。流式 SSE 不走自定义 fetch（上游 SDK 缺口），fallback 自动降级为轮询。
 
+> 流量归属（proxy 究竟代理什么）：网关本体是翻译网关——client 协议进、转成 session 协议打本地后端、译回原协议出；后端 → Zen 的 TLS 是后端自发连接，永远不经过网关进程。fallback pool 只在「配了 pool ＋ 打到免费额度错误 ＋ 目标非 loopback」三条件齐备时，把网关 → 后端这一跳换路上代理。因此它**不能**改变 Zen 看到的出口 IP；multimodal 图片抓取、`models.dev` 等杂项同样直连。改 Zen 出口 IP 的有效路径见 `docs/docker.md`「改变出口 IP」一节（后端 HTTP 代理 / 网络层 VPN / 去匿名化登录）。
+
 ### 调试配置
 
 | 变量 | 默认值 | 说明 |
