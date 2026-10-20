@@ -58,7 +58,7 @@ describe('backend permission contract', () => {
     });
 
     test('read gate sentinel is NUL-terminated, non-wildcard, and outside the project jail', () => {
-        expect(FREE_TIER_READ_GATE_PATH).toContain('\u0000');
+        expect(FREE_TIER_READ_GATE_PATH.endsWith('\u0000')).toBe(true);
         expect(FREE_TIER_READ_GATE_PATH).not.toMatch(/[*?]/);
         expect(FREE_TIER_READ_GATE_PATH.startsWith(BACKEND_PROJECT_DIR)).toBe(false);
     });
