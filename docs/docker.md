@@ -113,7 +113,7 @@ docker compose up -d --force-recreate
 
 升级固定版本时，代理侧单测只能保护代理侧契约，无法执行镜像里安装的后端。合并前必须完成：
 
-1. 更新 `tests/dockerfile-pin.test.js` 中的 `PINNED_VERSION`；
+1. 同步更新 `Dockerfile` 的 `ARG OPENCODE_VERSION`、`tests/dockerfile-pin.test.js` 的 `PINNED_VERSION`、本页所有版本字符串（含默认说明），以及 `docs/troubleshooting.md` / `AGENTS.md` / `CHANGELOG.md` 中当前 pin 的版本引用；
 2. 重跑 `tests/free-tier-gate.test.js`、`tests/backend-permission.test.js` 与 `tests/dockerfile-pin.test.js`；
 3. 检查目标版本源码，确认 `Permission.disabled()` 仍使用 `findLast`，且选择逻辑仍是“按工具名取最后一条规则，再判断该规则 pattern 是否为 `*`”；
 4. 用真实后端与 Zen 请求验证 `read` 仍出现在上游 `tools[]` 中，然后再合并。
