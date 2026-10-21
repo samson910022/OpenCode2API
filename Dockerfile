@@ -50,6 +50,8 @@ RUN npm ci --omit=dev
 COPY --from=builder /build/dist ./dist
 RUN chown -R node:node /home/node/project
 
+ENV NODE_ENV=production
+
 EXPOSE 10000 10001
 
 # Config env defaults stay empty on purpose: a non-empty default would win over

@@ -31,7 +31,7 @@ import { registerChatRoutes } from './routes/chat.js';
 import { registerResponsesRoutes } from './routes/responses.js';
 import { registerMessagesRoutes } from './routes/messages.js';
 import { registerInteractionsRoutes } from './routes/interactions.js';
-import { registerSystemRoutes, registerNotFoundRoute } from './routes/system.js';
+import { registerSystemRoutes, registerNotFoundRoute, registerErrorHandler } from './routes/system.js';
 import type { ProxyConfig } from './types/config.js';
 import type {
   AppContext,
@@ -124,6 +124,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   const maxAttempts = maxRetries + 1;
 
   const app: Application = express();
+  app.disable('x-powered-by');
   app.use(
     cors({
       origin: '*',
@@ -131,8 +132,6 @@ export function createApp(config: ProxyConfig): CreateAppResult {
       allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'anthropic-version'],
     }),
   );
-  app.use(bodyParser.json({ limit: '50mb' }));
-  app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
   const clientHeaders = buildBackendAuthHeaders(OPENCODE_SERVER_PASSWORD);
   const rawClient: OpencodeClient = createOpencodeClient({ baseUrl: OPENCODE_SERVER_URL, headers: clientHeaders });
@@ -147,6 +146,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   const apiKeyVerifier = createApiKeyVerifier(effectiveApiKeys);
 
   // Auth middleware (accepts Authorization: Bearer and x-api-key for Anthropic SDK compat)
+  // Runs before bodyParser so unauthenticated requests are rejected immediately without parsing.
   app.use((req: Request, res: Response, next: NextFunction): void => {
     if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/health/details' || req.path === '/metrics')
       return next();
@@ -165,6 +165,9 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     }
     next();
   });
+
+  app.use(bodyParser.json({ limit: '50mb' }));
+  app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
   const getProvidersList = async (): Promise<ProviderInfo[]> => {
     const providersRes = (await client.config.providers()) as unknown;
@@ -242,7 +245,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
       code?: string;
       availableModels?: string[];
     };
-    error.statusCode = 400;
+    error.statusCode = 404;
     error.code = 'model_not_found';
     error.availableModels = models.map((m) => m.id);
     throw error;
@@ -1098,13 +1101,14 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     translators: ensureTranslatorsRegistered(defaultTranslatorRegistry()),
   };
 
-  // P3: register routes (404 last to preserve catch-all order).
+  // P3: register routes (404 last to preserve catch-all order, error handler after).
   registerSystemRoutes(app, ctx);
   registerChatRoutes(app, ctx);
   registerResponsesRoutes(app, ctx);
   registerMessagesRoutes(app, ctx);
   registerInteractionsRoutes(app, ctx);
   registerNotFoundRoute(app);
+  registerErrorHandler(app);
 
   return { app, client };
 }
