@@ -362,7 +362,7 @@ describe('Phase 2: SSE Framing, Keepalives, Headers, and Wire Integrity', () => 
             expect(result.cut).toBeUndefined();
         });
 
-        test('resolves with finish: tool when iterator ends after tool finish', async () => {
+        test('resolves with finish: tool and cut: true when iterator ends after tool finish', async () => {
             const result = await run([
                 {
                     type: 'message.part.updated',
@@ -380,9 +380,52 @@ describe('Phase 2: SSE Framing, Keepalives, Headers, and Wire Integrity', () => 
             ]);
             expect(result).toMatchObject({
                 content: 'Tool call output',
-                finish: 'tool'
+                finish: 'tool',
+                cut: true
             });
-            expect(result.cut).toBeUndefined();
+            expect(result.cut).toBe(true);
+        });
+
+        test('resolves with cut: true when iterator ends on intermediate tool-calls finish', async () => {
+            const result = await run([
+                {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { id: 'p1', type: 'text', sessionID: 'collector-session' },
+                        delta: 'Calling tools'
+                    }
+                },
+                {
+                    type: 'message.updated',
+                    properties: {
+                        info: { sessionID: 'collector-session', finish: 'tool-calls' }
+                    }
+                }
+            ]);
+            expect(result).toMatchObject({
+                content: 'Calling tools',
+                finish: 'tool-calls',
+                cut: true
+            });
+            expect(result.cut).toBe(true);
+        });
+
+        test('resolves with cut: true when iterator ends after intermediate stop while tools are active', async () => {
+            const result = await run([
+                {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { id: 'tool-1', type: 'tool', sessionID: 'collector-session', state: { status: 'running' } }
+                    }
+                },
+                {
+                    type: 'message.updated',
+                    properties: {
+                        info: { sessionID: 'collector-session', finish: 'stop' }
+                    }
+                }
+            ]);
+            expect(result.cut).toBe(true);
         });
 
         test('natural iterator completion clears timeoutId, firstDeltaTimer, and idleTimer', async () => {

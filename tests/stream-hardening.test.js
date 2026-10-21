@@ -645,6 +645,32 @@ describe('collector authoritative snapshots', () => {
         expect(result.authoritative).toBe(true);
     });
 
+    test('interleaved snapshot -> delta -> newer snapshot -> delta does not duplicate delta text', async () => {
+        const result = await run([
+            { type: 'message.part.updated', properties: { part: { id: 'p1', messageID: 'msg-1', type: 'text', text: 'Hello', sessionID: 'collector-session' } } },
+            textDelta('p1', ' world', 'msg-1'),
+            { type: 'message.part.updated', properties: { part: { id: 'p1', messageID: 'msg-1', type: 'text', text: 'Hello world', sessionID: 'collector-session' } } },
+            textDelta('p1', '!', 'msg-1'),
+            stop()
+        ]);
+        expect(result.content).toBe('Hello world!');
+        expect(result.content).not.toBe('Hello world world!');
+        expect(result.content).not.toContain('world world');
+    });
+
+    test('interleaved snapshot -> delta -> newer snapshot -> delta via message.part.updated delta', async () => {
+        const result = await run([
+            { type: 'message.part.updated', properties: { part: { id: 'p1', messageID: 'msg-1', type: 'text', text: 'Hello', sessionID: 'collector-session' } } },
+            { type: 'message.part.updated', properties: { part: { id: 'p1', messageID: 'msg-1', type: 'text', sessionID: 'collector-session' }, delta: ' world' } },
+            { type: 'message.part.updated', properties: { part: { id: 'p1', messageID: 'msg-1', type: 'text', text: 'Hello world', sessionID: 'collector-session' } } },
+            { type: 'message.part.updated', properties: { part: { id: 'p1', messageID: 'msg-1', type: 'text', sessionID: 'collector-session' }, delta: '!' } },
+            stop()
+        ]);
+        expect(result.content).toBe('Hello world!');
+        expect(result.content).not.toBe('Hello world world!');
+        expect(result.content).not.toContain('world world');
+    });
+
     test('flushes orphaned deltas whose part update was dropped', async () => {
         const result = await run([
             { type: 'message.part.delta', properties: { sessionID: 'collector-session', messageID: 'msg-1', partID: 'orphan', field: 'text', delta: 'orphan text' } },

@@ -322,6 +322,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     const CANCELLED = Symbol('collector-cancelled');
     let removeSubscribeAbortListener = (): void => {};
     const subscribePromise = Promise.resolve().then(() => client.event.subscribe({ signal: controller.signal }));
+    subscribePromise.catch(() => {});
     const subscribeAbortPromise = new Promise<typeof CANCELLED>((resolve) => {
       const onAbort = (): void => {
         controller.abort();
@@ -424,6 +425,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
       const timeoutId = setTimeout(() => {
         if (finished) return;
         finished = true;
+        clearAllTimers();
         controller.abort();
         reject(new Error(`Request timeout after ${timeoutMs}ms`));
       }, timeoutMs);
@@ -432,6 +434,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
         ? setTimeout(() => {
             if (finished || receivedDelta) return;
             finished = true;
+            clearAllTimers();
             controller.abort();
             logDebug('No event data received', { sessionId, ms: Date.now() - startedAt });
             const result = finalizeCollected();
@@ -445,12 +448,17 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
         : null;
 
        let idleTimer: ReturnType<typeof setTimeout> | null = null;
-       const onSignalAbort = (): void => {
-         if (finished) return;
-         finished = true;
+
+       const clearAllTimers = (): void => {
          clearTimeout(timeoutId);
          if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
          if (idleTimer) clearTimeout(idleTimer);
+       };
+
+       const onSignalAbort = (): void => {
+         if (finished) return;
+         finished = true;
+         clearAllTimers();
          controller.abort();
          resolve({ content, reasoning, cancelled: true });
        };
@@ -478,6 +486,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
             return;
           }
           finished = true;
+          clearAllTimers();
           controller.abort();
           logDebug('Event idle timeout', {
             sessionId,
@@ -514,6 +523,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
         type: StreamPartType;
         deltaText: string;
         snapshotText: string;
+        deltasAfterSnapshot: string;
         order: number;
         messageID: string | null;
         partID: string | null;
@@ -574,6 +584,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
             type,
             deltaText: '',
             snapshotText: '',
+            deltasAfterSnapshot: '',
             order: order ?? ++partOrderCounter,
             messageID,
             partID,
@@ -615,6 +626,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
       };
       const appendPartDelta = (state: StreamPartState, delta: string): void => {
         state.deltaText += delta;
+        state.deltasAfterSnapshot += delta;
         state.deltaSeq = ++eventSeq;
         applyTextDelta(state.type, delta);
       };
@@ -680,20 +692,19 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
         if (typeof text === 'string' && text) {
           state.snapshotText = text;
           state.snapshotSeq = ++eventSeq;
+          state.deltasAfterSnapshot = '';
         }
       };
       const choosePartText = (state: StreamPartState): string => {
-        const { deltaText, snapshotText, snapshotSeq, deltaSeq } = state;
+        const { deltaText, snapshotText, deltasAfterSnapshot, snapshotSeq, deltaSeq } = state;
         if (snapshotText === '') return deltaText;
         if (deltaText === '') return snapshotText;
         if (snapshotText === deltaText) return snapshotText;
         if (snapshotText.startsWith(deltaText)) return snapshotText;
         if (deltaText.startsWith(snapshotText)) return deltaText;
-        if (snapshotText.endsWith(deltaText)) return snapshotText;
-        if (deltaText.endsWith(snapshotText)) return deltaText;
         // If deltas arrived after snapshotText was set, deltas were continuing:
         if (deltaSeq > snapshotSeq) {
-          return `${snapshotText}${deltaText}`;
+          return `${snapshotText}${deltasAfterSnapshot}`;
         }
         // Snapshot arrived after deltas: snapshot is the authoritative replacement:
         return snapshotText;
@@ -706,6 +717,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
             const state = ensurePartState(pending.messageID, pending.partID, 'text', pending.order);
             pending.deltas.forEach((delta) => {
               state.deltaText += delta;
+              state.deltasAfterSnapshot += delta;
             });
           }
           pendingDeltaParts.clear();
@@ -754,9 +766,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                const sessionError = readSessionEventError(props);
                terminalFinishSeen = true;
                finished = true;
-               clearTimeout(timeoutId);
-               if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-               if (idleTimer) clearTimeout(idleTimer);
+               clearAllTimers();
                controller.abort();
                logDebug('SSE session error', { sessionId, ms: Date.now() - startedAt });
                resolve(finalizeCollected({ error: sessionError }));
@@ -871,9 +881,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
               if (infoError != null) {
                 terminalFinishSeen = true;
                 finished = true;
-                clearTimeout(timeoutId);
-                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                if (idleTimer) clearTimeout(idleTimer);
+                clearAllTimers();
                 logDebug('SSE upstream message error', {
                   sessionId,
                   ms: Date.now() - startedAt,
@@ -898,14 +906,12 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                 partOrderCounter = Math.max(partOrderCounter, snapshotParts.length);
               }
               if (finish === 'tool' || finish === 'tool-calls') {
-                terminalFinishSeen = true;
                 // Assistant turn ended pending a tool call; keep waiting for the result.
                 if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
                 scheduleIdleTimer();
                 continue;
               }
               if (finish === 'stop') {
-                terminalFinishSeen = true;
                 // Only treat the stream as completed when no tool call is still
                 // pending. OpenCode may emit an intermediate 'stop' snapshot while a
                 // tool call is in flight; resolving on it would drop the final answer.
@@ -916,11 +922,10 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                   });
                   continue;
                 }
+                terminalFinishSeen = true;
                 if (!finished) {
                   finished = true;
-                  clearTimeout(timeoutId);
-                  if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                  if (idleTimer) clearTimeout(idleTimer);
+                  clearAllTimers();
                   logDebug('SSE completed', {
                     sessionId,
                     ms: Date.now() - startedAt,
@@ -938,9 +943,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
           }
           if (!finished) {
             finished = true;
-            clearTimeout(timeoutId);
-            if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-            if (idleTimer) clearTimeout(idleTimer);
+            clearAllTimers();
             logDebug('SSE eventStream ended naturally', {
               sessionId,
               ms: Date.now() - startedAt,
@@ -964,9 +967,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
         } catch (e: unknown) {
           if (!finished) {
             finished = true;
-            clearTimeout(timeoutId);
-            if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-            if (idleTimer) clearTimeout(idleTimer);
+            clearAllTimers();
             reject(e);
           }
         }
