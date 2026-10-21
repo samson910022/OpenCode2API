@@ -8,6 +8,7 @@ function readStringField(record: Record<string, unknown>, key: string): string |
 }
 
 function collectMessageParts(error: unknown): string {
+  if (typeof error === 'string') return error;
   const record = asRecord(error);
   const data = asRecord(record['data']);
   const parts: string[] = [];
@@ -27,7 +28,7 @@ function readStatusCode(error: unknown): number | null {
     const n = Number(direct.trim());
     if (Number.isFinite(n) && n > 0) return n;
   }
-  const candidates: unknown[] = [record['message'], data['message']];
+  const candidates: unknown[] = [typeof error === 'string' ? error : null, record['message'], data['message']];
   for (const candidate of candidates) {
     if (typeof candidate !== 'string') continue;
     const m = candidate.match(/^\s*(\d{3})\s*:/);
@@ -168,6 +169,13 @@ export function isTransientUpstreamError(error: unknown): boolean {
   // whatever the status code. Explicit false defers to the checks below.
   if (record['isRetryable'] === true || data['isRetryable'] === true) return true;
 
+  const status = readStatusCode(error);
+  if (typeof status === 'number' && status >= 400 && status < 500) {
+    if (status !== 401 && status !== 402 && status !== 408 && status !== 429) {
+      return false;
+    }
+  }
+
   // Genuine auth failures must surface immediately: a misconfigured key
   // should not burn the full backoff. The issue-#5 mislabeled billing case
   // ("Insufficient balance"/CreditsError) never carries these strings, so
@@ -205,32 +213,18 @@ export function isTransientUpstreamError(error: unknown): boolean {
     /retry your request/i,
     /resource exhausted/i,
     /(?:currently|temporarily) at capacity/i,
-    /endpoint is unavailable/i,
+    /^\s*endpoint is unavailable\.?\s*$/i,
   ];
-  if (message && transientSignatures.some((re) => re.test(message))) return true;
 
-  // Upstream errors arrive as "<status>: {json}" strings; SDK errors may also
-  // carry a numeric status on the object itself. Only accept a leading
-  // "<status>:" prefix — a loose \b(\d{3}): match misfires on embedded
-  // numbers like "retry after 300: ...".
-  const recordStatus: unknown = record['statusCode'] ?? data['statusCode'] ?? data['status'];
-  let status: number | null = typeof recordStatus === 'number' ? recordStatus : null;
-  if (typeof status !== 'number') {
-    const statusCandidates: string[] = [];
-    const msg: unknown = record['message'];
-    const dataMsg: unknown = data['message'];
-    if (typeof msg === 'string') statusCandidates.push(msg);
-    if (typeof dataMsg === 'string') statusCandidates.push(dataMsg);
-    for (const candidate of statusCandidates) {
-      const prefixMatch = candidate.match(/^\s*(\d{3})\s*:/);
-      if (prefixMatch?.[1]) {
-        status = Number(prefixMatch[1]);
-        break;
-      }
-    }
-  }
+  const msgParts: string[] = [];
+  if (message) msgParts.push(message);
+  if (typeof record['message'] === 'string' && record['message'] !== message) msgParts.push(record['message']);
+  if (typeof data['message'] === 'string' && data['message'] !== message) msgParts.push(data['message']);
+
+  if (msgParts.some((text) => transientSignatures.some((re) => re.test(text)))) return true;
+
   if (typeof status === 'number') {
-    if (status === 401 || status === 402 || status === 429) return true;
+    if (status === 401 || status === 402 || status === 408 || status === 429) return true;
     if (status >= 500) return true;
   }
   return false;

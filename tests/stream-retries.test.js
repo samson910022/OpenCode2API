@@ -65,6 +65,18 @@ const { isTransientUpstreamError } = await import('../src/errors/upstream.js');
 const { createApp } = await import('../src/proxy.js');
 const { lock, notifyBackendReconnect } = await import('../src/backend/manager.js');
 
+function freeUsageError() {
+    return {
+        name: 'APIError',
+        data: {
+            message: 'Rate limit exceeded. Please try again later.',
+            statusCode: 429,
+            isRetryable: true,
+            responseBody: '{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded."}}',
+        },
+    };
+}
+
 function baseConfig(overrides = {}) {
     return {
         PORT: 10000,
@@ -93,6 +105,22 @@ describe('isTransientUpstreamError', () => {
         expect(isTransientUpstreamError({ data: { statusCode: 400 } })).toBe(false);
         expect(isTransientUpstreamError({ message: 'invalid request parameters' })).toBe(false);
         expect(isTransientUpstreamError({ message: 'context length exceeded', data: { statusCode: 503 } })).toBe(false);
+    });
+
+    test('rejects HTTP 400, 403, 404 even if message has "endpoint is unavailable", but accepts 503 and exact "endpoint is unavailable"', () => {
+        expect(isTransientUpstreamError({ statusCode: 400, message: 'Endpoint is unavailable.' })).toBe(false);
+        expect(isTransientUpstreamError({ data: { statusCode: 400, message: 'Endpoint is unavailable.' } })).toBe(false);
+        expect(isTransientUpstreamError({ statusCode: 403, message: 'Endpoint is unavailable.' })).toBe(false);
+        expect(isTransientUpstreamError({ data: { statusCode: 403 }, message: 'Endpoint is unavailable.' })).toBe(false);
+        expect(isTransientUpstreamError({ statusCode: 404, message: 'Endpoint is unavailable.' })).toBe(false);
+        expect(isTransientUpstreamError({ data: { statusCode: 404 }, message: 'Endpoint is unavailable.' })).toBe(false);
+        expect(isTransientUpstreamError(new Error('400: Endpoint is unavailable.'))).toBe(false);
+        expect(isTransientUpstreamError(new Error('404: Endpoint is unavailable.'))).toBe(false);
+        expect(isTransientUpstreamError({ data: { statusCode: 503 } })).toBe(true);
+        expect(isTransientUpstreamError({ statusCode: 503 })).toBe(true);
+        expect(isTransientUpstreamError({ message: 'Endpoint is unavailable.' })).toBe(true);
+        expect(isTransientUpstreamError(new Error('Endpoint is unavailable.'))).toBe(true);
+        expect(isTransientUpstreamError({ message: 'Some other error: Endpoint is unavailable. Check endpoint' })).toBe(false);
     });
 });
 
@@ -514,7 +542,7 @@ describe('Provider List Caching', () => {
         expect(sdkMocks.configProviders).toHaveBeenCalledTimes(3);
     });
 
-    test('Responses stream retry on continuation request does NOT delete parent session', async () => {
+    test('Responses continuation 503 retry preserves parent session AND does not call session.create()', async () => {
         const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
 
         sdkMocks.sessionMessages.mockResolvedValue([
@@ -529,11 +557,8 @@ describe('Provider List Caching', () => {
         expect(seedRes.status).toBe(200);
         const prevId = seedRes.body.id;
 
-        // 2. Continuation turn: attempt 1 fails with transient 503 error event, attempt 2 creates retry session and succeeds
+        // 2. Continuation turn: attempt 1 fails with transient 503 error event, attempt 2 preserves parent session and succeeds
         let attempt = 0;
-        sdkMocks.sessionCreate.mockImplementation(async () => {
-            return { data: { id: 'retry-stream-session-456' } };
-        });
         sdkMocks.eventSubscribe.mockImplementation(async () => {
             attempt += 1;
             const currentAttempt = attempt;
@@ -553,11 +578,11 @@ describe('Provider List Caching', () => {
                     } else {
                         yield {
                             type: 'message.part.updated',
-                            properties: { part: { type: 'text', sessionID: 'retry-stream-session-456' }, delta: 'turn 2 success' }
+                            properties: { part: { type: 'text', sessionID: 'parent-session-123' }, delta: 'turn 2 success' }
                         };
                         yield {
                             type: 'message.updated',
-                            properties: { info: { sessionID: 'retry-stream-session-456', finish: 'stop' } }
+                            properties: { info: { sessionID: 'parent-session-123', finish: 'stop' } }
                         };
                     }
                 })()
@@ -565,6 +590,7 @@ describe('Provider List Caching', () => {
         });
 
         sdkMocks.sessionDelete.mockClear();
+        sdkMocks.sessionCreate.mockClear();
         const contRes = await request(app)
             .post('/v1/responses')
             .set('Authorization', 'Bearer test-key')
@@ -574,8 +600,116 @@ describe('Provider List Caching', () => {
         expect(contRes.text).toContain('turn 2 success');
         expect(contRes.text).toContain('response.completed');
 
-        // Verify parent session was NOT deleted!
+        // Verify parent session was NOT deleted and session.create() was NOT called on retry
+        expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
         const deletedIds = sdkMocks.sessionDelete.mock.calls.map(c => c[0]?.path?.id);
         expect(deletedIds).not.toContain('parent-session-123');
+    });
+
+    test('Interactions continuation 503 retry preserves parent session AND does not call session.create()', async () => {
+        const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
+
+        sdkMocks.sessionCreate.mockResolvedValueOnce({ data: { id: 'intr-parent-session-123' } });
+        sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [] } });
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1 intr' }] }
+        ]);
+
+        const seedRes = await request(app)
+            .post('/v1beta/interactions')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'first turn',
+                store: true
+            });
+        expect(seedRes.status).toBe(200);
+        const prevIntrId = seedRes.body.id;
+
+        let promptCount = 0;
+        sdkMocks.sessionPrompt.mockImplementation(async (params) => {
+            promptCount += 1;
+            expect(params.path.id).toBe('intr-parent-session-123');
+            if (promptCount === 1) {
+                const err = new Error('Endpoint is unavailable.');
+                err.data = { statusCode: 503, message: 'Endpoint is unavailable.', responseHeaders: { 'retry-after-ms': '5' } };
+                throw err;
+            }
+            return { data: { parts: [] } };
+        });
+
+        sdkMocks.sessionMessages.mockResolvedValue([
+            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 2 intr success' }] }
+        ]);
+
+        sdkMocks.sessionCreate.mockClear();
+        sdkMocks.sessionDelete.mockClear();
+
+        const contRes = await request(app)
+            .post('/v1beta/interactions')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'second turn',
+                previous_interaction_id: prevIntrId
+            });
+
+        expect(contRes.status).toBe(200);
+        expect(contRes.body.output_text).toBe('turn 2 intr success');
+
+        // Verify parent session was NOT deleted and session.create() was NOT called on retry
+        expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
+        const deletedIds = sdkMocks.sessionDelete.mock.calls.map(c => c[0]?.path?.id);
+        expect(deletedIds).not.toContain('intr-parent-session-123');
+    });
+
+    test('Responses stream proxy fallback succeeds cleanly without repeating prompts or retaining Attempt 1 error', async () => {
+        const { app } = createApp(baseConfig({
+            RETRY_MAX_RETRIES: 1,
+            UPSTREAM_PROXIES: ['http://10.0.0.1:8080'],
+            UPSTREAM_PROXY_COOLDOWN_MS: 60000,
+        }));
+
+        let sessionCount = 0;
+        sdkMocks.sessionCreate.mockImplementation(async () => {
+            sessionCount += 1;
+            return { data: { id: `resp-fallback-${sessionCount}` } };
+        });
+
+        sdkMocks.eventSubscribe.mockImplementation(async () => {
+            return {
+                stream: (async function* () {
+                    yield {
+                        type: 'session.error',
+                        properties: {
+                            sessionID: 'resp-fallback-1',
+                            error: freeUsageError()
+                        }
+                    };
+                })()
+            };
+        });
+
+        let promptCalls = 0;
+        sdkMocks.sessionPrompt.mockImplementation(async () => {
+            promptCalls += 1;
+            return { data: { parts: [] } };
+        });
+
+        sdkMocks.sessionMessages.mockResolvedValue([
+            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'Hello from proxy fallback attempt 2' }] }
+        ]);
+
+        const res = await request(app)
+            .post('/v1/responses')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'hello fallback',
+                stream: true
+            });
+
+        expect(res.status).toBe(200);
+        expect(res.text).toContain('Hello from proxy fallback attempt 2');
+        expect(res.text).toContain('response.completed');
+        expect(res.text).not.toContain('Rate limit exceeded');
+        expect(promptCalls).toBe(2);
     });
 });

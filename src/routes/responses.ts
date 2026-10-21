@@ -1162,30 +1162,54 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
            }
          };
 
+        let streamSearchToolParts: unknown[] = [];
+        const keepStreamToolParts = (polled: { toolParts?: unknown }): void => {
+          if (hostedSearch.requested && Array.isArray(polled.toolParts) && polled.toolParts.length > 0) {
+            streamSearchToolParts = polled.toolParts;
+          }
+        };
         let recoverySnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
         let recoveryPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> | null = null;
+        const pollRecoverySnapshot = (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> => {
+          if (!recoveryPromise) {
+            recoveryPromise = activePollForAssistantResponse(
+              sessionId as string,
+              REQUEST_TIMEOUT_MS,
+              undefined,
+              responsesAbortController.signal,
+            );
+          }
+          return recoveryPromise;
+        };
         let collected: Record<string, unknown> | null = null;
         let lastStreamAttemptError: unknown = null;
+        const isContinuation = Boolean(previousState?.sessionId);
 
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          collected = null;
           if (attempt > 1) {
             const retriedSessionId = sessionId;
-            if (retriedSessionId && retriedSessionId !== previousState?.sessionId) {
-              try {
-                await activeClient.session.delete({ path: { id: retriedSessionId } });
-              } catch (e: unknown) {
-                logDebug('Failed to delete retried responses session', { sessionId: retriedSessionId, error: toErrorMessage(e) });
+            if (!isContinuation) {
+              if (retriedSessionId) {
+                try {
+                  await activeClient.session.delete({ path: { id: retriedSessionId } });
+                } catch (e: unknown) {
+                  logDebug('Failed to delete retried responses session', { sessionId: retriedSessionId, error: toErrorMessage(e) });
+                }
               }
+              const retrySessionRes = (await withTimeout(
+                activeClient.session.create(),
+                REQUEST_TIMEOUT_MS,
+                'create session',
+              )) as unknown;
+              sessionId = (asRecord(asRecord(retrySessionRes)['data'])['id'] as string | undefined) ?? null;
+              if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
+              ownedResponsesSessionId = sessionId;
+              promptParams.path.id = sessionId;
+            } else {
+              sessionId = previousState!.sessionId;
+              promptParams.path.id = sessionId;
             }
-            const retrySessionRes = (await withTimeout(
-              activeClient.session.create(),
-              REQUEST_TIMEOUT_MS,
-              'create session',
-            )) as unknown;
-            sessionId = (asRecord(asRecord(retrySessionRes)['data'])['id'] as string | undefined) ?? null;
-            if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
-            ownedResponsesSessionId = sessionId;
-            promptParams.path.id = sessionId;
             requestForcedResponsesToolCall = makeForcedResponsesToolCallRequester();
             content = '';
             reasoning = '';
@@ -1211,8 +1235,19 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           try {
             if (fallbackToProxy) {
               // SSE subscribe ignores custom fetch (SDK gap): prompt through the
-              // proxy bundle; the poll below (line ~614) fills content/reasoning.
+              // proxy bundle; the poll below fills content/reasoning.
               await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+              const pres = await pollRecoverySnapshot();
+              if (pres.error != null) {
+                collected = { error: pres.error };
+              } else {
+                recoverySnapshot = pres;
+                keepStreamToolParts(pres);
+                if (pres.content || pres.reasoning) {
+                  replaySnapshotText(pres.content, pres.reasoning);
+                }
+                collected = { content: pres.content, reasoning: pres.reasoning, toolParts: pres.toolParts };
+              }
             } else {
               const collectPromise = collectFromEvents(
                 sessionId as string,
@@ -1246,7 +1281,22 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           }
 
           const collectedRecord = asRecord(collected);
-          const attemptError: unknown = collectedRecord['error'] ?? collectedRecord['__error'] ?? null;
+          let attemptError: unknown = collectedRecord['error'] ?? collectedRecord['__error'] ?? null;
+          if (!attemptError && (collectedRecord['noData'] || collectedRecord['cut'] || collectedRecord['idleTimeout'])) {
+            try {
+              const recovery = await pollRecoverySnapshot();
+              if (recovery.error != null) {
+                attemptError = recovery.error;
+              } else {
+                recoverySnapshot = recovery;
+                keepStreamToolParts(recovery);
+                replaySnapshotText(recovery.content, recovery.reasoning);
+                collected = { content: recovery.content, reasoning: recovery.reasoning, toolParts: recovery.toolParts };
+              }
+            } catch (pollErr: unknown) {
+              attemptError = pollErr;
+            }
+          }
           const nothingStreamed = !rawContent && !rawReasoning && streamedToolCalls.length === 0;
           if (attemptError && nothingStreamed && attempt < maxAttempts && engageProxyFallback(attemptError)) {
             lastStreamAttemptError = attemptError;
@@ -1271,23 +1321,6 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         if (collectedR['error'] != null) {
           throw normalizeBackendError(collectedR['error']);
         }
-        let streamSearchToolParts: unknown[] = [];
-        const keepStreamToolParts = (polled: { toolParts?: unknown }): void => {
-          if (hostedSearch.requested && Array.isArray(polled.toolParts) && polled.toolParts.length > 0) {
-            streamSearchToolParts = polled.toolParts;
-          }
-        };
-        const pollRecoverySnapshot = (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> => {
-          if (!recoveryPromise) {
-            recoveryPromise = activePollForAssistantResponse(
-              sessionId as string,
-              REQUEST_TIMEOUT_MS,
-              undefined,
-              responsesAbortController.signal,
-            );
-          }
-          return recoveryPromise;
-        };
          const hasPartialOutput = (): boolean => Boolean(
            rawContent || rawReasoning || streamedToolCalls.length > 0 || content || reasoning,
          );
@@ -1663,22 +1696,26 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           return;
         }
         if (attempt > 1) {
-          const retriedSessionId = sessionId;
-          if (ownedResponsesSessionId === retriedSessionId) ownedResponsesSessionId = null;
-          // A `previous_response_id` parent session is shared with earlier turns; only
-          // a session this request created may be discarded on retry.
-          if (retriedSessionId && retriedSessionId !== previousState?.sessionId) {
-            try {
-              await activeClient.session.delete({ path: { id: retriedSessionId } });
-            } catch (e: unknown) {
-              logDebug('Failed to delete retried session', { sessionId, error: toErrorMessage(e) });
+          const isNonStreamContinuation = Boolean(previousState?.sessionId);
+          if (!isNonStreamContinuation) {
+            const retriedSessionId = sessionId;
+            if (ownedResponsesSessionId === retriedSessionId) ownedResponsesSessionId = null;
+            if (retriedSessionId) {
+              try {
+                await activeClient.session.delete({ path: { id: retriedSessionId } });
+              } catch (e: unknown) {
+                logDebug('Failed to delete retried session', { sessionId, error: toErrorMessage(e) });
+              }
             }
+            const retrySessionRes = (await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
+            sessionId = (asRecord(asRecord(retrySessionRes)['data'])['id'] as string | undefined) ?? null;
+            if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
+            ownedResponsesSessionId = sessionId;
+            promptParams.path.id = sessionId;
+          } else {
+            sessionId = previousState!.sessionId;
+            promptParams.path.id = sessionId;
           }
-          const retrySessionRes = (await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
-          sessionId = (asRecord(asRecord(retrySessionRes)['data'])['id'] as string | undefined) ?? null;
-          if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
-          ownedResponsesSessionId = sessionId;
-          promptParams.path.id = sessionId;
           requestForcedResponsesToolCall = makeForcedResponsesToolCallRequester();
           await sleep(computeRetryDelay(attempt - 1, lastResponsesAttemptError));
         }

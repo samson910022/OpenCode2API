@@ -696,6 +696,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
 
           let lastStreamAttemptError: unknown = null;
           for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            collected = null;
             if (attempt > 1) {
               try {
                 await activeClient.session.delete({ path: { id: sessionId } });
@@ -792,7 +793,24 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
             }
 
             const collectedRecord = asRecord(collected);
-            const attemptError: unknown = collectedRecord['error'] ?? collectedRecord['__error'] ?? null;
+            let attemptError: unknown = collectedRecord['error'] ?? collectedRecord['__error'] ?? null;
+            if (!attemptError && (collectedRecord['noData'] || collectedRecord['cut'] || collectedRecord['idleTimeout'])) {
+              try {
+                const recovery = await pollSnapshot();
+                if (recovery.error != null) {
+                  attemptError = recovery.error;
+                } else {
+                  polledSnapshot = recovery;
+                  const presContent = unsentSuffix(recovery.content, rawContent);
+                  const presReasoning = unsentSuffix(recovery.reasoning, rawReasoning);
+                  if (presContent) sendDelta(presContent, false);
+                  if (presReasoning) sendDelta(presReasoning, true);
+                  collected = { content: recovery.content, reasoning: recovery.reasoning, toolParts: recovery.toolParts };
+                }
+              } catch (pollErr: unknown) {
+                attemptError = pollErr;
+              }
+            }
             const nothingStreamed = !rawContent && !rawReasoning && streamedToolCalls.length === 0;
             if (attemptError && nothingStreamed && attempt < maxAttempts && engageProxyFallback(attemptError)) {
               lastStreamAttemptError = attemptError;
