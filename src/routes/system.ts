@@ -234,7 +234,7 @@ export function registerErrorHandler(app: Application): void {
       next(err);
       return;
     }
-    const { status, body } = classifyHttpError(err, req.path);
+    const { status, body } = classifyHttpError(err, req.originalUrl || req.path);
     res.status(status).json(body);
   });
 }

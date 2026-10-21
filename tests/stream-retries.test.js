@@ -500,7 +500,7 @@ describe('Model Resolution Fast-Fail & Lock Separation', () => {
 
             expect(res.status).toBe(404);
             expect(res.body.type).toBe('error');
-            expect(res.body.error.type).toBe('model_not_found');
+            expect(res.body.error.type).toBe('not_found_error');
             expect(elapsed).toBeLessThan(150);
         } finally {
             releaseLock();
@@ -540,6 +540,15 @@ describe('Provider List Caching', () => {
         const list4 = await ctx.getProvidersList();
         expect(list4).toEqual(list1);
         expect(sdkMocks.configProviders).toHaveBeenCalledTimes(3);
+    });
+
+    test('Concurrent calls to getProvidersList share the same pending promise', async () => {
+        sdkMocks.configProviders.mockClear();
+        const { ctx } = createApp(baseConfig({}));
+
+        const [listA, listB] = await Promise.all([ctx.getProvidersList(), ctx.getProvidersList()]);
+        expect(listA).toEqual(listB);
+        expect(sdkMocks.configProviders).toHaveBeenCalledTimes(1);
     });
 
     test('Responses continuation 503 retry preserves parent session AND does not call session.create()', async () => {

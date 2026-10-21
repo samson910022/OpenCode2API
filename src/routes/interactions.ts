@@ -155,6 +155,12 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       fallbackToProxy = true;
       return true;
     };
+    const onClientClose = (): void => {
+      if (res.writableEnded) return;
+      clientGone = true;
+      requestAbortController.abort();
+    };
+    res.once('close', onClientClose);
     try {
       const body = asRecord((req as unknown as { body: unknown }).body);
       const model: unknown = body['model'];
@@ -163,14 +169,8 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       const systemInstruction: unknown = body['system_instruction'];
       const toolsRaw: unknown = body['tools'];
       const tools: unknown[] = Array.isArray(toolsRaw) ? (toolsRaw as unknown[]) : [];
-       const stream = body['stream'] === true;
-       const store = body['store'] !== false;
-       const onClientClose = (): void => {
-         if (res.writableEnded) return;
-         clientGone = true;
-         requestAbortController.abort();
-       };
-       res.once('close', onClientClose);
+      const stream = body['stream'] === true;
+      const store = body['store'] !== false;
 
       const previousInteractionId: unknown = body['previous_interaction_id'];
 
@@ -534,30 +534,19 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         }
       }
       return;
+    } finally {
+      res.removeListener('close', onClientClose);
     }
   };
 
-  app.post('/v1beta/interactions', (req: Request, res: Response): void => {
+  app.post(['/v1beta/interactions', '/v1/interactions'], (req: Request, res: Response): void => {
     void handle(req, res).catch((err: unknown) => {
+      const transformed = transformUpstreamError(err);
       if (!res.headersSent) {
-        res.status(500).json({ error: { message: toErrorMessage(err), type: 'api_error' } });
+        res.status(transformed.statusCode).json(transformed.error);
       } else if (!res.writableEnded && !res.destroyed) {
         try {
-          res.write(`data: ${JSON.stringify({ type: 'error', error: { message: toErrorMessage(err), type: 'api_error' } })}\n\n`);
-        } catch {
-          // ignore
-        }
-        res.end();
-      }
-    });
-  });
-  app.post('/v1/interactions', (req: Request, res: Response): void => {
-    void handle(req, res).catch((err: unknown) => {
-      if (!res.headersSent) {
-        res.status(500).json({ error: { message: toErrorMessage(err), type: 'api_error' } });
-      } else if (!res.writableEnded && !res.destroyed) {
-        try {
-          res.write(`data: ${JSON.stringify({ type: 'error', error: { message: toErrorMessage(err), type: 'api_error' } })}\n\n`);
+          res.write(`data: ${JSON.stringify({ type: 'error', error: transformed.error })}\n\n`);
         } catch {
           // ignore
         }

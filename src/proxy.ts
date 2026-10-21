@@ -46,6 +46,7 @@ import { asRecord, toErrorMessage } from './utils/guards.js';
 import { buildEffectiveApiKeys, createApiKeyVerifier } from './auth/keys.js';
 import { defaultTranslatorRegistry } from './converters/registry.js';
 import { ensureTranslatorsRegistered } from './converters/wire.js';
+import { isAnthropicMessagesPath } from './errors/http.js';
 
 // P4: thin re-exports to preserve original import paths
 // (tests/env-alias.test.js, stream-hardening.test.js import these from '../src/proxy.js').
@@ -155,7 +156,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
         req as unknown as { headers: { authorization?: unknown; 'x-api-key'?: unknown } },
       );
       if (!authorized) {
-        if (req.path === '/v1/messages') {
+        if (isAnthropicMessagesPath(req.originalUrl || req.path)) {
           res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: 'Unauthorized' } });
           return;
         }
@@ -172,10 +173,12 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   const PROVIDERS_CACHE_TTL_MS = 30_000;
   let cachedProvidersList: ProviderInfo[] | null = null;
   let cachedProvidersAt = 0;
+  let pendingProvidersPromise: Promise<ProviderInfo[]> | null = null;
 
   const invalidateProvidersCache = (): void => {
     cachedProvidersList = null;
     cachedProvidersAt = 0;
+    pendingProvidersPromise = null;
   };
 
   onBackendReconnect(invalidateProvidersCache);
@@ -185,19 +188,27 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     if (cachedProvidersList && now - cachedProvidersAt < PROVIDERS_CACHE_TTL_MS) {
       return cachedProvidersList;
     }
-    try {
-      const providersRes = (await client.config.providers()) as unknown;
-      const providersRaw: unknown = asRecord(asRecord(providersRes)['data'])['providers'] ?? [];
-      const list = Array.isArray(providersRaw)
-        ? (providersRaw as ProviderInfo[])
-        : Object.entries(asRecord(providersRaw)).map(([id, info]) => ({ ...(asRecord(info) as object), id }) as ProviderInfo);
-      cachedProvidersList = list;
-      cachedProvidersAt = Date.now();
-      return list;
-    } catch (err: unknown) {
-      invalidateProvidersCache();
-      throw err;
+    if (pendingProvidersPromise) {
+      return pendingProvidersPromise;
     }
+    pendingProvidersPromise = (async () => {
+      try {
+        const providersRes = (await client.config.providers()) as unknown;
+        const providersRaw: unknown = asRecord(asRecord(providersRes)['data'])['providers'] ?? [];
+        const list = Array.isArray(providersRaw)
+          ? (providersRaw as ProviderInfo[])
+          : Object.entries(asRecord(providersRaw)).map(([id, info]) => ({ ...(asRecord(info) as object), id }) as ProviderInfo);
+        cachedProvidersList = list;
+        cachedProvidersAt = Date.now();
+        return list;
+      } catch (err: unknown) {
+        invalidateProvidersCache();
+        throw err;
+      } finally {
+        pendingProvidersPromise = null;
+      }
+    })();
+    return pendingProvidersPromise;
   };
 
   const buildModelsList = (providersList: unknown): ModelInfo[] => {

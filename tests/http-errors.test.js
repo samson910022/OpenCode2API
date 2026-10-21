@@ -310,6 +310,22 @@ describe('Terminal Express Error Handler with Supertest', () => {
         });
     });
 
+    test('unauthorized request on /v1/messages/ with trailing slash returns Anthropic error format', async () => {
+        const res = await request(app)
+            .post('/v1/messages/')
+            .set('Content-Type', 'application/json')
+            .send('{bad json');
+
+        expect(res.status).toBe(401);
+        expect(res.body).toEqual({
+            type: 'error',
+            error: {
+                type: 'authentication_error',
+                message: 'Unauthorized'
+            }
+        });
+    });
+
     test('oversized body (simulated 413) returns 413 JSON', async () => {
         const testApp = express();
         testApp.disable('x-powered-by');
@@ -398,7 +414,7 @@ describe('Terminal Express Error Handler with Supertest', () => {
         expect(res.status).toBe(404);
         expect(res.body.type).toBe('error');
         expect(res.body.error.code).toBe('model_not_found');
-        expect(res.body.error.type).toBe('model_not_found');
+        expect(res.body.error.type).toBe('not_found_error');
     });
 
     test('unknown model request on /v1/responses returns 404', async () => {

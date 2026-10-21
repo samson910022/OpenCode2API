@@ -203,7 +203,8 @@ describe('POST /v1/responses backend plain-object error', () => {
             .set('Authorization', 'Bearer test-key')
             .send({ model: 'opencode/kimi-k2.5', max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] });
         expect(res.statusCode).toBe(402);
-        expect(res.body.error?.type).toBe('insufficient_quota');
+        expect(res.body.error?.type).toBe('api_error');
+        expect(res.body.error?.code).toBe('insufficient_quota');
         expect(JSON.stringify(res.body)).toContain('Insufficient balance');
         expect(JSON.stringify(res.body)).not.toContain('"Object"');
     });

@@ -24,7 +24,7 @@ export interface ClassifiedHttpError {
   body: AnthropicHttpErrorBody | OpenAiHttpErrorBody;
 }
 
-function isAnthropicMessagesPath(path?: string): boolean {
+export function isAnthropicMessagesPath(path?: string): boolean {
   if (!path || typeof path !== 'string') return false;
   const normalized = (path.split('?')[0]?.replace(/\/+$/, '') ?? '').toLowerCase();
   return normalized === '/v1/messages';

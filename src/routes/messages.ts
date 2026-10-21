@@ -11,6 +11,7 @@ import {
   buildAnthropicMessage,
   sseEvent,
   estimateTokens,
+  toAnthropicErrorType,
 } from '../converters/anthropic.js';
 import { defaultTranslatorRegistry } from '../converters/registry.js';
 import { ensureTranslatorsRegistered } from '../converters/wire.js';
@@ -488,10 +489,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
               // Fail-closed: any backend error fails even with partial content (see chat.ts).
                           if (error != null) {
               const t = transformUpstreamError(error);
+              const anthropicType = toAnthropicErrorType(t.statusCode, t.error.type);
               res.status(t.statusCode).json({
                 type: 'error',
                 error: {
-                  type: t.error.type || 'api_error',
+                  type: anthropicType,
                   message: t.error.message || 'Upstream error',
                   ...(t.error.code ? { code: t.error.code } : {}),
                 },
@@ -1136,10 +1138,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           }
           if (!res.headersSent) {
             const t = transformUpstreamError(error);
+            const anthropicType = toAnthropicErrorType(t.statusCode, t.error.type);
             res.status(t.statusCode).json({
               type: 'error',
               error: {
-                type: t.error.type || 'api_error',
+                type: anthropicType,
                 message: t.error.message || toErrorMessage(error) || 'Upstream error',
                 ...(t.error.code ? { code: t.error.code } : {}),
               },
@@ -1149,10 +1152,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           closeOpenBlocks();
           try {
             const t = transformUpstreamError(error);
+            const anthropicType = toAnthropicErrorType(t.statusCode, t.error.type);
             res.write(
               sseEvent('error', {
                 type: 'error',
-                error: { type: t.error.type || 'api_error', message: t.error.message, ...(t.error.code ? { code: t.error.code } : {}) },
+                error: { type: anthropicType, message: t.error.message, ...(t.error.code ? { code: t.error.code } : {}) },
               }),
             );
           } catch {
@@ -1165,10 +1169,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
     } catch (error: unknown) {
       if (!res.headersSent) {
         const t = transformUpstreamError(error);
+        const anthropicType = toAnthropicErrorType(t.statusCode, t.error.type);
         res.status(t.statusCode).json({
           type: 'error',
           error: {
-            type: t.error.type || 'api_error',
+            type: anthropicType,
             message: t.error.message || toErrorMessage(error) || 'Upstream error',
             ...(t.error.code ? { code: t.error.code } : {}),
           },
@@ -1177,10 +1182,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
         closeOpenBlocks();
         try {
           const t = transformUpstreamError(error);
+          const anthropicType = toAnthropicErrorType(t.statusCode, t.error.type);
           res.write(
             sseEvent('error', {
               type: 'error',
-              error: { type: t.error.type || 'api_error', message: t.error.message, ...(t.error.code ? { code: t.error.code } : {}) },
+              error: { type: anthropicType, message: t.error.message, ...(t.error.code ? { code: t.error.code } : {}) },
             }),
           );
         } catch {
