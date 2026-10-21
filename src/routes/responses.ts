@@ -316,10 +316,11 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
       const flushHeaders = (res as unknown as { flushHeaders?: unknown }).flushHeaders;
       if (typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
       responsesKeepalive = setInterval(() => {
-        if (!res.destroyed && !res.writableEnded) res.write(': heartbeat\n\n');
+        if (!res.destroyed && !res.writableEnded) res.write(': heartbeat\n');
       }, 15000);
       responsesResClosed = new Promise<boolean>((resolve) =>
         res.once('close', () => {
@@ -1235,7 +1236,10 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
            !collectedR['__error'] &&
            !collectedR['noData'] &&
            !collectedR['idleTimeout'] &&
+           !collectedR['cut'] &&
            !collectedR['cancelled'] &&
+           collectedR['finish'] !== 'tool' &&
+           collectedR['finish'] !== 'tool-calls' &&
            (rawContent ||
              rawReasoning ||
              streamedToolCalls.length > 0 ||
@@ -1271,7 +1275,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
            return polled;
          };
          const needsRecovery = Boolean(
-           collectedR['__error'] || collectedR['noData'] || collectedR['idleTimeout'] || !hasValidTerminal,
+           collectedR['__error'] || collectedR['noData'] || collectedR['idleTimeout'] || collectedR['cut'] || !hasValidTerminal,
          );
          if (needsRecovery) {
            if (collectedR['__error'] && !fallbackToProxy) engageProxyFallback(collectedR['__error']);
@@ -1888,10 +1892,18 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         } catch (writeError: unknown) {
           logDebug('Failed to report error on open response stream', { error: toErrorMessage(writeError) });
         }
-        res.end();
+        if (!res.writableEnded && !res.destroyed) {
+          res.end();
+        }
         return;
       }
-      res.status(transformed.statusCode).json(transformed.error);
+      if (!res.headersSent) {
+        res.status(transformed.statusCode).json(transformed.error);
+        return;
+      }
+      if (!res.writableEnded && !res.destroyed) {
+        res.end();
+      }
       return;
     } finally {
       await cleanupOwnedResponsesSession();

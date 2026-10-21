@@ -476,6 +476,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
             res.setHeader('Cache-Control', 'no-cache');
             res.setHeader('Connection', 'keep-alive');
             if (stream) {
+              res.setHeader('X-Accel-Buffering', 'no');
               const flushHeaders = (res as unknown as { flushHeaders?: unknown }).flushHeaders;
              if (typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
              const onClientClose = (): void => {
@@ -520,8 +521,8 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               const ensureKeepalive = (): void => {
                 if (!keepaliveInterval) {
                   keepaliveInterval = setInterval(() => {
-                    if (!res.destroyed) {
-                      res.write(': keepalive\n\n');
+                    if (!res.destroyed && !res.writableEnded) {
+                      res.write(': keepalive\n');
                     }
                   }, 15000);
                 }
@@ -767,8 +768,8 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                     polledSnapshot = snapshot;
                     replaySnapshot(snapshot);
                   }
-                } else if (collectedR['noData']) {
-                  logDebug('Fallback to polling (stream)', { sessionId });
+                } else if (collectedR['noData'] || collectedR['cut']) {
+                  logDebug('Fallback to polling (stream)', { sessionId, cut: Boolean(collectedR['cut']) });
                   const snapshot = await recoverSnapshot();
                   if (snapshot) {
                     polledSnapshot = snapshot;
@@ -798,7 +799,10 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   !collectedR['__error'] &&
                   !collectedR['noData'] &&
                   !collectedR['idleTimeout'] &&
+                  !collectedR['cut'] &&
                   !collectedR['cancelled'] &&
+                  collectedR['finish'] !== 'tool' &&
+                  collectedR['finish'] !== 'tool-calls' &&
                   (rawStreamedContent || rawStreamedReasoning || streamedToolCalls.length > 0 || collectedR['content'] || collectedR['reasoning']),
                 );
 
@@ -1287,6 +1291,14 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               type: error instanceof Error ? error.constructor.name : String(er['name'] ?? 'Error'),
             },
           });
+        } else if (!res.writableEnded && !res.destroyed) {
+          try {
+            const transformed = transformUpstreamError(error);
+            res.write(`data: ${JSON.stringify({ error: transformed.error })}\n\n`);
+          } catch {
+            // ignore
+          }
+          res.end();
         }
       }
     })();

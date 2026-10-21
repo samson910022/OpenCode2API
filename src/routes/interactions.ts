@@ -401,13 +401,14 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
         const flushHeaders = (res as unknown as { flushHeaders?: unknown }).flushHeaders;
         if (typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
         // Stream contract: interaction.created → step.delta* → interaction.completed
         // (no [DONE]; errors arrive as {type:'error'} like /v1/messages).
          const heartbeat = setInterval(() => {
 
-          if (!res.destroyed && !res.writableEnded) res.write(': heartbeat\n\n');
+          if (!res.destroyed && !res.writableEnded) res.write(': heartbeat\n');
         }, 15000);
         if (typeof heartbeat.unref === 'function') heartbeat.unref();
         const emit = (payload: unknown): void => {
@@ -518,16 +519,40 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         } catch {
           // ignore
         }
-        res.end();
+        if (!res.writableEnded && !res.destroyed) {
+          res.end();
+        }
       }
       return;
     }
   };
 
   app.post('/v1beta/interactions', (req: Request, res: Response): void => {
-    void handle(req, res);
+    void handle(req, res).catch((err: unknown) => {
+      if (!res.headersSent) {
+        res.status(500).json({ error: { message: toErrorMessage(err), type: 'api_error' } });
+      } else if (!res.writableEnded && !res.destroyed) {
+        try {
+          res.write(`data: ${JSON.stringify({ type: 'error', error: { message: toErrorMessage(err), type: 'api_error' } })}\n\n`);
+        } catch {
+          // ignore
+        }
+        res.end();
+      }
+    });
   });
   app.post('/v1/interactions', (req: Request, res: Response): void => {
-    void handle(req, res);
+    void handle(req, res).catch((err: unknown) => {
+      if (!res.headersSent) {
+        res.status(500).json({ error: { message: toErrorMessage(err), type: 'api_error' } });
+      } else if (!res.writableEnded && !res.destroyed) {
+        try {
+          res.write(`data: ${JSON.stringify({ type: 'error', error: { message: toErrorMessage(err), type: 'api_error' } })}\n\n`);
+        } catch {
+          // ignore
+        }
+        res.end();
+      }
+    });
   });
 }

@@ -76,6 +76,25 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
   const activeTranslators = translators ?? ensureTranslatorsRegistered(defaultTranslatorRegistry());
 
   app.post('/v1/messages', async (req: Request, res: Response): Promise<void> => {
+    let textBlockOpen = false;
+    let thinkingBlockOpen = false;
+    let textIndex: number | null = null;
+    let thinkingIndex: number | null = null;
+    const closeOpenBlocks = (): void => {
+      if (res.destroyed || res.writableEnded) return;
+      try {
+        if (textBlockOpen && textIndex !== null) {
+          res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
+          textBlockOpen = false;
+        }
+        if (thinkingBlockOpen && thinkingIndex !== null) {
+          res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: thinkingIndex }));
+          thinkingBlockOpen = false;
+        }
+      } catch {
+        // ignore
+      }
+    };
     try {
       await lock(async (): Promise<void> => {
          let sessionId: string | null = null;
@@ -527,10 +546,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                       res.setHeader('Content-Type', 'text/event-stream');
            res.setHeader('Cache-Control', 'no-cache');
            res.setHeader('Connection', 'keep-alive');
+           res.setHeader('X-Accel-Buffering', 'no');
            const flushHeaders = (res as unknown as { flushHeaders?: unknown }).flushHeaders;
            if (typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
            keepaliveInterval = setInterval(() => {
-            if (!res.destroyed && !res.writableEnded) res.write(': keep-alive\n\n');
+            if (!res.destroyed && !res.writableEnded) res.write(': keep-alive\n');
           }, 15000);
            const resClosed = new Promise<boolean>((resolve) =>
              res.once('close', () => {
@@ -554,11 +574,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
            const filterReasoning = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
            const parseContent = createExternalToolCallStreamParser(externalToolRegistry);
            const parseReason = createExternalToolCallStreamParser(externalToolRegistry);
-          let textBlockOpen = false;
-          let thinkingBlockOpen = false;
-          let nextBlockIndex = 0;
-          let textIndex: number | null = null;
-          let thinkingIndex: number | null = null;
+           textBlockOpen = false;
+           thinkingBlockOpen = false;
+           let nextBlockIndex = 0;
+           textIndex = null;
+           thinkingIndex = null;
           const ensureTextIndex = (): number => {
             if (textIndex === null) textIndex = nextBlockIndex++;
             return textIndex;
@@ -722,7 +742,10 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                 !recoveryRecord['__error'] &&
                 !recoveryRecord['noData'] &&
                 !recoveryRecord['idleTimeout'] &&
+                !recoveryRecord['cut'] &&
                 !recoveryRecord['cancelled'] &&
+                recoveryRecord['finish'] !== 'tool' &&
+                recoveryRecord['finish'] !== 'tool-calls' &&
                 (rawContent || rawReasoning || streamedToolCalls.length > 0 || recoveryRecord['content'] || recoveryRecord['reasoning']),
               );
               if (recoveryRecord['__error']) {
@@ -736,7 +759,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                  if (remainingContent) sendDelta(remainingContent, false);
                  if (remainingReasoning) sendDelta(remainingReasoning, true);
                }
-              } else if (recoveryRecord['noData'] || recoveryRecord['idleTimeout']) {
+              } else if (recoveryRecord['noData'] || recoveryRecord['idleTimeout'] || recoveryRecord['cut']) {
 
                const snapshot = await recoverSnapshot();
                if (snapshot) {
@@ -929,6 +952,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                     error: { type: 'api_error', message: toolMessage, code: toolCode },
                   });
                 } else if (!res.destroyed) {
+                  closeOpenBlocks();
                   try {
                     res.write(
                       sseEvent('error', {
@@ -966,8 +990,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: streamedText } }));
              }
            }
-           if (textBlockOpen) res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
-           if (thinkingBlockOpen) res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: thinkingIndex }));
+           closeOpenBlocks();
            let toolBlockIndex = nextBlockIndex;
            for (const tc of toPublicToolCalls(finalValidated)) {
              const tcr = tc as unknown as Record<string, unknown>;
@@ -1038,6 +1061,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
             });
             return;
           }
+          closeOpenBlocks();
           try {
             const t = transformUpstreamError(error);
             res.write(
@@ -1054,8 +1078,23 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
         }
       }, REQUEST_TIMEOUT_MS + 20000);
     } catch (error: unknown) {
-      if (!res.headersSent)
+      if (!res.headersSent) {
         res.status(500).json({ type: 'error', error: { type: 'api_error', message: toErrorMessage(error) } });
+      } else if (!res.writableEnded && !res.destroyed) {
+        closeOpenBlocks();
+        try {
+          const t = transformUpstreamError(error);
+          res.write(
+            sseEvent('error', {
+              type: 'error',
+              error: { type: t.error.type || 'api_error', message: t.error.message, ...(t.error.code ? { code: t.error.code } : {}) },
+            }),
+          );
+        } catch {
+          // ignore
+        }
+        res.end();
+      }
     }
   });
 }

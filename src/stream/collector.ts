@@ -341,6 +341,8 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
 
     const eventStream = asRecord(eventStreamResult)['stream'] as AsyncIterable<BackendEvent>;
     let finished = false;
+    let terminalFinishSeen = false;
+    let lastFinish: string | null = null;
     let content = '';
     let reasoning = '';
     let receivedDelta = false;
@@ -750,6 +752,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
              if (finished) break;
              if (evType === 'session.error' && (props['sessionID'] == null || props['sessionID'] === sessionId)) {
                const sessionError = readSessionEventError(props);
+               terminalFinishSeen = true;
                finished = true;
                clearTimeout(timeoutId);
                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
@@ -860,11 +863,13 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                 }
                 continue;
               }
+              if (typeof finish === 'string') lastFinish = finish;
               // An aborted or failed message never produces another delta. Without
               // this, the collector waits out the whole first-delta window before
               // polling rediscovers the same error.
               const infoError: unknown = info['error'];
               if (infoError != null) {
+                terminalFinishSeen = true;
                 finished = true;
                 clearTimeout(timeoutId);
                 if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
@@ -893,12 +898,14 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                 partOrderCounter = Math.max(partOrderCounter, snapshotParts.length);
               }
               if (finish === 'tool' || finish === 'tool-calls') {
+                terminalFinishSeen = true;
                 // Assistant turn ended pending a tool call; keep waiting for the result.
                 if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
                 scheduleIdleTimer();
                 continue;
               }
               if (finish === 'stop') {
+                terminalFinishSeen = true;
                 // Only treat the stream as completed when no tool call is still
                 // pending. OpenCode may emit an intermediate 'stop' snapshot while a
                 // tool call is in flight; resolving on it would drop the final answer.
@@ -919,7 +926,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                     ms: Date.now() - startedAt,
                     deltaChars,
                   });
-                  const result = finalizeCollected();
+                  const result = finalizeCollected({ finish: 'stop' });
                   if (!(result['content'] as string) && !(result['reasoning'] as string)) {
                     result['noData'] = true;
                   }
@@ -927,6 +934,31 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                 }
                 break;
               }
+            }
+          }
+          if (!finished) {
+            finished = true;
+            clearTimeout(timeoutId);
+            if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
+            if (idleTimer) clearTimeout(idleTimer);
+            logDebug('SSE eventStream ended naturally', {
+              sessionId,
+              ms: Date.now() - startedAt,
+              terminalFinishSeen,
+              deltaChars,
+            });
+            if (!terminalFinishSeen) {
+              const result = finalizeCollected({ cut: true, ...(lastFinish ? { finish: lastFinish } : {}) });
+              if (!(result['content'] as string) && !(result['reasoning'] as string)) {
+                result['noData'] = true;
+              }
+              resolve(result);
+            } else {
+              const result = finalizeCollected({ ...(lastFinish ? { finish: lastFinish } : {}) });
+              if (!(result['content'] as string) && !(result['reasoning'] as string)) {
+                result['noData'] = true;
+              }
+              resolve(result);
             }
           }
         } catch (e: unknown) {
