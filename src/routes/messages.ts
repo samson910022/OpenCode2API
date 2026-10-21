@@ -833,7 +833,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                  if (remainingContent) sendDelta(remainingContent, false);
                  if (remainingReasoning) sendDelta(remainingReasoning, true);
                }
-              } else if (recoveryRecord['noData'] || recoveryRecord['idleTimeout'] || recoveryRecord['cut']) {
+              } else if (recoveryRecord['noData'] || recoveryRecord['idleTimeout'] || recoveryRecord['cut'] || !hasValidTerminal) {
 
                const snapshot = await recoverSnapshot();
                if (snapshot) {
@@ -907,10 +907,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                : [];
            const callsFromText = (source: AuthoritativeStreamSource): FinalToolCall[] =>
              externalToolRegistry.length > 0
-               ? mergeToolCallArtifacts(
-                   streamedToolCalls,
-                   parseJoined(source.reasoning, source.content),
-                 )
+               ? parseJoined(source.reasoning, source.content)
                : [];
            const callsFromRaw = (source: AuthoritativeStreamSource): FinalToolCall[] =>
              externalToolRegistry.length > 0
@@ -942,13 +939,10 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                kind: 'polled-snapshot',
                fromSnapshot: true,
              };
-             // The snapshot itself must yield at least one valid call; a bare
-             // streamed artifact cannot turn an unrelated snapshot into a repair.
-             const snapshotCalls = mergeToolCallArtifacts(parseJoined(repairedSource.reasoning, repairedSource.content));
+             const snapshotCalls = parseJoined(repairedSource.reasoning, repairedSource.content);
              if (snapshotCalls.length === 0) return false;
-             const repairedCalls = mergeToolCallArtifacts(streamedToolCalls, snapshotCalls);
              try {
-               assertToolCallArtifactIntegrity(repairedCalls, externalToolRegistry, [
+               assertToolCallArtifactIntegrity(snapshotCalls, externalToolRegistry, [
                  [repairedSource.reasoning, repairedSource.content],
                ]);
              } catch {
@@ -956,7 +950,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
              }
              polledSnapshot = snapshot;
              authoritativeSource = repairedSource;
-             parsedToolCalls = repairedCalls;
+             parsedToolCalls = snapshotCalls;
              if (shouldBufferExternalStream) {
                const visible = stripExternalToolCallMarkupFromJoinedText(
                  externalToolRegistry,

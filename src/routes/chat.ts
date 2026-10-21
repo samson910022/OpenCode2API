@@ -805,7 +805,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   (rawStreamedContent || rawStreamedReasoning || streamedToolCalls.length > 0 || collectedR['content'] || collectedR['reasoning']),
                 );
 
-                if (!fallbackServed && !rawStreamedContent && !rawStreamedReasoning && !hasValidTerminal) {
+                if (!fallbackServed && !hasValidTerminal) {
                   logDebug('SSE returned empty, falling back to polling', { sessionId });
                   const snapshot = await recoverSnapshot();
                   if (snapshot) {
@@ -841,10 +841,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   : [];
               const callsFromText = (source: AuthoritativeStreamSource): FinalToolCall[] =>
                 externalToolRegistry.length > 0
-                  ? mergeToolCallArtifacts(
-                      streamedToolCalls,
-                      parseJoined(source.reasoning, source.content),
-                    )
+                  ? parseJoined(source.reasoning, source.content)
                   : [];
               const callsFromRaw = (source: AuthoritativeStreamSource): FinalToolCall[] =>
                 externalToolRegistry.length > 0
@@ -906,13 +903,10 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   kind: 'polled-snapshot',
                   fromSnapshot: true,
                 };
-                // The snapshot itself must yield at least one valid call; a bare
-                // streamed artifact cannot turn an unrelated snapshot into a repair.
-                const snapshotCalls = mergeToolCallArtifacts(parseJoined(repairedSource.reasoning, repairedSource.content));
+                const snapshotCalls = parseJoined(repairedSource.reasoning, repairedSource.content);
                 if (snapshotCalls.length === 0) return false;
-                const repairedCalls = mergeToolCallArtifacts(streamedToolCalls, snapshotCalls);
                 try {
-                  assertToolCallArtifactIntegrity(repairedCalls, externalToolRegistry, [
+                  assertToolCallArtifactIntegrity(snapshotCalls, externalToolRegistry, [
                     [repairedSource.reasoning, repairedSource.content],
                   ]);
                 } catch {
@@ -920,7 +914,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 }
                 polledSnapshot = snapshot;
                 authoritativeSource = repairedSource;
-                parsedToolCalls = repairedCalls;
+                parsedToolCalls = snapshotCalls;
                 if (shouldBufferExternalStream) {
                   const visible = stripExternalToolCallMarkupFromJoinedText(
                     externalToolRegistry,
@@ -1249,10 +1243,14 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
             if (!res.headersSent) {
               const transformed = transformUpstreamError(error);
               res.status(transformed.statusCode).json(transformed.error);
-            } else if (!res.destroyed) {
-              const transformed = transformUpstreamError(error);
-              res.write(`data: ${JSON.stringify({ error: transformed.error })}\n\n`);
-              res.end();
+            } else if (!res.writableEnded && !res.destroyed) {
+              try {
+                const transformed = transformUpstreamError(error);
+                res.write(`data: ${JSON.stringify({ error: transformed.error })}\n\n`);
+                res.end();
+              } catch {
+                // ignore write failure on closed stream
+              }
             }
              if (sessionId) {
                try {

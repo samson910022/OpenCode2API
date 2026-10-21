@@ -203,4 +203,97 @@ describe('route snapshot source selection', () => {
         expect(JSON.stringify(calls[0].arguments)).toContain('a.txt');
         expect(res.text).not.toContain('response.failed');
     }, 15000);
+
+    test.each(payloads)('%s delivers only snapshot tool call (b.txt) and does not combine raw streamed call (a.txt)', async (_label, path, payload) => {
+        sdkMocks.sessionMessages.mockResolvedValue([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{
+                    type: 'text',
+                    text: '<function_calls>{"id":"call_snap_complete","name":"read","arguments":{"path":"b.txt"}}</function_calls>'
+                }]
+            }
+        ]);
+        const res = await request(buildApp())
+            .post(path)
+            .set('Authorization', 'Bearer test-key')
+            .set('anthropic-version', '2023-06-01')
+            .send(payload);
+        expect(res.statusCode).toBe(200);
+        expect(visibleTextFor(path, res.text).join('')).toBe('');
+        const calls = toolCallsFor(path, res.text);
+        expect(calls).toHaveLength(1);
+        expect(calls[0]).toMatchObject({ name: 'read' });
+        expect(JSON.stringify(calls[0].arguments)).toContain('b.txt');
+        expect(JSON.stringify(calls[0].arguments)).not.toContain('a.txt');
+        expect(res.text).not.toContain('a.txt');
+        expect(res.text).not.toContain('response.failed');
+        expect(res.text).not.toMatch(/"error"\s*:\s*\{/);
+    });
+
+    test.each(payloads)('%s succeeds with 1 tool call under parallel_tool_calls: false without failing with parallel_external_tool_calls', async (_label, path, payload) => {
+        sdkMocks.sessionMessages.mockResolvedValue([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{
+                    type: 'text',
+                    text: '<function_calls>{"id":"call_snap_complete","name":"read","arguments":{"path":"b.txt"}}</function_calls>'
+                }]
+            }
+        ]);
+        const nonParallelPayload = {
+            ...payload,
+            parallel_tool_calls: false,
+            disable_parallel_tool_use: true
+        };
+        const res = await request(buildApp())
+            .post(path)
+            .set('Authorization', 'Bearer test-key')
+            .set('anthropic-version', '2023-06-01')
+            .send(nonParallelPayload);
+        expect(res.statusCode).toBe(200);
+        expect(res.text).not.toContain('parallel_external_tool_calls');
+        const calls = toolCallsFor(path, res.text);
+        expect(calls).toHaveLength(1);
+        expect(calls[0]).toMatchObject({ name: 'read' });
+        expect(JSON.stringify(calls[0].arguments)).toContain('b.txt');
+        expect(JSON.stringify(calls[0].arguments)).not.toContain('a.txt');
+        expect(res.text).not.toContain('response.failed');
+        expect(res.text).not.toMatch(/"error"\s*:\s*\{/);
+    });
+
+    test.each(payloads)('%s cleanly delivers snapshot tool calls when repairing from malformed raw markup without combining raw deltas', async (_label, path, payload) => {
+        const malformedDelta = 'prefix <function_calls>{"name":"read" arguments</function_calls> suffix';
+        sdkMocks.eventSubscribe.mockImplementation(async () => ({
+            stream: (async function* () {
+                yield {
+                    type: 'message.part.updated',
+                    properties: { part: { type: 'text', sessionID: SESSION_ID }, delta: malformedDelta }
+                };
+                yield { type: 'message.updated', properties: { info: { sessionID: SESSION_ID, finish: 'stop' } } };
+            })()
+        }));
+        sdkMocks.sessionMessages.mockResolvedValue([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{
+                    type: 'text',
+                    text: '<function_calls>{"id":"call_snap_repaired","name":"read","arguments":{"path":"b.txt"}}</function_calls>'
+                }]
+            }
+        ]);
+        const res = await request(buildApp())
+            .post(path)
+            .set('Authorization', 'Bearer test-key')
+            .set('anthropic-version', '2023-06-01')
+            .send(payload);
+        expect(res.statusCode).toBe(200);
+        expect(res.text).not.toContain('malformed_external_tool_call');
+        const calls = toolCallsFor(path, res.text);
+        expect(calls).toHaveLength(1);
+        expect(calls[0]).toMatchObject({ name: 'read' });
+        expect(JSON.stringify(calls[0].arguments)).toContain('b.txt');
+        expect(res.text).not.toContain('response.failed');
+        expect(res.text).not.toMatch(/"error"\s*:\s*\{/);
+    });
 });

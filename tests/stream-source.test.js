@@ -1,4 +1,4 @@
-import { resolveAuthoritativeStreamSource } from '../src/tool-runtime/stream-source.js';
+import { resolveAuthoritativeStreamSource, isMalformedExternalToolCallError } from '../src/tool-runtime/stream-source.js';
 
 const rawInput = (overrides = {}) => ({
     collected: { content: 'raw content', reasoning: 'raw reasoning', authoritative: false },
@@ -69,5 +69,22 @@ describe('resolveAuthoritativeStreamSource', () => {
             polledSnapshot: { content: 'ignored', reasoning: '', error: { name: 'Boom' }, complete: true }
         }));
         expect(source).toMatchObject({ kind: 'raw', fromSnapshot: false, content: 'raw content' });
+    });
+});
+
+describe('isMalformedExternalToolCallError', () => {
+    test('returns true for errors with code malformed_external_tool_call', () => {
+        const error = new Error('Malformed markup');
+        error.code = 'malformed_external_tool_call';
+        expect(isMalformedExternalToolCallError(error)).toBe(true);
+        expect(isMalformedExternalToolCallError({ code: 'malformed_external_tool_call' })).toBe(true);
+    });
+
+    test('returns false for other errors, strings, or null/undefined', () => {
+        expect(isMalformedExternalToolCallError(new Error('other error'))).toBe(false);
+        expect(isMalformedExternalToolCallError({ code: 'parallel_external_tool_calls' })).toBe(false);
+        expect(isMalformedExternalToolCallError(null)).toBe(false);
+        expect(isMalformedExternalToolCallError(undefined)).toBe(false);
+        expect(isMalformedExternalToolCallError('malformed_external_tool_call')).toBe(false);
     });
 });
