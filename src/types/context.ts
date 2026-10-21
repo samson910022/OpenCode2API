@@ -58,7 +58,7 @@ export interface CollectorHandle {
     timeoutMs: number,
     intervalMs?: number,
     signal?: AbortSignal
-  ) => Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[] }>;
+  ) => Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[]; partial?: boolean; complete?: boolean }>;
   collectFromEvents: (
     sessionId: string,
     timeoutMs: number,

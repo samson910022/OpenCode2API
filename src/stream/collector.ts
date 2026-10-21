@@ -215,7 +215,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     timeoutMs: number,
     intervalMs: number = DEFAULT_POLL_INTERVAL_MS,
     signal?: AbortSignal,
-  ): Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[] }> {
+  ): Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[]; partial?: boolean; complete?: boolean }> {
     // Drift signal only: backend-minted ses_* IDs should match the canonical
     // shape (see src/session/ids.ts). Never block on mismatch — the schema
     // itself accepts any startsWith("ses") value.
@@ -283,9 +283,9 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
               reasoningLen: reasoning.length,
               error: error ? (asRecord(error)['name'] as unknown) : null,
             });
-            return { content, reasoning, error, toolParts };
+            return { content, reasoning, error, toolParts, complete: true };
           }
-          if (content || reasoning) {
+          if (content || reasoning || toolParts.length > 0) {
             lastPartial = { content, reasoning, error: null, toolParts };
           }
           break;
@@ -302,7 +302,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
         contentLen: lastPartial.content.length,
         reasoningLen: lastPartial.reasoning.length,
       });
-      return lastPartial;
+      return { ...lastPartial, partial: true };
     }
     logDebug('Polling timeout', { sessionId, ms: Date.now() - pollStart });
     throw new Error(`Request timeout after ${timeoutMs}ms`);
@@ -432,7 +432,13 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
             finished = true;
             controller.abort();
             logDebug('No event data received', { sessionId, ms: Date.now() - startedAt });
-            resolve({ content: '', reasoning: '', noData: true });
+            const result = finalizeCollected();
+            // A snapshot can produce content without any delta activity; only
+            // report noData when reconciliation is also empty.
+            if (!(result['content'] as string) && !(result['reasoning'] as string)) {
+              result['noData'] = true;
+            }
+            resolve(result);
           }, firstDeltaTimeoutMs)
         : null;
 
@@ -476,12 +482,10 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
             ms: Date.now() - startedAt,
             deltaChars,
           });
-          resolve({
-            content,
-            reasoning,
+          resolve(finalizeCollected({
             idleTimeout: true,
             receivedDelta,
-          });
+          }));
         }, idleTimeoutMs);
       };
 
@@ -496,20 +500,93 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
         scheduleIdleTimer();
       };
 
-      // Newer OpenCode servers stream deltas as `message.part.delta` events that
-      // carry only a `partID` (no `part.type`). The part type is announced by the
-      // preceding `message.part.updated` event, so we key partID -> type here and
-      // resolve each delta against it. Without this, reasoning and answer text can
-      // never be told apart and the answer is mis-routed (or dropped) entirely.
-      const partTypeById = new Map<string, string>();
-      const rememberPartType = (part: unknown): void => {
-        const pr = asRecord(part);
-        if (pr['id'] != null && typeof pr['type'] === 'string') {
-          partTypeById.set(String(pr['id']), pr['type'] as string);
-        }
+      // Per-part reconciliation state. A turn can contain several text/reasoning
+      // parts, so snapshots are tracked per part (messageID + partID, numeric IDs
+      // stringified) instead of as one global joined snapshot. This prevents a
+      // missing snapshot in part 1 from truncating part 2, and it keeps a sticky
+      // `message.updated info.parts` snapshot from overriding a newer full
+      // `message.part.updated part.text` (both write the same part state; the
+      // later event wins).
+      type StreamPartType = 'text' | 'reasoning';
+      interface StreamPartState {
+        type: StreamPartType;
+        deltaText: string;
+        snapshotText: string;
+        order: number;
+        messageID: string | null;
+        partID: string | null;
+        snapshotSeq: number;
+        deltaSeq: number;
+      }
+      const partStates = new Map<string, StreamPartState>();
+      // A `message.part.delta` can arrive before the part update that announces
+      // its type. Keep those deltas (and their first-seen order) until the part
+      // update arrives, then replay them into the now-typed part state.
+      const pendingDeltaParts = new Map<string, { deltas: string[]; order: number; messageID: string | null; partID: string | null }>();
+      // Message roles are keyed by the assistant/user message id. A missing id
+      // uses the empty bucket, which covers legacy events that also omit
+      // `messageID`; unknown roles are accepted so old backends keep working.
+      const messageRoles = new Map<string, string>();
+      const staleMessageIds = new Set<string>();
+      let partOrderCounter = 0;
+      let eventSeq = 0;
+
+      const readPartId = (value: unknown): string | null => {
+        if (value == null || typeof value === 'boolean') return null;
+        return String(value);
       };
-      const applyTextDelta = (partType: unknown, delta: unknown): void => {
-        const deltaStr = typeof delta === 'string' ? delta : String(delta ?? '');
+      const readPartMessageId = (record: Record<string, unknown>): string | null =>
+        readPartId(record['messageID'] ?? record['messageId']);
+      const readInfoMessageId = (info: Record<string, unknown>): string | null =>
+        readPartId(info['id'] ?? info['messageID'] ?? info['messageId']);
+      const idPartKey = (messageID: string | null, partID: string): string => `${messageID ?? ''}\u0000${partID}`;
+      const partKeyFor = (messageID: string | null, partID: string | null, type: StreamPartType): string =>
+        partID != null ? `id\u0000${idPartKey(messageID, partID)}` : `noid\u0000${type}`;
+      const resolveMessageRole = (messageID: string | null): string | undefined =>
+        messageRoles.get(messageID ?? '');
+      const isUserPart = (messageID: string | null): boolean => resolveMessageRole(messageID) === 'user';
+      const findPartState = (messageID: string | null, partID: string | null): StreamPartState | undefined => {
+        if (partID == null) return undefined;
+        const direct = partStates.get(partKeyFor(messageID, partID, 'text'));
+        if (direct) return direct;
+        // Deltas may omit `messageID` while the part update carries it (or vice
+        // versa); fall back to the same part id so early deltas are not lost.
+        const withoutMessageId = partStates.get(partKeyFor(null, partID, 'text'));
+        if (withoutMessageId) return withoutMessageId;
+        for (const state of partStates.values()) {
+          if (state.partID === partID) return state;
+        }
+        return undefined;
+      };
+      const ensurePartState = (
+        messageID: string | null,
+        partID: string | null,
+        type: StreamPartType,
+        order?: number,
+      ): StreamPartState => {
+        let state = findPartState(messageID, partID);
+        // ID-less parts fall back to one stable state per type.
+        if (!state && partID == null) state = partStates.get(partKeyFor(messageID, null, type));
+        if (!state) {
+          state = {
+            type,
+            deltaText: '',
+            snapshotText: '',
+            order: order ?? ++partOrderCounter,
+            messageID,
+            partID,
+            snapshotSeq: 0,
+            deltaSeq: 0,
+          };
+          partStates.set(partKeyFor(messageID, partID, type), state);
+        } else {
+          state.type = type;
+          if (state.messageID == null && messageID != null) state.messageID = messageID;
+        }
+        if (order !== undefined) state.order = order;
+        return state;
+      };
+      const noteDeltaActivity = (partType: unknown): void => {
         receivedDelta = true;
         if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
         scheduleIdleTimer();
@@ -521,6 +598,10 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
             type: partType,
           });
         }
+      };
+      const applyTextDelta = (partType: unknown, delta: unknown): void => {
+        const deltaStr = typeof delta === 'string' ? delta : String(delta ?? '');
+        noteDeltaActivity(partType);
         if (partType === 'reasoning') {
           reasoning += deltaStr;
           if (onDelta) onDelta(deltaStr, true);
@@ -529,6 +610,136 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
           if (onDelta) onDelta(deltaStr, false);
         }
         deltaChars += deltaStr.length;
+      };
+      const appendPartDelta = (state: StreamPartState, delta: string): void => {
+        state.deltaText += delta;
+        state.deltaSeq = ++eventSeq;
+        applyTextDelta(state.type, delta);
+      };
+      // Delta events may omit `messageID` while the part update carries it (or
+      // vice versa), so pending lookups fall back to the part id alone. Numeric
+      // ids are already stringified by readPartId.
+      const findPendingKey = (messageID: string | null, partID: string): string | null => {
+        const exact = idPartKey(messageID, partID);
+        if (pendingDeltaParts.has(exact)) return exact;
+        const withoutMessageId = idPartKey(null, partID);
+        if (pendingDeltaParts.has(withoutMessageId)) return withoutMessageId;
+        for (const [key, pending] of pendingDeltaParts) {
+          if (pending.partID === partID) return key;
+        }
+        return null;
+      };
+      const flushPendingDeltas = (state: StreamPartState): void => {
+        if (state.partID == null) return;
+        const key = findPendingKey(state.messageID, state.partID);
+        if (key == null) return;
+        const pending = pendingDeltaParts.get(key);
+        if (!pending) return;
+        pendingDeltaParts.delete(key);
+        pending.deltas.forEach((delta) => appendPartDelta(state, delta));
+      };
+      const rememberPartRole = (messageID: string | null, role: string | null): void => {
+        if (role == null) return;
+        messageRoles.set(messageID ?? '', role);
+      };
+      const isStaleAssistantSnapshot = (info: Record<string, unknown>, role: string | null): boolean => {
+        if (role !== 'assistant') return false;
+        const created = asRecord(info['time'])['created'];
+        return typeof created === 'number' && created < startedAt - 1000;
+      };
+      const isStalePart = (part: Record<string, unknown>): boolean => {
+        const timeRecord = asRecord(part['time']);
+        const created =
+          typeof timeRecord['created'] === 'number'
+            ? timeRecord['created']
+            : typeof part['time'] === 'number'
+              ? (part['time'] as number)
+              : null;
+        return typeof created === 'number' && created < startedAt - 1000;
+      };
+      const applyPartSnapshot = (
+        part: Record<string, unknown>,
+        order?: number,
+      ): void => {
+        const type = part['type'];
+        if (type !== 'text' && type !== 'reasoning') return;
+        if (isStalePart(part)) return;
+        const messageID = readPartMessageId(part);
+        if (messageID && staleMessageIds.has(messageID)) return;
+        if (isUserPart(messageID)) return;
+        const partID = readPartId(part['id']);
+        const pendingKey = partID != null ? findPendingKey(messageID, partID) : null;
+        const pendingOrder = pendingKey != null ? pendingDeltaParts.get(pendingKey)?.order : undefined;
+        const state = ensurePartState(messageID, partID, type, order ?? pendingOrder);
+        flushPendingDeltas(state);
+        const text = part['text'];
+        // Only a newer non-empty full text replaces the snapshot. An omitted or
+        // empty `text` (status-only update) must not erase a complete snapshot.
+        if (typeof text === 'string' && text) {
+          state.snapshotText = text;
+          state.snapshotSeq = ++eventSeq;
+        }
+      };
+      const choosePartText = (state: StreamPartState): string => {
+        const { deltaText, snapshotText, snapshotSeq, deltaSeq } = state;
+        if (snapshotText === '') return deltaText;
+        if (deltaText === '') return snapshotText;
+        if (snapshotText === deltaText) return snapshotText;
+        if (snapshotText.startsWith(deltaText)) return snapshotText;
+        if (deltaText.startsWith(snapshotText)) return deltaText;
+        if (snapshotText.endsWith(deltaText)) return snapshotText;
+        if (deltaText.endsWith(snapshotText)) return deltaText;
+        // If deltas arrived after snapshotText was set, deltas were continuing:
+        if (deltaSeq > snapshotSeq) {
+          return `${snapshotText}${deltaText}`;
+        }
+        // Snapshot arrived after deltas: snapshot is the authoritative replacement:
+        return snapshotText;
+      };
+      const finalizeCollected = (extra: Record<string, unknown> = {}): Record<string, unknown> => {
+        if (pendingDeltaParts.size > 0) {
+          for (const [, pending] of pendingDeltaParts) {
+            if (isUserPart(pending.messageID)) continue;
+            if (pending.messageID && staleMessageIds.has(pending.messageID)) continue;
+            const state = ensurePartState(pending.messageID, pending.partID, 'text', pending.order);
+            pending.deltas.forEach((delta) => {
+              state.deltaText += delta;
+            });
+          }
+          pendingDeltaParts.clear();
+        }
+
+        const states = [...partStates.values()].filter(
+          (state) => !isUserPart(state.messageID) && !(state.messageID && staleMessageIds.has(state.messageID)),
+        );
+        let finalContent = content;
+        let finalReasoning = reasoning;
+        if (states.length > 0) {
+          const joinedFor = (type: StreamPartType): string =>
+            states
+              .filter((state) => state.type === type)
+              .sort((left, right) => left.order - right.order)
+              .map((state) => choosePartText(state))
+              .join('');
+          finalContent = joinedFor('text');
+          finalReasoning = joinedFor('reasoning');
+        } else if ([...partStates.values()].some((state) => isUserPart(state.messageID))) {
+          // If the only observed states were user messages, clear any leaked content
+          finalContent = '';
+          finalReasoning = '';
+        }
+        const result: Record<string, unknown> = {
+          content: finalContent,
+          reasoning: finalReasoning,
+          ...extra,
+        };
+        // `authoritative` means the snapshot repaired/replaced the live delta
+        // text. Equal text (or empty/empty) is not a repair and must keep routes
+        // on the raw path so streamed tool artifacts stay available.
+        if (finalContent !== content || finalReasoning !== reasoning) {
+          result['authoritative'] = true;
+        }
+        return result;
       };
 
       (async (): Promise<void> => {
@@ -545,35 +756,63 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                if (idleTimer) clearTimeout(idleTimer);
                controller.abort();
                logDebug('SSE session error', { sessionId, ms: Date.now() - startedAt });
-               resolve({ content, reasoning, error: sessionError });
+               resolve(finalizeCollected({ error: sessionError }));
                break;
              }
              if (evType === 'message.part.updated' && asRecord(props['part'])['sessionID'] === sessionId) {
 
               const part = asRecord(props['part']);
-              rememberPartType(part);
+              const partType = part['type'];
+              const partMessageID = readPartMessageId(part);
+              if (isStalePart(part) || (partMessageID != null && staleMessageIds.has(partMessageID))) {
+                continue;
+              }
+              // A user prompt's text/reasoning parts must never become assistant
+              // answer/tool content. When the role is still unknown the part is
+              // stored and filtered at finalize if the role later turns out user.
+              if ((partType === 'text' || partType === 'reasoning') && !isUserPart(partMessageID)) {
+                applyPartSnapshot(part);
+                // Older OpenCode servers carried the streaming delta directly on
+                // message.part.updated; newer servers emit message.part.delta.
+                const delta: unknown = props['delta'];
+                if (typeof delta === 'string' && delta) {
+                  const state = ensurePartState(partMessageID, readPartId(part['id']), partType);
+                  appendPartDelta(state, delta);
+                }
+              }
               trackToolActivity(part);
-              // Older OpenCode servers carried the streaming delta directly on
-              // message.part.updated; newer servers emit message.part.delta.
-               const delta: unknown = props['delta'];
-               if (
-                 typeof delta === 'string' &&
-                 delta &&
-                 (part['type'] === 'text' || part['type'] === 'reasoning')
-               ) applyTextDelta(part['type'], delta);
 
               continue;
             }
             if (evType === 'message.part.delta' && props['sessionID'] === sessionId) {
-              const partID: unknown = props['partID'];
+              const partID = readPartId(props['partID']);
               const delta: unknown = props['delta'];
               const field: unknown = props['field'];
               // Text and reasoning deltas both stream through field === 'text'.
               // Tool-input deltas surface via message.part.updated tool state.
-              if (typeof delta === 'string' && field === 'text') {
-                const partType = typeof partID === 'string' ? partTypeById.get(partID) : undefined;
-                if (partType === 'reasoning' || partType === 'text') {
-                  applyTextDelta(partType, delta);
+              if (typeof delta === 'string' && delta && field === 'text' && partID != null) {
+                const partMessageID = readPartMessageId(props);
+                if (partMessageID != null && (isUserPart(partMessageID) || staleMessageIds.has(partMessageID))) {
+                  continue;
+                }
+                const state = findPartState(partMessageID, partID);
+                if (state) {
+                  appendPartDelta(state, delta);
+                } else {
+                  // Type not announced yet; keep the delta (numeric IDs already
+                  // stringified) until the part update arrives.
+                  noteDeltaActivity(undefined);
+                  const existingKey = findPendingKey(partMessageID, partID);
+                  if (existingKey != null) {
+                    pendingDeltaParts.get(existingKey)?.deltas.push(delta);
+                  } else {
+                    pendingDeltaParts.set(idPartKey(partMessageID, partID), {
+                      deltas: [delta],
+                      order: ++partOrderCounter,
+                      messageID: partMessageID,
+                      partID,
+                    });
+                  }
                 }
               }
               continue;
@@ -581,6 +820,46 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
             if (evType === 'message.updated' && asRecord(props['info'])['sessionID'] === sessionId) {
               const info = asRecord(props['info']);
               const finish: unknown = info['finish'];
+              const messageID = readInfoMessageId(info);
+              const role = typeof info['role'] === 'string' ? (info['role'] as string) : null;
+              rememberPartRole(messageID, role);
+              // User prompt snapshots are never assistant output: skipping the
+              // whole update also prevents a user `finish` from ending the turn.
+              if (role === 'user') {
+                if (messageID) {
+                  for (const [key, st] of partStates) {
+                    if (st.messageID === messageID) partStates.delete(key);
+                  }
+                }
+                if (Array.isArray(info['parts'])) {
+                  for (const rawPart of info['parts'] as unknown[]) {
+                    const pId = readPartId(asRecord(rawPart)['id']);
+                    if (pId != null) {
+                      for (const [key, st] of partStates) {
+                        if (st.partID === pId) partStates.delete(key);
+                      }
+                    }
+                  }
+                }
+                continue;
+              }
+              // A stale assistant message from before this turn must not overwrite
+              // the live answer. Only apply this when the backend supplies a
+              // creation timestamp; timestamp-less legacy events stay accepted.
+              if (isStaleAssistantSnapshot(info, role)) {
+                logDebug('Ignoring stale assistant message snapshot', {
+                  sessionId,
+                  messageID,
+                  created: asRecord(info['time'])['created'],
+                });
+                if (messageID) {
+                  staleMessageIds.add(messageID);
+                  for (const [key, st] of partStates) {
+                    if (st.messageID === messageID) partStates.delete(key);
+                  }
+                }
+                continue;
+              }
               // An aborted or failed message never produces another delta. Without
               // this, the collector waits out the whole first-delta window before
               // polling rediscovers the same error.
@@ -595,18 +874,23 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                   ms: Date.now() - startedAt,
                   error: (asRecord(infoError)['name'] as unknown) || 'UnknownError',
                 });
-                resolve({ content, reasoning, error: infoError });
+                resolve(finalizeCollected({ error: infoError }));
                 break;
               }
-              // Reconcile active tool calls from the full message snapshot so we
-              // detect pending tools even when only message.updated fires.
+              // Reconcile active tool calls and per-part text snapshots from the
+              // full message snapshot so we detect pending tools even when only
+              // message.updated fires.
               if (Array.isArray(info['parts'])) {
-                for (const part of info['parts'] as unknown[]) {
-                  rememberPartType(part);
-                   trackToolState(part);
-
-
-                }
+                const snapshotParts = info['parts'] as unknown[];
+                snapshotParts.forEach((rawPart, index) => {
+                  const part = asRecord(rawPart);
+                  // `info.parts` is ordered; the array index is authoritative for
+                  // joining multiple text/reasoning parts.
+                  applyPartSnapshot(part, index);
+                  if (part['type'] === 'tool') trackToolState(part);
+                });
+                // New parts observed after this snapshot must sort after it.
+                partOrderCounter = Math.max(partOrderCounter, snapshotParts.length);
               }
               if (finish === 'tool' || finish === 'tool-calls') {
                 // Assistant turn ended pending a tool call; keep waiting for the result.
@@ -635,7 +919,11 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                     ms: Date.now() - startedAt,
                     deltaChars,
                   });
-                  resolve(content || reasoning ? { content, reasoning } : { content, reasoning, noData: true });
+                  const result = finalizeCollected();
+                  if (!(result['content'] as string) && !(result['reasoning'] as string)) {
+                    result['noData'] = true;
+                  }
+                  resolve(result);
                 }
                 break;
               }

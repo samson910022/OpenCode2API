@@ -210,6 +210,24 @@ describe('collector terminal state', () => {
         expect(result).toMatchObject({ content: '', reasoning: '', noData: true });
     });
 
+    test('first-delta timeout keeps snapshot-only text and skips noData', async () => {
+        const result = await run([
+            {
+                type: 'message.updated',
+                properties: {
+                    info: {
+                        id: 'msg-1',
+                        role: 'assistant',
+                        sessionID: 'collector-session',
+                        parts: [{ id: 'p1', messageID: 'msg-1', type: 'text', text: 'snapshot answer' }]
+                    }
+                }
+            }
+        ], 20);
+        expect(result).toMatchObject({ content: 'snapshot answer', authoritative: true });
+        expect(result.noData).toBeUndefined();
+    });
+
     test.each([['tool'], ['tool-calls']])(
         'keeps the stream open when a turn finishes with %s',
         async (finish) => {
@@ -408,6 +426,256 @@ describe('collector event error and tool deltas', () => {
     });
 });
 
+describe('collector authoritative snapshots', () => {
+    const run = (events) => {
+        const client = {
+            event: {
+                subscribe: async () => ({
+                    stream: (async function* () {
+                        for (const event of events) yield event;
+                    })()
+                })
+            }
+        };
+        return createCollector({ client, logDebug: () => {} })
+            .collectFromEvents('collector-session', 1000, null, null, null);
+    };
+    const textDelta = (partID, delta, messageID) => ({
+        type: 'message.part.delta',
+        properties: { sessionID: 'collector-session', partID, field: 'text', delta, ...(messageID ? { messageID } : {}) }
+    });
+    const stop = (parts) => ({
+        type: 'message.updated',
+        properties: {
+            info: {
+                sessionID: 'collector-session',
+                finish: 'stop',
+                ...(parts ? { parts } : {})
+            }
+        }
+    });
+
+    test('final part.text repairs a delta that never arrived', async () => {
+        const result = await run([
+            { type: 'message.part.updated', properties: { part: { id: 'p1', type: 'text', sessionID: 'collector-session' }, delta: 'Hello ' } },
+            { type: 'message.part.updated', properties: { part: { id: 'p1', type: 'text', text: 'Hello world', sessionID: 'collector-session' } } },
+            stop()
+        ]);
+        expect(result).toMatchObject({ content: 'Hello world', authoritative: true });
+    });
+
+    test('id-less final part.text still repairs a missing delta', async () => {
+        const result = await run([
+            { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'collector-session' }, delta: 'Hello ' } },
+            { type: 'message.part.updated', properties: { part: { type: 'text', text: 'Hello world', sessionID: 'collector-session' } } },
+            stop()
+        ]);
+        expect(result).toMatchObject({ content: 'Hello world', authoritative: true });
+    });
+
+    test('keeps multiple id-less text deltas in one stable bucket', async () => {
+        const result = await run([
+            { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'collector-session' }, delta: 'Hello ' } },
+            { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'collector-session' }, delta: 'world' } },
+            stop()
+        ]);
+        expect(result.content).toBe('Hello world');
+        expect(result.authoritative).toBeUndefined();
+    });
+
+    test('message.updated info.parts snapshot replaces partial delta text', async () => {
+        const result = await run([
+            textDelta('p1', 'partial '),
+            { type: 'message.part.updated', properties: { part: { id: 'p1', type: 'text', sessionID: 'collector-session' } } },
+            textDelta('p1', 'answer'),
+            stop([
+                { id: 'p1', type: 'text', text: 'complete answer' }
+            ])
+        ]);
+        expect(result).toMatchObject({ content: 'complete answer', authoritative: true });
+        expect(result.content).not.toContain('partial');
+    });
+
+    test('keeps a delta that arrives before its part type is known', async () => {
+        const result = await run([
+            textDelta('p1', 'early '),
+            { type: 'message.part.updated', properties: { part: { id: 'p1', type: 'text', sessionID: 'collector-session' } } },
+            textDelta('p1', 'answer'),
+            stop()
+        ]);
+        expect(result).toMatchObject({ content: 'early answer' });
+        expect(result.authoritative).toBeUndefined();
+    });
+
+    test('a final snapshot wins over buffered deltas without duplicating text', async () => {
+        const result = await run([
+            textDelta('p1', 'early '),
+            { type: 'message.part.updated', properties: { part: { id: 'p1', type: 'text', text: 'complete answer', sessionID: 'collector-session' } } },
+            stop([{ id: 'p1', type: 'text', text: 'complete answer' }])
+        ]);
+        expect(result).toMatchObject({ content: 'complete answer', authoritative: true });
+        expect(result.content.match(/complete/g)).toHaveLength(1);
+        expect(result.content).not.toContain('early');
+    });
+
+    test('does not mark equal delta and snapshot text as authoritative', async () => {
+        const result = await run([
+            { type: 'message.part.updated', properties: { part: { id: 'p1', type: 'text', sessionID: 'collector-session' }, delta: 'Hello world' } },
+            stop([{ id: 'p1', type: 'text', text: 'Hello world' }])
+        ]);
+        expect(result).toMatchObject({ content: 'Hello world' });
+        expect(result.authoritative).toBeUndefined();
+        expect(result.content.match(/Hello world/g)).toHaveLength(1);
+    });
+
+    test('ignores a user prompt snapshot and user text parts', async () => {
+        const deltas = [];
+        const client = {
+            event: {
+                subscribe: async () => ({
+                    stream: (async function* () {
+                        yield {
+                            type: 'message.updated',
+                            properties: {
+                                info: {
+                                    id: 'msg-user',
+                                    sessionID: 'collector-session',
+                                    role: 'user',
+                                    parts: [{ id: 'user-text', messageID: 'msg-user', type: 'text', text: 'SECRET PROMPT' }]
+                                }
+                            }
+                        };
+                        yield {
+                            type: 'message.updated',
+                            properties: { info: { id: 'msg-assistant', sessionID: 'collector-session', role: 'assistant' } }
+                        };
+                        yield {
+                            type: 'message.part.updated',
+                            properties: { part: { id: 'user-text', messageID: 'msg-user', type: 'text', sessionID: 'collector-session', text: 'SECRET PROMPT' } }
+                        };
+                        yield textDelta('assistant-text', 'answer', 'msg-assistant');
+                        yield {
+                            type: 'message.part.updated',
+                            properties: { part: { id: 'assistant-text', messageID: 'msg-assistant', type: 'text', text: 'answer', sessionID: 'collector-session' } }
+                        };
+                        yield stop();
+                    })()
+                })
+            }
+        };
+        const result = await createCollector({ client, logDebug: () => {} })
+            .collectFromEvents('collector-session', 1000, (delta) => deltas.push(delta), null, null);
+        expect(result.content).toBe('answer');
+        expect(result.content).not.toContain('SECRET');
+        expect(deltas.join('')).not.toContain('SECRET');
+    });
+
+    test('a delayed user role filters a part that arrived before the role was known', async () => {
+        const result = await run([
+            { type: 'message.part.updated', properties: { part: { id: 'user-text', messageID: 'msg-user', type: 'text', sessionID: 'collector-session' }, delta: 'SECRET PROMPT' } },
+            { type: 'message.updated', properties: { info: { id: 'msg-user', sessionID: 'collector-session', role: 'user' } } },
+            { type: 'message.updated', properties: { info: { id: 'msg-assistant', sessionID: 'collector-session', role: 'assistant' } } },
+            { type: 'message.part.updated', properties: { part: { id: 'assistant-text', messageID: 'msg-assistant', type: 'text', sessionID: 'collector-session' } } },
+            textDelta('assistant-text', 'answer', 'msg-assistant'),
+            stop()
+        ]);
+        expect(result.content).toBe('answer');
+        expect(result.content).not.toContain('SECRET');
+        expect(result.authoritative).toBe(true);
+    });
+
+    test('keeps every part when one part snapshot is missing', async () => {
+        const result = await run([
+            { type: 'message.part.updated', properties: { part: { id: 'p1', messageID: 'msg-1', type: 'text', sessionID: 'collector-session' }, delta: 'Hello ' } },
+            { type: 'message.part.updated', properties: { part: { id: 'p2', messageID: 'msg-1', type: 'text', sessionID: 'collector-session' }, delta: 'world' } },
+            { type: 'message.part.updated', properties: { part: { id: 'p2', messageID: 'msg-1', type: 'text', text: 'world!', sessionID: 'collector-session' } } },
+            stop()
+        ]);
+        expect(result.content).toBe('Hello world!');
+        expect(result.authoritative).toBe(true);
+    });
+
+    test('a newer full part.text overrides a sticky info.parts snapshot', async () => {
+        const result = await run([
+            {
+                type: 'message.updated',
+                properties: {
+                    info: {
+                        id: 'msg-1',
+                        role: 'assistant',
+                        sessionID: 'collector-session',
+                        parts: [{ id: 'p1', messageID: 'msg-1', type: 'text', text: 'old snapshot' }]
+                    }
+                }
+            },
+            { type: 'message.part.updated', properties: { part: { id: 'p1', messageID: 'msg-1', type: 'text', text: 'newer text', sessionID: 'collector-session' } } },
+            stop()
+        ]);
+        expect(result.content).toBe('newer text');
+        expect(result.content).not.toContain('old snapshot');
+    });
+
+    test('flushes an early delta whose numeric partID was stringified', async () => {
+        const result = await run([
+            { type: 'message.part.delta', properties: { sessionID: 'collector-session', partID: 7, field: 'text', delta: 'early ' } },
+            { type: 'message.part.updated', properties: { part: { id: 7, messageID: 'msg-1', type: 'text', sessionID: 'collector-session' } } },
+            { type: 'message.part.delta', properties: { sessionID: 'collector-session', messageID: 'msg-1', partID: 7, field: 'text', delta: 'answer' } },
+            stop()
+        ]);
+        expect(result.content).toBe('early answer');
+        expect(result.authoritative).toBeUndefined();
+    });
+
+    test('snapshot-only final part.text becomes content with zero deltas', async () => {
+        const result = await run([
+            { type: 'message.part.updated', properties: { part: { id: 'p1', messageID: 'msg-1', type: 'text', text: 'snapshot only', sessionID: 'collector-session' } } },
+            stop()
+        ]);
+        expect(result.content).toBe('snapshot only');
+        expect(result.authoritative).toBe(true);
+    });
+
+    test('combines snapshot prefix with subsequent deltas for the same part', async () => {
+        const result = await run([
+            { type: 'message.part.updated', properties: { part: { id: 'p1', messageID: 'msg-1', type: 'text', text: 'Hello', sessionID: 'collector-session' } } },
+            { type: 'message.part.updated', properties: { part: { id: 'p1', messageID: 'msg-1', type: 'text', sessionID: 'collector-session' }, delta: ' world' } },
+            stop()
+        ]);
+        expect(result.content).toBe('Hello world');
+        expect(result.authoritative).toBe(true);
+    });
+
+    test('flushes orphaned deltas whose part update was dropped', async () => {
+        const result = await run([
+            { type: 'message.part.delta', properties: { sessionID: 'collector-session', messageID: 'msg-1', partID: 'orphan', field: 'text', delta: 'orphan text' } },
+            stop()
+        ]);
+        expect(result.content).toBe('orphan text');
+    });
+
+    test('ignores a stale assistant part from a previous turn', async () => {
+        const result = await run([
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        id: 'old-part',
+                        messageID: 'msg-old',
+                        type: 'text',
+                        text: 'OLD TEXT',
+                        time: { created: Date.now() - 60000 },
+                        sessionID: 'collector-session'
+                    }
+                }
+            },
+            { type: 'message.part.updated', properties: { part: { id: 'new-part', messageID: 'msg-new', type: 'text', sessionID: 'collector-session' }, delta: 'new answer' } },
+            stop()
+        ]);
+        expect(result.content).toBe('new answer');
+        expect(result.content).not.toContain('OLD TEXT');
+    });
+});
+
 describe('collector polling finish classification', () => {
     const run = (snapshots, timeoutMs = 1000) => {
         let call = 0;
@@ -432,12 +700,20 @@ describe('collector polling finish classification', () => {
                 assistant({ finish: 'stop', time: { completed: 2 } }, 'Done: 42.')
             ]);
             expect(result.content).toBe('Done: 42.');
+            expect(result.complete).toBe(true);
         }
     );
 
     test('still finishes on time.completed for a terminal turn', async () => {
         const result = await run([assistant({ time: { completed: 1 } }, 'Answer without a finish reason.')]);
         expect(result.content).toBe('Answer without a finish reason.');
+        expect(result.complete).toBe(true);
+    });
+
+    test('returns a timeout partial with partial: true', async () => {
+        const result = await run([assistant({ finish: 'tool' }, 'Still working')], 100);
+        expect(result).toMatchObject({ content: 'Still working', partial: true });
+        expect(result.complete).toBeUndefined();
     });
 
     test.each(['pending', 'running'])('does not finish while a tool part is %s', async (status) => {

@@ -244,7 +244,7 @@ export function buildExternalToolsReminder(registry: unknown, toolChoice: unknow
   const exampleName = normalizedChoice.requiredTool || first.namespacedName;
   return [
     'REMINDER: External tools are called by emitting markup, not through any native tool API.',
-    `To call one, your entire reply must be ONLY <function_calls>{"name":"${exampleName}","arguments":{...}}</function_calls>`,
+    `To call one, your entire reply must be ONLY <function_calls>{"name":"${exampleName}","arguments":{}}</function_calls>`,
     'with no prose, no markdown and no <think> block. Otherwise answer normally.',
     `Available names: ${list.map((tool) => tool.namespacedName).join(', ')}`
   ].join('\n');

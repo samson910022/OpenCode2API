@@ -23,6 +23,10 @@ import {
   createToolCallFilter,
   createExternalToolCallStreamParser,
 } from '../tool-runtime/parser.js';
+import {
+  isMalformedExternalToolCallError,
+  resolveAuthoritativeStreamSource,
+} from '../tool-runtime/stream-source.js';
 import { isTransientUpstreamError, normalizeBackendError, transformUpstreamError } from '../errors/upstream.js';
 import { engageFallbackForFreeLimit } from '../upstream-proxy/fallback.js';
 import { detectHostedSearchTools } from '../search/grounding.js';
@@ -36,6 +40,7 @@ import { getImageDataUri } from '../stream/collector.js';
 import type { Application, Request, Response } from 'express';
 import type { AppContext } from '../types/context.js';
 import type { FinalToolCall } from '../tool-runtime/parser.js';
+import type { AuthoritativeStreamSource } from '../tool-runtime/stream-source.js';
 import { asRecord, toErrorMessage } from '../utils/guards.js';
 
 export function registerMessagesRoutes(app: Application, ctx: AppContext): void {
@@ -620,13 +625,14 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
              return snapshotPromise;
            };
           // Recovery snapshots repeat what the event stream already delivered, so only the
-          // suffix past the raw prefix may be replayed. A snapshot the raw prefix does not
-          // match is still sent in full rather than dropped.
+          // suffix past the raw prefix may be replayed. A divergent snapshot is not a safe
+          // replay (raw "AC" + snapshot "ABC" would render "ACABC"); tool calls still come
+          // from the snapshot while visible text keeps the raw stream.
            const unsentSuffix = (full: unknown, raw: string): string => {
              const text = typeof full === 'string' ? full : '';
              if (!text) return '';
              if (!raw) return text;
-             return text.startsWith(raw) ? text.slice(raw.length) : text;
+             return text.startsWith(raw) ? text.slice(raw.length) : '';
            };
            const hasPartialOutput = (): boolean => {
              const current = asRecord(collected);
@@ -768,59 +774,135 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
            const flushedContentCalls = parseContent.flush ? parseContent.flush() : [];
            const flushedReasoningText = filterReasoning.flush ? filterReasoning.flush() : '';
            const flushedContentText = filterContent.flush ? filterContent.flush() : '';
+           const collectedR = asRecord(collected);
+           if (collectedR['error'] != null) throw normalizeBackendError(collectedR['error']);
+           // One authoritative source group: snapshot when available, otherwise
+           // the raw delta text. Never validate both groups independently.
+           let authoritativeSource = resolveAuthoritativeStreamSource({
+             collected: collectedR,
+             polledSnapshot,
+             rawContent,
+             rawReasoning,
+           });
+           const streamSource = (): string[][] => [[authoritativeSource.reasoning, authoritativeSource.content]];
+
            if (shouldBufferExternalStream) {
              const visible = stripExternalToolCallMarkupFromJoinedText(
                externalToolRegistry,
-               rawReasoning,
-               rawContent,
+               authoritativeSource.reasoning,
+               authoritativeSource.content,
              );
              streamedReasoning = visible.reasoning;
              streamedText = visible.content;
            } else {
              if (flushedReasoningText) sendReasoningDelta(flushedReasoningText);
              if (flushedContentText) sendTextDelta(flushedContentText);
+             if (!streamedText && !streamedReasoning) {
+               const collectedRemainingContent = unsentSuffix(authoritativeSource.content, rawContent);
+               const collectedRemainingReasoning = unsentSuffix(authoritativeSource.reasoning, rawReasoning);
+               if (collectedRemainingReasoning) sendReasoningDelta(collectedRemainingReasoning);
+               if (collectedRemainingContent) sendTextDelta(collectedRemainingContent);
+             }
            }
 
-           const collectedR = asRecord(collected);
-           if (collectedR['error'] != null) throw normalizeBackendError(collectedR['error']);
-           const snapshotReasoning = polledSnapshot?.reasoning ?? (typeof collectedR['reasoning'] === 'string' ? collectedR['reasoning'] as string : rawReasoning);
-           const snapshotContent = polledSnapshot?.content ?? (typeof collectedR['content'] === 'string' ? collectedR['content'] as string : rawContent);
            const parseJoined = (reasoningText: string, contentText: string): FinalToolCall[] =>
              externalToolRegistry.length > 0
                ? parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoningText, contentText)
                : [];
-           const streamSource = [
-             [snapshotReasoning, snapshotContent],
-             [rawReasoning, rawContent]
-           ];
-            let parsedToolCalls: FinalToolCall[] = externalToolRegistry.length > 0
-              ? mergeToolCallArtifacts(
-                  streamedToolCalls,
-                  flushedReasoningCalls,
-                  flushedContentCalls,
-                  parseJoined(snapshotReasoning, snapshotContent),
-                  parseJoined(rawReasoning, rawContent),
-                )
-              : [];
-            let finalValidated: FinalToolCall[];
-            try {
-              assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource);
-              if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
-                const forcedResponse = await requestForcedMessagesToolCall();
-                if (forcedResponse) {
-                  const forcedReasoning = typeof forcedResponse['reasoning'] === 'string' ? forcedResponse['reasoning'] as string : '';
-                  const forcedContent = typeof forcedResponse['content'] === 'string' ? forcedResponse['content'] as string : '';
-                  parsedToolCalls = mergeToolCallArtifacts(parsedToolCalls, parseJoined(forcedReasoning, forcedContent));
-                  assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [forcedReasoning, forcedContent]);
-                }
-              }
-              finalValidated = finalizeStreamToolCalls(
-                parsedToolCalls,
-                externalToolRegistry,
-                externalToolChoice,
-                streamSource,
-                parallelToolCalls,
-              ) as unknown as FinalToolCall[];
+           const callsFromText = (source: AuthoritativeStreamSource): FinalToolCall[] =>
+             externalToolRegistry.length > 0
+               ? mergeToolCallArtifacts(
+                   streamedToolCalls,
+                   parseJoined(source.reasoning, source.content),
+                 )
+               : [];
+           const callsFromRaw = (source: AuthoritativeStreamSource): FinalToolCall[] =>
+             externalToolRegistry.length > 0
+               ? mergeToolCallArtifacts(
+                   streamedToolCalls,
+                   flushedReasoningCalls,
+                   flushedContentCalls,
+                   parseJoined(source.reasoning, source.content),
+                 )
+               : [];
+           let parsedToolCalls: FinalToolCall[] = authoritativeSource.fromSnapshot
+             ? callsFromText(authoritativeSource)
+             : callsFromRaw(authoritativeSource);
+           const repairFromSnapshot = async (): Promise<boolean> => {
+             if (externalToolRegistry.length === 0) return false;
+             let snapshot = polledSnapshot;
+             if (!snapshot) {
+               if (snapshotPolled) return false;
+               try {
+                 snapshot = await recoverSnapshot();
+               } catch {
+                 return false;
+               }
+             }
+             if (!snapshot || snapshot.error != null) return false;
+             const repairedSource: AuthoritativeStreamSource = {
+               content: String(snapshot.content ?? ''),
+               reasoning: String(snapshot.reasoning ?? ''),
+               kind: 'polled-snapshot',
+               fromSnapshot: true,
+             };
+             // The snapshot itself must yield at least one valid call; a bare
+             // streamed artifact cannot turn an unrelated snapshot into a repair.
+             const snapshotCalls = mergeToolCallArtifacts(parseJoined(repairedSource.reasoning, repairedSource.content));
+             if (snapshotCalls.length === 0) return false;
+             const repairedCalls = mergeToolCallArtifacts(streamedToolCalls, snapshotCalls);
+             try {
+               assertToolCallArtifactIntegrity(repairedCalls, externalToolRegistry, [
+                 [repairedSource.reasoning, repairedSource.content],
+               ]);
+             } catch {
+               return false;
+             }
+             polledSnapshot = snapshot;
+             authoritativeSource = repairedSource;
+             parsedToolCalls = repairedCalls;
+             if (shouldBufferExternalStream) {
+               const visible = stripExternalToolCallMarkupFromJoinedText(
+                 externalToolRegistry,
+                 authoritativeSource.reasoning,
+                 authoritativeSource.content,
+               );
+               streamedReasoning = visible.reasoning;
+               streamedText = visible.content;
+             }
+             return true;
+           };
+           let finalValidated: FinalToolCall[];
+           try {
+             try {
+               assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource());
+             } catch (integrityError) {
+               if (!isMalformedExternalToolCallError(integrityError) || !(await repairFromSnapshot())) {
+                 throw integrityError;
+               }
+             }
+             if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+               const forcedResponse = await requestForcedMessagesToolCall();
+               if (forcedResponse) {
+                 const forcedReasoning = typeof forcedResponse['reasoning'] === 'string' ? forcedResponse['reasoning'] as string : '';
+                 const forcedContent = typeof forcedResponse['content'] === 'string' ? forcedResponse['content'] as string : '';
+                 parsedToolCalls = mergeToolCallArtifacts(parsedToolCalls, parseJoined(forcedReasoning, forcedContent));
+                 authoritativeSource = {
+                   content: `${authoritativeSource.content}${forcedContent}`,
+                   reasoning: `${authoritativeSource.reasoning}${forcedReasoning}`,
+                   kind: authoritativeSource.kind,
+                   fromSnapshot: authoritativeSource.fromSnapshot,
+                 };
+                 assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource());
+               }
+             }
+             finalValidated = finalizeStreamToolCalls(
+               parsedToolCalls,
+               externalToolRegistry,
+               externalToolChoice,
+               streamSource(),
+               parallelToolCalls,
+             ) as unknown as FinalToolCall[];
             } catch (toolError) {
               const toolCode = (toolError as Error & { code?: string }).code;
               const failClosedCodes = [
