@@ -354,6 +354,26 @@ if (process.platform !== 'win32') {
 // Backend management state (per-instance)
 export const backendState = new Map<string, BackendState>();
 
+type BackendReconnectListener = () => void;
+const backendReconnectListeners = new Set<BackendReconnectListener>();
+
+export function onBackendReconnect(listener: BackendReconnectListener): () => void {
+  backendReconnectListeners.add(listener);
+  return () => {
+    backendReconnectListeners.delete(listener);
+  };
+}
+
+export function notifyBackendReconnect(): void {
+  for (const listener of backendReconnectListeners) {
+    try {
+      listener();
+    } catch {
+      // ignore
+    }
+  }
+}
+
 /**
  * Backend Lifecycle Management
  */
@@ -572,6 +592,7 @@ export async function ensureBackend(config: unknown): Promise<void> {
     // A fresh backend reverts to its default model: drop cached
     // set-active-model state so the next request PUTs again.
     resetActiveModelCache();
+    notifyBackendReconnect();
 
     // Handle spawn errors
     state.process.on('error', (spawnErr: unknown) => {

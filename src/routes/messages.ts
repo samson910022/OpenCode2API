@@ -43,6 +43,16 @@ import type { FinalToolCall } from '../tool-runtime/parser.js';
 import type { AuthoritativeStreamSource } from '../tool-runtime/stream-source.js';
 import { asRecord, toErrorMessage } from '../utils/guards.js';
 
+function readDataMessage(e: unknown): string {
+  const r = asRecord(e);
+  const data = asRecord(r['data']);
+  const dm: unknown = data['message'];
+  if (typeof dm === 'string') return dm;
+  const m: unknown = r['message'];
+  if (typeof m === 'string') return m;
+  return 'unknown';
+}
+
 export function registerMessagesRoutes(app: Application, ctx: AppContext): void {
   const {
     client,
@@ -96,11 +106,112 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
       }
     };
     try {
+      const rawBody: unknown = (req as unknown as { body: unknown }).body;
+      const validationError = validateMessagesRequest(rawBody);
+      if (validationError) {
+        res.status(validationError.statusCode).json(validationError.body);
+        return;
+      }
+      const body = asRecord(rawBody);
+      const model: unknown = body['model'];
+      const system: unknown = body['system'];
+      const messagesRaw: unknown = body['messages'];
+      const toolsRaw: unknown = body['tools'];
+      const tools: unknown[] = Array.isArray(toolsRaw) ? (toolsRaw as unknown[]) : [];
+      // Anthropic server-side web_search would be silently dropped by the
+      // function-tool bridge; fail loudly with a pointer instead. Uses the
+      // shared helper (covers versioned types like web_search_20260222)
+      // plus the bare `web_search` name for name-only defs.
+      const hasHostedSearch =
+        detectHostedSearchTools(tools).requested ||
+        tools.some((def: unknown) => {
+          const r = asRecord(def);
+          return typeof r['name'] === 'string' && String(r['name']) === 'web_search';
+        });
+      if (hasHostedSearch) {
+        res.status(400).json({
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message:
+              'web_search is not supported on /v1/messages; use POST /v1/responses with tools:[{type:"web_search"}] or POST /v1beta/interactions with tools:[{type:"google_search"}]',
+          },
+        });
+        return;
+      }
+      const tool_choice: unknown = body['tool_choice'];
+      const requestStream: unknown = body['stream'];
+      const temperature: unknown = body['temperature'];
+      const top_p: unknown = body['top_p'];
+      const top_k: unknown = body['top_k'];
+      const max_tokens: unknown = body['max_tokens'];
+      const stop_sequences: unknown = body['stop_sequences'];
+      const thinking: unknown = body['thinking'];
+      const stream = Boolean(requestStream);
+      const requestOpencodeConfig: unknown = body['opencode'];
+      const disableParallelRaw = body['disable_parallel_tool_use'];
+      const choiceDisableParallel = asRecord(tool_choice)['disable_parallel_tool_use'];
+      const parallelToolCalls: boolean = disableParallelRaw === true || choiceDisableParallel === true ? false : true;
+      // Phase 2 wiring: inbound claude.request -> chat.request via the wired
+      // N×N registry (thin wrapper over the same anthropic.ts pure layer,
+      // so shapes match). Direct registry call (not the Safe wrapper):
+      // requests are validated above and never error envelopes; an extra
+      // `type:'error'` field must not bypass conversion (mode confusion).
+      // Translated tools still flow through createRequestToolContext below
+      // (external__* bridge + server ∩ request), unchanged.
+      const translatedChatRequest = asRecord(
+        activeTranslators.translateRequest(
+          'claude',
+          'openai',
+          typeof model === 'string' ? model : '',
+          {
+            model,
+            system,
+            messages: messagesRaw,
+            tools,
+            tool_choice,
+            thinking,
+            max_tokens,
+            temperature,
+            top_p,
+            stop_sequences,
+          },
+          stream,
+        ),
+      );
+      const chatMessages = (
+        Array.isArray(translatedChatRequest['messages']) ? (translatedChatRequest['messages'] as unknown[]) : []
+      ) as unknown as Array<{ role?: unknown; content?: unknown }>;
+      const chatTools = Array.isArray(translatedChatRequest['tools']) ? (translatedChatRequest['tools'] as unknown[]) : [];
+      const chatToolChoice = translatedChatRequest['tool_choice'];
+      // Strict legacy parity via the testable gate (collapses the whole
+      // adaptive/auto family to the legacy fallback; translator itself
+      // stays Go-faithful).
+      const translatedEffort = translatedChatRequest['reasoning_effort'];
+      const reasoningLevel = resolveMessagesReasoningLevel(thinking, translatedEffort, normalizeReasoningEffort);
+
+      const requestParams: Record<string, unknown> = {
+        temperature: typeof temperature === 'number' ? temperature : 0.7,
+        max_tokens: typeof max_tokens === 'number' ? max_tokens : null,
+        top_p: typeof top_p === 'number' ? top_p : 1.0,
+        stop: Array.isArray(stop_sequences) ? stop_sequences : null,
+        reasoning_effort: reasoningLevel,
+      };
+      if (top_k !== undefined) logDebug('Ignoring top_k (no opencode equivalent)', { top_k });
+
+      const resolvedModel = (await withTimeout(resolveRequestedModel(model), REQUEST_TIMEOUT_MS, 'resolve model')) as unknown as {
+        providerID: string;
+        modelID: string;
+      };
+      const pID = String(asRecord(resolvedModel)['providerID']);
+      const mID = String(asRecord(resolvedModel)['modelID']);
+      const publicModel = `${pID}/${mID}`;
+
       await lock(async (): Promise<void> => {
-         let sessionId: string | null = null;
-         let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
-         const requestAbortController = new AbortController();
-         let disconnectedSessionCleaned = false;
+        let sessionId: string | null = null;
+        let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
+        const requestAbortController = new AbortController();
+        let disconnectedSessionCleaned = false;
 
         // P3 fallback bundle: direct by default; adopts the proxy bundle when
         // this request hits a free-limit error (or the pool is already engaged).
@@ -122,107 +233,6 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
         };
         if (proxyPool.isEngaged()) switchToProxyBundle();
         try {
-          const rawBody: unknown = (req as unknown as { body: unknown }).body;
-          const validationError = validateMessagesRequest(rawBody);
-          if (validationError) {
-            res.status(validationError.statusCode).json(validationError.body);
-            return;
-          }
-          const body = asRecord(rawBody);
-          const model: unknown = body['model'];
-          const system: unknown = body['system'];
-          const messagesRaw: unknown = body['messages'];
-          const toolsRaw: unknown = body['tools'];
-          const tools: unknown[] = Array.isArray(toolsRaw) ? (toolsRaw as unknown[]) : [];
-          // Anthropic server-side web_search would be silently dropped by the
-          // function-tool bridge; fail loudly with a pointer instead. Uses the
-          // shared helper (covers versioned types like web_search_20260222)
-          // plus the bare `web_search` name for name-only defs.
-          const hasHostedSearch =
-            detectHostedSearchTools(tools).requested ||
-            tools.some((def: unknown) => {
-              const r = asRecord(def);
-              return typeof r['name'] === 'string' && String(r['name']) === 'web_search';
-            });
-          if (hasHostedSearch) {
-            res.status(400).json({
-              type: 'error',
-              error: {
-                type: 'invalid_request_error',
-                message:
-                  'web_search is not supported on /v1/messages; use POST /v1/responses with tools:[{type:"web_search"}] or POST /v1beta/interactions with tools:[{type:"google_search"}]',
-              },
-            });
-            return;
-          }
-          const tool_choice: unknown = body['tool_choice'];
-          const requestStream: unknown = body['stream'];
-          const temperature: unknown = body['temperature'];
-          const top_p: unknown = body['top_p'];
-          const top_k: unknown = body['top_k'];
-          const max_tokens: unknown = body['max_tokens'];
-          const stop_sequences: unknown = body['stop_sequences'];
-          const thinking: unknown = body['thinking'];
-          const stream = Boolean(requestStream);
-          const requestOpencodeConfig: unknown = body['opencode'];
-          const disableParallelRaw = body['disable_parallel_tool_use'];
-          const choiceDisableParallel = asRecord(tool_choice)['disable_parallel_tool_use'];
-          const parallelToolCalls: boolean = disableParallelRaw === true || choiceDisableParallel === true ? false : true;
-          // Phase 2 wiring: inbound claude.request -> chat.request via the wired
-          // N×N registry (thin wrapper over the same anthropic.ts pure layer,
-          // so shapes match). Direct registry call (not the Safe wrapper):
-          // requests are validated above and never error envelopes; an extra
-          // `type:'error'` field must not bypass conversion (mode confusion).
-          // Translated tools still flow through createRequestToolContext below
-          // (external__* bridge + server ∩ request), unchanged.
-          const translatedChatRequest = asRecord(
-            activeTranslators.translateRequest(
-              'claude',
-              'openai',
-              typeof model === 'string' ? model : '',
-              {
-                model,
-                system,
-                messages: messagesRaw,
-                tools,
-                tool_choice,
-                thinking,
-                max_tokens,
-                temperature,
-                top_p,
-                stop_sequences,
-              },
-              stream,
-            ),
-          );
-          const chatMessages = (
-            Array.isArray(translatedChatRequest['messages']) ? (translatedChatRequest['messages'] as unknown[]) : []
-          ) as unknown as Array<{ role?: unknown; content?: unknown }>;
-          const chatTools = Array.isArray(translatedChatRequest['tools']) ? (translatedChatRequest['tools'] as unknown[]) : [];
-          const chatToolChoice = translatedChatRequest['tool_choice'];
-          // Strict legacy parity via the testable gate (collapses the whole
-          // adaptive/auto family to the legacy fallback; translator itself
-          // stays Go-faithful).
-          const translatedEffort = translatedChatRequest['reasoning_effort'];
-          const reasoningLevel = resolveMessagesReasoningLevel(thinking, translatedEffort, normalizeReasoningEffort);
-
-          const requestParams: Record<string, unknown> = {
-            temperature: typeof temperature === 'number' ? temperature : 0.7,
-            max_tokens: typeof max_tokens === 'number' ? max_tokens : null,
-            top_p: typeof top_p === 'number' ? top_p : 1.0,
-            stop: Array.isArray(stop_sequences) ? stop_sequences : null,
-            reasoning_effort: reasoningLevel,
-          };
-          if (top_k !== undefined) logDebug('Ignoring top_k (no opencode equivalent)', { top_k });
-
-          const resolvedModel = (await withTimeout(resolveRequestedModel(model), REQUEST_TIMEOUT_MS, 'resolve model')) as unknown as {
-            providerID: string;
-            modelID: string;
-          };
-          const pID = String(asRecord(resolvedModel)['providerID']);
-          const mID = String(asRecord(resolvedModel)['modelID']);
-          const publicModel = `${pID}/${mID}`;
-
           const requestToolContext = createRequestToolContext(chatTools, chatToolChoice, requestOpencodeConfig);
           const toolMode: string = requestToolContext.mode;
           const externalToolContext = requestToolContext.external;
@@ -570,10 +580,10 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
            // markup is never emitted as incremental `content_block_delta` before it
            // can be classified. Pure-text turns with tools declared also batch.
            const shouldBufferExternalStream = externalToolRegistry.length > 0;
-           const filterContent = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
-           const filterReasoning = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
-           const parseContent = createExternalToolCallStreamParser(externalToolRegistry);
-           const parseReason = createExternalToolCallStreamParser(externalToolRegistry);
+           let filterContent = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
+           let filterReasoning = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
+           let parseContent = createExternalToolCallStreamParser(externalToolRegistry);
+           let parseReason = createExternalToolCallStreamParser(externalToolRegistry);
            textBlockOpen = false;
            thinkingBlockOpen = false;
            let nextBlockIndex = 0;
@@ -684,60 +694,124 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
              return snapshot;
            };
 
-          if (fallbackToProxy) {
-            // SSE subscribe ignores custom fetch (SDK gap): prompt+poll
-            // through the proxy bundle instead of the event stream.
-            try {
-              await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-               const pres = await pollSnapshot();
-               polledSnapshot = pres;
-               if (pres.error != null) throw normalizeBackendError(pres.error);
-              if (res.destroyed || res.writableEnded) {
-                if (keepaliveInterval) clearInterval(keepaliveInterval);
-                return;
+          let lastStreamAttemptError: unknown = null;
+          for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            if (attempt > 1) {
+              try {
+                await activeClient.session.delete({ path: { id: sessionId } });
+              } catch (e: unknown) {
+                logDebug('Failed to delete retried messages session', { sessionId, error: toErrorMessage(e) });
               }
-              // Raw text: sendDelta parses tool calls and filters display markup.
-              const presContent = unsentSuffix(pres.content, rawContent);
-              const presReasoning = unsentSuffix(pres.reasoning, rawReasoning);
-              if (presContent) sendDelta(presContent, false);
-              if (presReasoning) sendDelta(presReasoning, true);
-              collected = { content: pres.content, reasoning: pres.reasoning };
-            } catch (e: unknown) {
-              throw normalizeBackendError(e);
+              const retrySessionRes = (await withTimeout(
+                activeClient.session.create(),
+                REQUEST_TIMEOUT_MS,
+                'create session',
+              )) as unknown;
+              sessionId = (asRecord(asRecord(retrySessionRes)['data'])['id'] as string | undefined) ?? null;
+              if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
+              promptParams.path.id = sessionId;
+              requestForcedMessagesToolCall = makeForcedMessagesToolCallRequester();
+              streamedText = '';
+              streamedReasoning = '';
+              rawContent = '';
+              rawReasoning = '';
+              streamedToolCalls.length = 0;
+              filterContent = createToolCallFilter({
+                disableTools: DISABLE_TOOLS,
+                forceStrip: shouldBufferExternalStream,
+                registry: externalToolRegistry,
+              });
+              filterReasoning = createToolCallFilter({
+                disableTools: DISABLE_TOOLS,
+                forceStrip: shouldBufferExternalStream,
+                registry: externalToolRegistry,
+              });
+              parseContent = createExternalToolCallStreamParser(externalToolRegistry);
+              parseReason = createExternalToolCallStreamParser(externalToolRegistry);
+              polledSnapshot = null;
+              snapshotPolled = false;
+              snapshotPromise = null;
+              textBlockOpen = false;
+              thinkingBlockOpen = false;
+              nextBlockIndex = 0;
+              textIndex = null;
+              thinkingIndex = null;
+              await sleep(computeRetryDelay(attempt - 1, lastStreamAttemptError));
             }
-          } else {
-            const collectPromise = collectFromEvents(
-              sessionId as string,
-              REQUEST_TIMEOUT_MS,
-              sendDelta,
-               DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-               DEFAULT_EVENT_IDLE_TIMEOUT_MS,
-               requestAbortController.signal,
-             ).catch((err: unknown) => ({ __error: err }));
+            try {
+              if (fallbackToProxy) {
+                // SSE subscribe ignores custom fetch (SDK gap): prompt+poll
+                // through the proxy bundle instead of the event stream.
+                await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                const pres = await pollSnapshot();
+                polledSnapshot = pres;
+                if (pres.error != null) throw normalizeBackendError(pres.error);
+                if (res.destroyed || res.writableEnded) {
+                  if (keepaliveInterval) clearInterval(keepaliveInterval);
+                  return;
+                }
+                // Raw text: sendDelta parses tool calls and filters display markup.
+                const presContent = unsentSuffix(pres.content, rawContent);
+                const presReasoning = unsentSuffix(pres.reasoning, rawReasoning);
+                if (presContent) sendDelta(presContent, false);
+                if (presReasoning) sendDelta(presReasoning, true);
+                collected = { content: pres.content, reasoning: pres.reasoning };
+              } else {
+                const collectPromise = collectFromEvents(
+                  sessionId as string,
+                  REQUEST_TIMEOUT_MS,
+                  sendDelta,
+                  DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
+                  DEFAULT_EVENT_IDLE_TIMEOUT_MS,
+                  requestAbortController.signal,
+                ).catch((err: unknown) => ({ __error: err }));
 
-            activeClient.session.prompt(promptParams).catch((err: unknown) => logDebug('Prompt error:', toErrorMessage(err)));
-            const raced = (await Promise.race([collectPromise, resClosed.then(() => ({ __cancelled: true }))])) as Record<string, unknown>;
-            collected = raced;
-             if (raced['__cancelled'] || requestAbortController.signal.aborted) {
-               if (keepaliveInterval) clearInterval(keepaliveInterval);
-               try {
-                 if (sessionId) {
-                   await activeClient.session.delete({ path: { id: sessionId } });
-                   disconnectedSessionCleaned = true;
-                 }
-               } catch (e: unknown) {
-                 logDebug('Failed to cleanup cancelled messages session', { error: toErrorMessage(e) });
-               }
-               try {
-                 if (!res.destroyed) res.end();
-               } catch {
-                 // ignore
-               }
-               return;
-             }
-             if (raced['error'] != null) throw normalizeBackendError(raced['error']);
-              const recoveryRecord = asRecord(collected);
-              const hasValidTerminal = Boolean(
+                activeClient.session.prompt(promptParams).catch((err: unknown) => logDebug('Prompt error:', toErrorMessage(err)));
+                const raced = (await Promise.race([collectPromise, resClosed.then(() => ({ __cancelled: true }))])) as Record<string, unknown>;
+                collected = raced;
+                if (raced['__cancelled'] || requestAbortController.signal.aborted) {
+                  if (keepaliveInterval) clearInterval(keepaliveInterval);
+                  try {
+                    if (sessionId) {
+                      await activeClient.session.delete({ path: { id: sessionId } });
+                      disconnectedSessionCleaned = true;
+                    }
+                  } catch (e: unknown) {
+                    logDebug('Failed to cleanup cancelled messages session', { error: toErrorMessage(e) });
+                  }
+                  try {
+                    if (!res.destroyed) res.end();
+                  } catch {
+                    // ignore
+                  }
+                  return;
+                }
+              }
+            } catch (e: unknown) {
+              collected = { __error: e };
+            }
+
+            const collectedRecord = asRecord(collected);
+            const attemptError: unknown = collectedRecord['error'] ?? collectedRecord['__error'] ?? null;
+            const nothingStreamed = !rawContent && !rawReasoning && streamedToolCalls.length === 0;
+            if (attemptError && nothingStreamed && attempt < maxAttempts && engageProxyFallback(attemptError)) {
+              lastStreamAttemptError = attemptError;
+              continue;
+            }
+            if (attemptError && nothingStreamed && attempt < maxAttempts && isTransientUpstreamError(attemptError)) {
+              console.warn(
+                `[Proxy] Transient upstream error in messages stream (attempt ${attempt}/${maxAttempts}), retrying:`,
+                readDataMessage(attemptError),
+              );
+              lastStreamAttemptError = attemptError;
+              continue;
+            }
+            break;
+          }
+
+          const recoveryRecord = asRecord(collected);
+          if (recoveryRecord['error'] != null) throw normalizeBackendError(recoveryRecord['error']);
+          const hasValidTerminal = Boolean(
                 collected &&
                 !recoveryRecord['__error'] &&
                 !recoveryRecord['noData'] &&
@@ -780,7 +854,6 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                  if (remainingContent) sendDelta(remainingContent, false);
                }
              }
-           }
            if (requestAbortController.signal.aborted || res.destroyed || res.writableEnded) {
              if (sessionId && !disconnectedSessionCleaned) {
                try {
@@ -1079,7 +1152,15 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
       }, REQUEST_TIMEOUT_MS + 20000);
     } catch (error: unknown) {
       if (!res.headersSent) {
-        res.status(500).json({ type: 'error', error: { type: 'api_error', message: toErrorMessage(error) } });
+        const t = transformUpstreamError(error);
+        res.status(t.statusCode).json({
+          type: 'error',
+          error: {
+            type: t.error.type || 'api_error',
+            message: t.error.message || toErrorMessage(error) || 'Upstream error',
+            ...(t.error.code ? { code: t.error.code } : {}),
+          },
+        });
       } else if (!res.writableEnded && !res.destroyed) {
         closeOpenBlocks();
         try {

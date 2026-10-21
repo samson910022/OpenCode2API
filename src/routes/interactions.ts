@@ -17,7 +17,7 @@ import crypto from 'crypto';
 import { withTimeout } from '../config/proxy-config.js';
 import { computeRetryDelay } from '../retry/policy.js';
 import { ensureActiveModel } from '../backend/active-model.js';
-import { normalizeBackendError, transformUpstreamError } from '../errors/upstream.js';
+import { isTransientUpstreamError, normalizeBackendError, transformUpstreamError } from '../errors/upstream.js';
 import { engageFallbackForFreeLimit } from '../upstream-proxy/fallback.js';
 import {
   buildCitationAnnotations,
@@ -329,9 +329,9 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         promptParams.body['tools'] = promptToolOverrides;
       }
 
-      // Thin retry: free-limit errors engage the proxy pool and rotate the
-      // session (bounded by maxAttempts like the other routes). Ordinary
-      // errors throw immediately — no generic transient backoff here.
+      // Upstream retry: free-limit errors engage the proxy pool and rotate the
+      // session; transient 5xx / rate-limit errors retry with exponential backoff
+      // (bounded by maxAttempts like the other routes).
       const parentSessionId = previousState?.sessionId ?? null;
       const promptAndPoll = async (): Promise<{
         content: string;
@@ -377,6 +377,13 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           } catch (e: unknown) {
             lastErr = e;
             if (attempt < maxAttempts && engageProxyFallback(e)) continue;
+            if (attempt < maxAttempts && isTransientUpstreamError(e)) {
+              console.warn(
+                `[Proxy] Transient upstream error in interactions (attempt ${attempt}/${maxAttempts}), retrying:`,
+                toErrorMessage(e),
+              );
+              continue;
+            }
             throw normalizeBackendError(e);
           }
         }

@@ -149,11 +149,10 @@ export function isFreeUsageLimitError(error: unknown): boolean {
 export function isTransientUpstreamError(error: unknown): boolean {
   if (!error) return false;
   const message = collectMessageParts(error);
-  if (!message) return false;
 
   // Upstream opencode never retries context overflow (retry.ts); neither do we.
   // A 500 carrying a context message must surface immediately, not burn retries.
-  if (/context.?length|context.?overflow|context_length_exceeded/i.test(message)) return false;
+  if (message && /context.?length|context.?overflow|context_length_exceeded/i.test(message)) return false;
 
   // First-party gate is permanent: retrying (or proxy-fallbacking) can never
   // succeed, and a Python Traceback body might otherwise trip a generic
@@ -161,7 +160,7 @@ export function isTransientUpstreamError(error: unknown): boolean {
   // "from within") so incidental phrasing like "originated from within the
   // model context" never matches; FreeTierError is the structured class seen
   // live in Zen response bodies (collectMessageParts covers name/code/type).
-  if (/from within opencode|used from within|freetiererror/i.test(message)) return false;
+  if (message && /from within opencode|used from within|freetiererror/i.test(message)) return false;
 
   const record = asRecord(error);
   const data = asRecord(record['data']);
@@ -174,7 +173,7 @@ export function isTransientUpstreamError(error: unknown): boolean {
   // ("Insufficient balance"/CreditsError) never carries these strings, so
   // it still retries. Placed after isRetryable so a provider-explicit
   // retryable flag keeps winning (upstream-faithful).
-  if (/invalid[_\s]?api[_\s]?key|unauthorized|authentication (failed|error)|api key (expired|invalid|incorrect)/i.test(message)) return false;
+  if (message && /invalid[_\s]?api[_\s]?key|unauthorized|authentication (failed|error)|api key (expired|invalid|incorrect)/i.test(message)) return false;
 
   const transientSignatures: RegExp[] = [
     /insufficient balance/i,
@@ -206,14 +205,15 @@ export function isTransientUpstreamError(error: unknown): boolean {
     /retry your request/i,
     /resource exhausted/i,
     /(?:currently|temporarily) at capacity/i,
+    /endpoint is unavailable/i,
   ];
-  if (transientSignatures.some((re) => re.test(message))) return true;
+  if (message && transientSignatures.some((re) => re.test(message))) return true;
 
   // Upstream errors arrive as "<status>: {json}" strings; SDK errors may also
   // carry a numeric status on the object itself. Only accept a leading
   // "<status>:" prefix — a loose \b(\d{3}): match misfires on embedded
   // numbers like "retry after 300: ...".
-  const recordStatus: unknown = record['statusCode'] ?? data['status'];
+  const recordStatus: unknown = record['statusCode'] ?? data['statusCode'] ?? data['status'];
   let status: number | null = typeof recordStatus === 'number' ? recordStatus : null;
   if (typeof status !== 'number') {
     const statusCandidates: string[] = [];

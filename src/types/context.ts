@@ -106,6 +106,7 @@ export interface AppContext {
   maxRetries: number;
   maxAttempts: number;
   getProvidersList: () => Promise<ProviderInfo[]>;
+  invalidateProvidersCache: () => void;
   buildModelsList: (providersList: unknown) => ModelInfo[];
   normalizeModelID: (modelID: unknown) => unknown;
   resolveRequestedModel: (requestedModel: unknown) => Promise<ResolvedModel>;
@@ -176,6 +177,7 @@ export interface AppContext {
 export interface CreateAppResult {
   app: import('express').Application;
   client: ProxyClient;
+  ctx?: AppContext;
 }
 
 export interface StartProxyResult {

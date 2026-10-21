@@ -91,12 +91,94 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
   app.post('/v1/chat/completions', (req: Request, res: Response): void => {
     void (async (): Promise<void> => {
       try {
+        const body = asRecord((req as unknown as { body: unknown }).body);
+        const messages: unknown = body['messages'];
+        const model: unknown = body['model'];
+        const toolsRaw: unknown = body['tools'];
+        const tools: unknown[] = Array.isArray(toolsRaw) ? (toolsRaw as unknown[]) : [];
+        const tool_choice: unknown = body['tool_choice'];
+        const requestStream: unknown = body['stream'];
+        const temperature: unknown = body['temperature'];
+        const max_tokens: unknown = body['max_tokens'];
+        const top_p: unknown = body['top_p'];
+        const frequency_penalty: unknown = body['frequency_penalty'];
+        const presence_penalty: unknown = body['presence_penalty'];
+        const stop: unknown = body['stop'];
+        const reasoning_effort: unknown = body['reasoning_effort'];
+        const reasoning: unknown = body['reasoning'];
+        const requestOpencodeConfig: unknown = body['opencode'];
+        const parallelToolCalls: boolean = body['parallel_tool_calls'] !== false;
+        const stream = Boolean(requestStream);
+        if (!messages || !Array.isArray(messages) || (messages as unknown[]).length === 0) {
+          res.status(400).json({ error: { message: 'messages array is required' } });
+          return;
+        }
+        if (detectHostedSearchTools(tools).requested) {
+          res.status(400).json({
+            error: {
+              message:
+                'web_search is not supported on /v1/chat/completions; use POST /v1/responses with tools:[{type:"web_search"}] or POST /v1beta/interactions with tools:[{type:"google_search"}]',
+              type: 'invalid_request_error',
+            },
+          });
+          return;
+        }
+        const unsupportedChatToolIndex = tools.findIndex((def) => {
+          const t = asRecord(def);
+          return t['type'] !== 'function';
+        });
+        if (unsupportedChatToolIndex >= 0) {
+          const rawType = asRecord(tools[unsupportedChatToolIndex])['type'];
+          const label = typeof rawType === 'string' && rawType.trim() ? rawType.trim() : 'missing';
+          res.status(400).json({
+            error: {
+              message: `Unsupported tool type "${label}" at tools[${unsupportedChatToolIndex}]. Only function tools are supported on this endpoint.`,
+              type: 'invalid_request_error',
+              code: 'unsupported_tool_type',
+            },
+          });
+          return;
+        }
+
+        const reasoningLevel = normalizeReasoningEffort(
+          (reasoning_effort as string) || (asRecord(reasoning)['effort'] as string),
+          null,
+        );
+
+        const requestParams: Record<string, unknown> = {
+          temperature: typeof temperature === 'number' ? temperature : 0.7,
+          max_tokens: typeof max_tokens === 'number' ? max_tokens : null,
+          top_p: typeof top_p === 'number' ? top_p : 1.0,
+          frequency_penalty: typeof frequency_penalty === 'number' ? frequency_penalty : 0,
+          presence_penalty: typeof presence_penalty === 'number' ? presence_penalty : 0,
+          stop: Array.isArray(stop) ? stop : stop ? [stop] : null,
+          reasoning_effort: reasoningLevel,
+        };
+
+        logDebug('Request params', {
+          temperature: requestParams['temperature'],
+          max_tokens: requestParams['max_tokens'],
+          top_p: requestParams['top_p'],
+          reasoning_effort: reasoningLevel,
+        });
+
+        let pID = 'opencode';
+        let mID = 'kimi-k2.5-free';
+        const resolvedModel = (await withTimeout(
+          resolveRequestedModel(model),
+          REQUEST_TIMEOUT_MS,
+          'resolve model',
+        )) as unknown as { providerID: string; modelID: string; aliasFrom?: string; resolved?: string };
+        const resolvedRecord = asRecord(resolvedModel);
+        pID = String(resolvedRecord['providerID'] ?? pID);
+        mID = String(resolvedRecord['modelID'] ?? mID);
+        if (resolvedRecord['aliasFrom']) {
+          logDebug('Resolved model alias', { from: resolvedRecord['aliasFrom'], to: resolvedRecord['resolved'] });
+        }
+
         await lock(async (): Promise<void> => {
           let sessionId: string | null = null;
           let eventStream: { close?: unknown } | null = null;
-          let stream = false;
-          let pID = 'opencode';
-          let mID = 'kimi-k2.5-free';
           let id = `chatcmpl-${crypto.randomUUID()}`;
            let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
            const requestAbortController = new AbortController();
@@ -129,89 +211,6 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
           if (proxyPool.isEngaged()) switchToProxyBundle();
 
           try {
-            const body = asRecord((req as unknown as { body: unknown }).body);
-            const messages: unknown = body['messages'];
-            const model: unknown = body['model'];
-            const toolsRaw: unknown = body['tools'];
-            const tools: unknown[] = Array.isArray(toolsRaw) ? (toolsRaw as unknown[]) : [];
-            const tool_choice: unknown = body['tool_choice'];
-            const requestStream: unknown = body['stream'];
-            const temperature: unknown = body['temperature'];
-            const max_tokens: unknown = body['max_tokens'];
-            const top_p: unknown = body['top_p'];
-            const frequency_penalty: unknown = body['frequency_penalty'];
-            const presence_penalty: unknown = body['presence_penalty'];
-            const stop: unknown = body['stop'];
-            const reasoning_effort: unknown = body['reasoning_effort'];
-            const reasoning: unknown = body['reasoning'];
-            const requestOpencodeConfig: unknown = body['opencode'];
-            const parallelToolCalls: boolean = body['parallel_tool_calls'] !== false;
-            stream = Boolean(requestStream);
-            if (!messages || !Array.isArray(messages) || (messages as unknown[]).length === 0) {
-              res.status(400).json({ error: { message: 'messages array is required' } });
-              return;
-            }
-            if (detectHostedSearchTools(tools).requested) {
-              res.status(400).json({
-                error: {
-                  message:
-                    'web_search is not supported on /v1/chat/completions; use POST /v1/responses with tools:[{type:"web_search"}] or POST /v1beta/interactions with tools:[{type:"google_search"}]',
-                  type: 'invalid_request_error',
-                },
-              });
-              return;
-            }
-            const unsupportedChatToolIndex = tools.findIndex((def) => {
-              const t = asRecord(def);
-              return t['type'] !== 'function';
-            });
-            if (unsupportedChatToolIndex >= 0) {
-              const rawType = asRecord(tools[unsupportedChatToolIndex])['type'];
-              const label = typeof rawType === 'string' && rawType.trim() ? rawType.trim() : 'missing';
-              res.status(400).json({
-                error: {
-                  message: `Unsupported tool type "${label}" at tools[${unsupportedChatToolIndex}]. Only function tools are supported on this endpoint.`,
-                  type: 'invalid_request_error',
-                  code: 'unsupported_tool_type',
-                },
-              });
-              return;
-            }
-
-            const reasoningLevel = normalizeReasoningEffort(
-              (reasoning_effort as string) || (asRecord(reasoning)['effort'] as string),
-              null,
-            );
-
-            const requestParams: Record<string, unknown> = {
-              temperature: typeof temperature === 'number' ? temperature : 0.7,
-              max_tokens: typeof max_tokens === 'number' ? max_tokens : null,
-              top_p: typeof top_p === 'number' ? top_p : 1.0,
-              frequency_penalty: typeof frequency_penalty === 'number' ? frequency_penalty : 0,
-              presence_penalty: typeof presence_penalty === 'number' ? presence_penalty : 0,
-              stop: Array.isArray(stop) ? stop : stop ? [stop] : null,
-              reasoning_effort: reasoningLevel,
-            };
-
-            logDebug('Request params', {
-              temperature: requestParams['temperature'],
-              max_tokens: requestParams['max_tokens'],
-              top_p: requestParams['top_p'],
-              reasoning_effort: reasoningLevel,
-            });
-
-            const resolvedModel = await withTimeout(
-              resolveRequestedModel(model),
-              REQUEST_TIMEOUT_MS,
-              'resolve model',
-            ) as unknown as { providerID: string; modelID: string; aliasFrom?: string; resolved?: string };
-            const resolvedRecord = asRecord(resolvedModel);
-            pID = String(resolvedRecord['providerID'] ?? pID);
-            mID = String(resolvedRecord['modelID'] ?? mID);
-            if (resolvedRecord['aliasFrom']) {
-              logDebug('Resolved model alias', { from: resolvedRecord['aliasFrom'], to: resolvedRecord['resolved'] });
-            }
-
             const normalizeMessageContent = (content: unknown): string => normalizeTextContent(content);
 
             const buildPromptParts = async (
@@ -1284,13 +1283,8 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
       } catch (error: unknown) {
         console.error('[Proxy] Request Handler Error:', toErrorMessage(error));
         if (!res.headersSent) {
-          const er = asRecord(error);
-          res.status(500).json({
-            error: {
-              message: toErrorMessage(error),
-              type: error instanceof Error ? error.constructor.name : String(er['name'] ?? 'Error'),
-            },
-          });
+          const transformed = transformUpstreamError(error);
+          res.status(transformed.statusCode).json(transformed.error);
         } else if (!res.writableEnded && !res.destroyed) {
           try {
             const transformed = transformUpstreamError(error);

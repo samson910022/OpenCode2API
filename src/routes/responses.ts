@@ -1162,72 +1162,132 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
            }
          };
 
+        let recoverySnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
+        let recoveryPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> | null = null;
         let collected: Record<string, unknown> | null = null;
-        try {
-          if (fallbackToProxy) {
-            // SSE subscribe ignores custom fetch (SDK gap): prompt through the
-            // proxy bundle; the poll below (line ~614) fills content/reasoning.
-            await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-          } else {
-            const collectPromise = collectFromEvents(
-              sessionId as string,
-              REQUEST_TIMEOUT_MS,
-              sendResponsesDelta,
-               DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-               DEFAULT_EVENT_IDLE_TIMEOUT_MS,
-               responsesAbortController.signal,
-             );
+        let lastStreamAttemptError: unknown = null;
 
-             const safeCollect = collectPromise.catch((err: unknown) => ({ __error: err }));
-             activeClient.session.prompt(promptParams).catch((err: unknown) => logDebug('Responses prompt error:', toErrorMessage(err)));
-             const closePromise = getResponsesResClosed();
-             const raced = closePromise
-               ? await Promise.race([safeCollect, closePromise.then(() => ({ __cancelled: true }))])
-               : await safeCollect;
-            const racedRecord = asRecord(raced);
-            if (racedRecord['__cancelled']) {
-              stopResponsesKeepalive();
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          if (attempt > 1) {
+            const retriedSessionId = sessionId;
+            if (retriedSessionId && retriedSessionId !== previousState?.sessionId) {
               try {
-                if (!res.destroyed) res.end();
-              } catch {
-                // ignore
+                await activeClient.session.delete({ path: { id: retriedSessionId } });
+              } catch (e: unknown) {
+                logDebug('Failed to delete retried responses session', { sessionId: retriedSessionId, error: toErrorMessage(e) });
               }
-              return;
             }
-            collected = raced as Record<string, unknown>;
+            const retrySessionRes = (await withTimeout(
+              activeClient.session.create(),
+              REQUEST_TIMEOUT_MS,
+              'create session',
+            )) as unknown;
+            sessionId = (asRecord(asRecord(retrySessionRes)['data'])['id'] as string | undefined) ?? null;
+            if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
+            ownedResponsesSessionId = sessionId;
+            promptParams.path.id = sessionId;
+            requestForcedResponsesToolCall = makeForcedResponsesToolCallRequester();
+            content = '';
+            reasoning = '';
+            rawContent = '';
+            rawReasoning = '';
+            streamedToolCalls.length = 0;
+            filterContentDelta = createToolCallFilter({
+              disableTools: DISABLE_TOOLS,
+              forceStrip: shouldBufferExternalStream,
+              registry: externalToolRegistry,
+            });
+            filterReasoningDelta = createToolCallFilter({
+              disableTools: DISABLE_TOOLS,
+              forceStrip: shouldBufferExternalStream,
+              registry: externalToolRegistry,
+            });
+            parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+            parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+            recoverySnapshot = null;
+            recoveryPromise = null;
+            await sleep(computeRetryDelay(attempt - 1, lastStreamAttemptError));
           }
-        } catch (e: unknown) {
-          collected = { __error: e };
+          try {
+            if (fallbackToProxy) {
+              // SSE subscribe ignores custom fetch (SDK gap): prompt through the
+              // proxy bundle; the poll below (line ~614) fills content/reasoning.
+              await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+            } else {
+              const collectPromise = collectFromEvents(
+                sessionId as string,
+                REQUEST_TIMEOUT_MS,
+                sendResponsesDelta,
+                DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
+                DEFAULT_EVENT_IDLE_TIMEOUT_MS,
+                responsesAbortController.signal,
+              );
+
+              const safeCollect = collectPromise.catch((err: unknown) => ({ __error: err }));
+              activeClient.session.prompt(promptParams).catch((err: unknown) => logDebug('Responses prompt error:', toErrorMessage(err)));
+              const closePromise = getResponsesResClosed();
+              const raced = closePromise
+                ? await Promise.race([safeCollect, closePromise.then(() => ({ __cancelled: true }))])
+                : await safeCollect;
+              const racedRecord = asRecord(raced);
+              if (racedRecord['__cancelled']) {
+                stopResponsesKeepalive();
+                try {
+                  if (!res.destroyed) res.end();
+                } catch {
+                  // ignore
+                }
+                return;
+              }
+              collected = raced as Record<string, unknown>;
+            }
+          } catch (e: unknown) {
+            collected = { __error: e };
+          }
+
+          const collectedRecord = asRecord(collected);
+          const attemptError: unknown = collectedRecord['error'] ?? collectedRecord['__error'] ?? null;
+          const nothingStreamed = !rawContent && !rawReasoning && streamedToolCalls.length === 0;
+          if (attemptError && nothingStreamed && attempt < maxAttempts && engageProxyFallback(attemptError)) {
+            lastStreamAttemptError = attemptError;
+            continue;
+          }
+          if (attemptError && nothingStreamed && attempt < maxAttempts && isTransientUpstreamError(attemptError)) {
+            console.warn(
+              `[Proxy] Transient upstream error in responses stream (attempt ${attempt}/${maxAttempts}), retrying:`,
+              readDataMessage(attemptError),
+            );
+            lastStreamAttemptError = attemptError;
+            continue;
+          }
+          break;
         }
 
-          const collectedR = asRecord(collected);
-          if (responsesAbortController.signal.aborted || collectedR['cancelled']) {
-            stopResponsesKeepalive();
-            return;
-          }
-          if (collectedR['error'] != null) {
-
-           throw normalizeBackendError(collectedR['error']);
-         }
+        const collectedR = asRecord(collected);
+        if (responsesAbortController.signal.aborted || collectedR['cancelled']) {
+          stopResponsesKeepalive();
+          return;
+        }
+        if (collectedR['error'] != null) {
+          throw normalizeBackendError(collectedR['error']);
+        }
         let streamSearchToolParts: unknown[] = [];
         const keepStreamToolParts = (polled: { toolParts?: unknown }): void => {
           if (hostedSearch.requested && Array.isArray(polled.toolParts) && polled.toolParts.length > 0) {
             streamSearchToolParts = polled.toolParts;
           }
         };
-         let recoverySnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
-         let recoveryPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> | null = null;
-         const pollRecoverySnapshot = (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> => {
-           if (!recoveryPromise) {
-             recoveryPromise = activePollForAssistantResponse(
-               sessionId as string,
-               REQUEST_TIMEOUT_MS,
-               undefined,
-               responsesAbortController.signal,
-             );
-           }
-           return recoveryPromise;
-         };
+        const pollRecoverySnapshot = (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> => {
+          if (!recoveryPromise) {
+            recoveryPromise = activePollForAssistantResponse(
+              sessionId as string,
+              REQUEST_TIMEOUT_MS,
+              undefined,
+              responsesAbortController.signal,
+            );
+          }
+          return recoveryPromise;
+        };
          const hasPartialOutput = (): boolean => Boolean(
            rawContent || rawReasoning || streamedToolCalls.length > 0 || content || reasoning,
          );

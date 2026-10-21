@@ -24,7 +24,7 @@ import {
   buildProxyConfig,
   DEFAULT_REQUEST_TIMEOUT_MS,
 } from './config/proxy-config.js';
-import { buildBackendAuthHeaders, ensureBackend, backendState } from './backend/manager.js';
+import { buildBackendAuthHeaders, ensureBackend, backendState, onBackendReconnect } from './backend/manager.js';
 import { createCollector } from './stream/collector.js';
 import { createProxyPool } from './upstream-proxy/pool.js';
 import { registerChatRoutes } from './routes/chat.js';
@@ -169,11 +169,35 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   app.use(bodyParser.json({ limit: '50mb' }));
   app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
+  const PROVIDERS_CACHE_TTL_MS = 30_000;
+  let cachedProvidersList: ProviderInfo[] | null = null;
+  let cachedProvidersAt = 0;
+
+  const invalidateProvidersCache = (): void => {
+    cachedProvidersList = null;
+    cachedProvidersAt = 0;
+  };
+
+  onBackendReconnect(invalidateProvidersCache);
+
   const getProvidersList = async (): Promise<ProviderInfo[]> => {
-    const providersRes = (await client.config.providers()) as unknown;
-    const providersRaw: unknown = asRecord(asRecord(providersRes)['data'])['providers'] ?? [];
-    if (Array.isArray(providersRaw)) return providersRaw as ProviderInfo[];
-    return Object.entries(asRecord(providersRaw)).map(([id, info]) => ({ ...(asRecord(info) as object), id }) as ProviderInfo);
+    const now = Date.now();
+    if (cachedProvidersList && now - cachedProvidersAt < PROVIDERS_CACHE_TTL_MS) {
+      return cachedProvidersList;
+    }
+    try {
+      const providersRes = (await client.config.providers()) as unknown;
+      const providersRaw: unknown = asRecord(asRecord(providersRes)['data'])['providers'] ?? [];
+      const list = Array.isArray(providersRaw)
+        ? (providersRaw as ProviderInfo[])
+        : Object.entries(asRecord(providersRaw)).map(([id, info]) => ({ ...(asRecord(info) as object), id }) as ProviderInfo);
+      cachedProvidersList = list;
+      cachedProvidersAt = Date.now();
+      return list;
+    } catch (err: unknown) {
+      invalidateProvidersCache();
+      throw err;
+    }
   };
 
   const buildModelsList = (providersList: unknown): ModelInfo[] => {
@@ -1042,6 +1066,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     maxRetries,
     maxAttempts,
     getProvidersList,
+    invalidateProvidersCache,
     buildModelsList,
     normalizeModelID,
     resolveRequestedModel,
@@ -1110,7 +1135,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   registerNotFoundRoute(app);
   registerErrorHandler(app);
 
-  return { app, client };
+  return { app, client, ctx };
 }
 
 /**
