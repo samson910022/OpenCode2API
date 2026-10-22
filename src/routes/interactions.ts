@@ -14,6 +14,7 @@
 //   throw immediately with no generic transient backoff.
 // - `store:false` skips persistence and deletes the session after responding.
 import crypto from 'crypto';
+import { makeId } from '../converters/json.js';
 import { withTimeout } from '../config/proxy-config.js';
 import { computeRetryDelay } from '../retry/policy.js';
 import { ensureActiveModel } from '../backend/active-model.js';
@@ -323,6 +324,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           parts,
         },
       };
+      promptParams.body.messageID = makeId('msg');
       // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
       const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
       if (promptToolOverrides) {
@@ -333,6 +335,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       // session; transient 5xx / rate-limit errors retry with exponential backoff
       // (bounded by maxAttempts like the other routes).
       const parentSessionId = previousState?.sessionId ?? null;
+      let promptSubmitted = false;
       const promptAndPoll = async (): Promise<{
         content: string;
         reasoning: string;
@@ -344,6 +347,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           if (res.destroyed || res.writableEnded) throw new Error('Client disconnected');
           if (attempt > 1) {
             if (!parentSessionId) {
+              promptSubmitted = false;
               const currentId = sessionId as string;
               if (currentId) {
                 try {
@@ -367,13 +371,16 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
             await awaitWithAbort(sleep(computeRetryDelay(attempt - 1, lastErr)), requestAbortController.signal);
           }
           try {
-             await awaitWithAbort(activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS), requestAbortController.signal);
-             const polled = await activePollForAssistantResponse(
-               sessionId as string,
-               REQUEST_TIMEOUT_MS,
-               undefined,
-               requestAbortController.signal,
-             );
+            if (!(parentSessionId && promptSubmitted)) {
+              await awaitWithAbort(activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS), requestAbortController.signal);
+              promptSubmitted = true;
+            }
+            const polled = await activePollForAssistantResponse(
+              sessionId as string,
+              REQUEST_TIMEOUT_MS,
+              undefined,
+              requestAbortController.signal,
+            );
 
             if (polled.error && !polled.content && !polled.reasoning) throw normalizeBackendError(polled.error);
             return polled;

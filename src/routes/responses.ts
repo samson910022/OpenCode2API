@@ -1,5 +1,6 @@
 // P4 TS: POST /v1/responses (ported from P3 .js, behavior identical).
 import crypto from 'crypto';
+import { makeId } from '../converters/json.js';
 import {
   ADDITIONAL_TOOLS_ITEM_TYPE,
   collectAdditionalToolSources,
@@ -776,6 +777,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           ...(top_p !== undefined ? { top_p } : {}),
         },
       };
+      promptParams.body.messageID = makeId('msg');
       // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
       const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
       if (promptToolOverrides) {
@@ -1185,12 +1187,15 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         let collected: Record<string, unknown> | null = null;
         let lastStreamAttemptError: unknown = null;
         const isContinuation = Boolean(previousState?.sessionId);
+        let promptSubmitted = false;
+        let promptPromise: Promise<unknown> | null = null;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
           collected = null;
           if (attempt > 1) {
             const retriedSessionId = sessionId;
             if (!isContinuation) {
+              promptSubmitted = false;
               if (retriedSessionId) {
                 try {
                   await activeClient.session.delete({ path: { id: retriedSessionId } });
@@ -1210,6 +1215,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             } else {
               sessionId = previousState!.sessionId;
               promptParams.path.id = sessionId;
+              if (promptPromise) {
+                await promptPromise.catch(() => {});
+              }
             }
             requestForcedResponsesToolCall = makeForcedResponsesToolCallRequester();
             content = '';
@@ -1238,7 +1246,10 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             if (fallbackToProxy) {
               // SSE subscribe ignores custom fetch (SDK gap): prompt through the
               // proxy bundle; the poll below fills content/reasoning.
-              await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+              if (!(isContinuation && promptSubmitted)) {
+                await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                promptSubmitted = true;
+              }
               const pres = await pollRecoverySnapshot();
               if (pres.error != null) {
                 collected = { error: pres.error };
@@ -1262,7 +1273,15 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               );
 
               const safeCollect = collectPromise.catch((err: unknown) => ({ __error: err }));
-              activeClient.session.prompt(promptParams).catch((err: unknown) => logDebug('Responses prompt error:', toErrorMessage(err)));
+              if (isContinuation && promptSubmitted) {
+                // Do NOT prompt again!
+              } else {
+                promptPromise = activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS)
+                  .then(() => {
+                    promptSubmitted = true;
+                  })
+                  .catch((err: unknown) => logDebug('Responses prompt error:', toErrorMessage(err)));
+              }
               const closePromise = getResponsesResClosed();
               const raced = closePromise
                 ? await Promise.race([safeCollect, closePromise.then(() => ({ __cancelled: true }))])
@@ -1699,14 +1718,16 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       let polledFilled = false;
       let lastResponsesAttemptError: unknown = null;
       let searchToolParts: unknown[] = [];
+      const isNonStreamContinuation = Boolean(previousState?.sessionId);
+      let promptSubmitted = false;
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         if (res.writableEnded || res.destroyed) {
           logDebug('Client gone, stop retrying', { sessionId, attempt });
           return;
         }
         if (attempt > 1) {
-          const isNonStreamContinuation = Boolean(previousState?.sessionId);
           if (!isNonStreamContinuation) {
+            promptSubmitted = false;
             const retriedSessionId = sessionId;
             if (ownedResponsesSessionId === retriedSessionId) ownedResponsesSessionId = null;
             if (retriedSessionId) {
@@ -1730,29 +1751,38 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         }
         let polledResponse: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
         try {
-          responseRes = await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-          const dataParts: unknown = asRecord(asRecord(responseRes)['data'])['parts'];
-          responseParts = Array.isArray(dataParts) ? (dataParts as unknown[]) : [];
-          promptContent = responseParts
-            .filter((p) => asRecord(p)['type'] === 'text')
-            .map((p) => String(asRecord(p)['text'] ?? ''))
-            .join('\n');
-          promptReasoning = responseParts
-            .filter((p) => asRecord(p)['type'] === 'reasoning')
-            .map((p) => String(asRecord(p)['text'] ?? ''))
-            .join('\n');
-                      promptParsedToolCalls =
-             externalToolRegistry.length > 0
-               ? parseExternalToolCallsFromJoinedText(externalToolRegistry, promptReasoning, promptContent)
-               : [];
-          if (promptContent || promptReasoning) break;
-           polledResponse = await activePollForAssistantResponse(
-             sessionId as string,
-             REQUEST_TIMEOUT_MS,
-             undefined,
-             responsesAbortController.signal,
-           );
-
+          if (isNonStreamContinuation && promptSubmitted) {
+            polledResponse = await activePollForAssistantResponse(
+              sessionId as string,
+              REQUEST_TIMEOUT_MS,
+              undefined,
+              responsesAbortController.signal,
+            );
+          } else {
+            responseRes = await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+            promptSubmitted = true;
+            const dataParts: unknown = asRecord(asRecord(responseRes)['data'])['parts'];
+            responseParts = Array.isArray(dataParts) ? (dataParts as unknown[]) : [];
+            promptContent = responseParts
+              .filter((p) => asRecord(p)['type'] === 'text')
+              .map((p) => String(asRecord(p)['text'] ?? ''))
+              .join('\n');
+            promptReasoning = responseParts
+              .filter((p) => asRecord(p)['type'] === 'reasoning')
+              .map((p) => String(asRecord(p)['text'] ?? ''))
+              .join('\n');
+            promptParsedToolCalls =
+              externalToolRegistry.length > 0
+                ? parseExternalToolCallsFromJoinedText(externalToolRegistry, promptReasoning, promptContent)
+                : [];
+            if (promptContent || promptReasoning) break;
+            polledResponse = await activePollForAssistantResponse(
+              sessionId as string,
+              REQUEST_TIMEOUT_MS,
+              undefined,
+              responsesAbortController.signal,
+            );
+          }
         } catch (loopError: unknown) {
           if (attempt < maxAttempts && engageProxyFallback(loopError)) {
             lastResponsesAttemptError = loopError;

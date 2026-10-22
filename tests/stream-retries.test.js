@@ -615,6 +615,228 @@ describe('Provider List Caching', () => {
         expect(deletedIds).not.toContain('parent-session-123');
     });
 
+    test('Responses continuation 503 retry does not duplicate user prompt in stateful session transcript', async () => {
+        const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
+
+        const transcript = [];
+        let isTurn2 = false;
+        let sessionPromptTurn2Calls = 0;
+        let capturedMessageId = null;
+
+        sdkMocks.sessionPrompt.mockImplementation(async (params) => {
+            transcript.push({ role: 'user', content: params.body.parts });
+            if (isTurn2) {
+                sessionPromptTurn2Calls += 1;
+                capturedMessageId = params.body?.messageID;
+            }
+            return { data: { parts: [{ type: 'text', text: isTurn2 ? 'turn 2' : 'turn 1' }] } };
+        });
+
+        sdkMocks.sessionMessages.mockResolvedValue([
+            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1' }] }
+        ]);
+        sdkMocks.sessionCreate.mockResolvedValueOnce({ data: { id: 'stateful-parent-session-123' } });
+
+        // Turn 1: seed parent session
+        const seedRes = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/kimi-k2.5', input: 'first turn' });
+        expect(seedRes.status).toBe(200);
+        const prevId = seedRes.body.id;
+        expect(transcript).toHaveLength(1);
+
+        // Turn 2: continuation turn
+        // Attempt 1 succeeds in persisting user prompt, but SSE event stream emits 503 session.error
+        isTurn2 = true;
+        let attempt = 0;
+        sdkMocks.eventSubscribe.mockImplementation(async () => {
+            attempt += 1;
+            const currentAttempt = attempt;
+            return {
+                stream: (async function* () {
+                    if (currentAttempt === 1) {
+                        yield {
+                            type: 'session.error',
+                            properties: {
+                                sessionID: 'stateful-parent-session-123',
+                                error: {
+                                    name: 'APIError',
+                                    data: { statusCode: 503, message: 'Endpoint is unavailable.', responseHeaders: { 'retry-after-ms': '5' } }
+                                }
+                            }
+                        };
+                    } else {
+                        yield {
+                            type: 'message.part.updated',
+                            properties: { part: { type: 'text', sessionID: 'stateful-parent-session-123' }, delta: 'turn 2 success' }
+                        };
+                        yield {
+                            type: 'message.updated',
+                            properties: { info: { sessionID: 'stateful-parent-session-123', finish: 'stop' } }
+                        };
+                    }
+                })()
+            };
+        });
+
+        const contRes = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'second turn',
+                stream: true,
+                previous_response_id: prevId,
+            });
+
+        expect(contRes.status).toBe(200);
+        expect(contRes.text).toContain('turn 2 success');
+        expect(contRes.text).toContain('response.completed');
+
+        // Assert sdkMocks.sessionPrompt is called only once for Turn 2
+        expect(sessionPromptTurn2Calls).toBe(1);
+        expect(capturedMessageId).toMatch(/^msg/);
+        // Assert session transcript has only one instance of Turn 2 user prompt (no duplicate)
+        const turn2Entries = transcript.filter((t) =>
+            JSON.stringify(t.content).includes('second turn'),
+        );
+        expect(turn2Entries).toHaveLength(1);
+    });
+
+    test('Responses non-stream continuation 503 retry does not duplicate user prompt in stateful session transcript', async () => {
+        const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
+
+        const transcript = [];
+        let isTurn2 = false;
+        let sessionPromptTurn2Calls = 0;
+
+        sdkMocks.sessionMessages.mockResolvedValue([
+            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1 nonstream' }] }
+        ]);
+        sdkMocks.sessionCreate.mockResolvedValueOnce({ data: { id: 'stateful-parent-nonstream-789' } });
+
+        sdkMocks.sessionPrompt.mockImplementation(async (params) => {
+            transcript.push({ role: 'user', content: params.body.parts });
+            if (isTurn2) {
+                sessionPromptTurn2Calls += 1;
+            }
+            return { data: { parts: [{ type: 'text', text: isTurn2 ? 'turn 2 nonstream' : 'turn 1 nonstream' }] } };
+        });
+
+        const seedRes = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/kimi-k2.5', input: 'first turn nonstream' });
+        expect(seedRes.status).toBe(200);
+        const prevId = seedRes.body.id;
+        expect(transcript).toHaveLength(1);
+
+        isTurn2 = true;
+        let pollCount = 0;
+        // In continuation turn 2: sessionPrompt returns empty parts so it polls, and poll attempt 1 fails with 503
+        sdkMocks.sessionPrompt.mockImplementation(async (params) => {
+            transcript.push({ role: 'user', content: params.body.parts });
+            if (isTurn2) {
+                sessionPromptTurn2Calls += 1;
+            }
+            return { data: { parts: [] } };
+        });
+
+        sdkMocks.sessionMessages.mockImplementation(async () => {
+            pollCount += 1;
+            if (pollCount === 1) {
+                const err = new Error('Endpoint is unavailable.');
+                err.data = { statusCode: 503, message: 'Endpoint is unavailable.', responseHeaders: { 'retry-after-ms': '5' } };
+                throw err;
+            }
+            return [
+                { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 2 nonstream success' }] }
+            ];
+        });
+
+        const contRes = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'second turn nonstream',
+                previous_response_id: prevId,
+            });
+
+        expect(contRes.status).toBe(200);
+        expect(contRes.body.output[0].content[0].text).toBe('turn 2 nonstream success');
+        expect(sessionPromptTurn2Calls).toBe(1);
+        const turn2Entries = transcript.filter((t) =>
+            JSON.stringify(t.content).includes('second turn nonstream'),
+        );
+        expect(turn2Entries).toHaveLength(1);
+    });
+
+    test('Interactions continuation 503 retry does not duplicate user prompt in stateful session transcript', async () => {
+        const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
+
+        const transcript = [];
+        let isTurn2 = false;
+        let sessionPromptTurn2Calls = 0;
+        let capturedMessageId = null;
+
+        sdkMocks.sessionCreate.mockResolvedValueOnce({ data: { id: 'intr-stateful-parent-456' } });
+        sdkMocks.sessionPrompt.mockImplementation(async (params) => {
+            transcript.push({ role: 'user', content: params.body.parts });
+            if (isTurn2) {
+                sessionPromptTurn2Calls += 1;
+                capturedMessageId = params.body?.messageID;
+            }
+            return { data: { parts: [] } };
+        });
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1 intr' }] }
+        ]);
+
+        const seedRes = await request(app)
+            .post('/v1beta/interactions')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'first turn',
+                store: true,
+            });
+        expect(seedRes.status).toBe(200);
+        const prevIntrId = seedRes.body.id;
+        expect(transcript).toHaveLength(1);
+
+        isTurn2 = true;
+        let pollCount = 0;
+        sdkMocks.sessionMessages.mockImplementation(async () => {
+            pollCount += 1;
+            if (pollCount === 1) {
+                const err = new Error('Endpoint is unavailable.');
+                err.data = { statusCode: 503, message: 'Endpoint is unavailable.', responseHeaders: { 'retry-after-ms': '5' } };
+                throw err;
+            }
+            return [
+                { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 2 intr success' }] }
+            ];
+        });
+
+        const contRes = await request(app)
+            .post('/v1beta/interactions')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'second turn',
+                previous_interaction_id: prevIntrId,
+            });
+
+        expect(contRes.status).toBe(200);
+        expect(contRes.body.output_text).toBe('turn 2 intr success');
+        expect(sessionPromptTurn2Calls).toBe(1);
+        expect(capturedMessageId).toMatch(/^msg/);
+        const turn2Entries = transcript.filter((t) =>
+            JSON.stringify(t.content).includes('second turn'),
+        );
+        expect(turn2Entries).toHaveLength(1);
+    });
+
     test('Interactions continuation 503 retry preserves parent session AND does not call session.create()', async () => {
         const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
 
