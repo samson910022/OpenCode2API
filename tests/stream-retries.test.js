@@ -620,7 +620,7 @@ describe('Provider List Caching', () => {
         }
     });
 
-    test('Responses continuation 503 retry preserves parent session AND does not call session.create()', async () => {
+    test('Responses continuation 503 fails closed, preserves parent session AND does not call session.create()', async () => {
         const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
 
         sdkMocks.sessionMessages.mockResolvedValue([
@@ -635,7 +635,7 @@ describe('Provider List Caching', () => {
         expect(seedRes.status).toBe(200);
         const prevId = seedRes.body.id;
 
-        // 2. Continuation turn: attempt 1 fails with transient 503 error event, attempt 2 preserves parent session and succeeds
+        // 2. Continuation turn: attempt 1 fails with transient 503 error event, fails closed without creating new session or deleting parent session
         let attempt = 0;
         sdkMocks.eventSubscribe.mockImplementation(async () => {
             attempt += 1;
@@ -675,16 +675,17 @@ describe('Provider List Caching', () => {
             .send({ model: 'opencode/kimi-k2.5', input: 'second turn', stream: true, previous_response_id: prevId });
 
         expect(contRes.status).toBe(200);
-        expect(contRes.text).toContain('turn 2 success');
-        expect(contRes.text).toContain('response.completed');
+        expect(contRes.text).toContain('response.failed');
+        expect(contRes.text).toContain('Endpoint is unavailable.');
+        expect(contRes.text).not.toContain('turn 2 success');
 
-        // Verify parent session was NOT deleted and session.create() was NOT called on retry
+        // Verify parent session was NOT deleted and session.create() was NOT called
         expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
         const deletedIds = sdkMocks.sessionDelete.mock.calls.map(c => c[0]?.path?.id);
         expect(deletedIds).not.toContain('parent-session-123');
     });
 
-    test('Responses continuation 503 retry does not duplicate user prompt in stateful session transcript', async () => {
+    test('Responses continuation 503 fails closed and does not duplicate user prompt in stateful session transcript', async () => {
         const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
 
         const transcript = [];
@@ -760,12 +761,13 @@ describe('Provider List Caching', () => {
             });
 
         expect(contRes.status).toBe(200);
-        expect(contRes.text).toContain('turn 2 success');
-        expect(contRes.text).toContain('response.completed');
+        expect(contRes.text).toContain('response.failed');
+        expect(contRes.text).toContain('Endpoint is unavailable.');
+        expect(contRes.text).not.toContain('turn 2 success');
 
         // Assert sdkMocks.sessionPrompt is called only once for Turn 2
         expect(sessionPromptTurn2Calls).toBe(1);
-        expect(capturedMessageId).toMatch(/^msg/);
+        expect(capturedMessageId).toMatch(/^msg_/);
         // Assert session transcript has only one instance of Turn 2 user prompt (no duplicate)
         const turn2Entries = transcript.filter((t) =>
             JSON.stringify(t.content).includes('second turn'),
@@ -773,12 +775,13 @@ describe('Provider List Caching', () => {
         expect(turn2Entries).toHaveLength(1);
     });
 
-    test('Responses non-stream continuation 503 retry does not duplicate user prompt in stateful session transcript', async () => {
+    test('Responses non-stream continuation 503 fails closed without duplicate user prompt in stateful session transcript', async () => {
         const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
 
         const transcript = [];
         let isTurn2 = false;
         let sessionPromptTurn2Calls = 0;
+        let capturedMessageId = null;
 
         sdkMocks.sessionMessages.mockResolvedValue([
             { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1 nonstream' }] }
@@ -789,6 +792,7 @@ describe('Provider List Caching', () => {
             transcript.push({ role: 'user', content: params.body.parts });
             if (isTurn2) {
                 sessionPromptTurn2Calls += 1;
+                capturedMessageId = params.body?.messageID;
             }
             return { data: { parts: [{ type: 'text', text: isTurn2 ? 'turn 2 nonstream' : 'turn 1 nonstream' }] } };
         });
@@ -808,6 +812,7 @@ describe('Provider List Caching', () => {
             transcript.push({ role: 'user', content: params.body.parts });
             if (isTurn2) {
                 sessionPromptTurn2Calls += 1;
+                capturedMessageId = params.body?.messageID;
             }
             return { data: { parts: [] } };
         });
@@ -816,6 +821,7 @@ describe('Provider List Caching', () => {
             pollCount += 1;
             if (pollCount === 1) {
                 const err = new Error('Endpoint is unavailable.');
+                err.statusCode = 503;
                 err.data = { statusCode: 503, message: 'Endpoint is unavailable.', responseHeaders: { 'retry-after-ms': '5' } };
                 throw err;
             }
@@ -833,16 +839,17 @@ describe('Provider List Caching', () => {
                 previous_response_id: prevId,
             });
 
-        expect(contRes.status).toBe(200);
-        expect(contRes.body.output[0].content[0].text).toBe('turn 2 nonstream success');
+        expect(contRes.status).toBe(503);
+        expect(contRes.body.message).toContain('Endpoint is unavailable.');
         expect(sessionPromptTurn2Calls).toBe(1);
+        expect(capturedMessageId).toMatch(/^msg_/);
         const turn2Entries = transcript.filter((t) =>
             JSON.stringify(t.content).includes('second turn nonstream'),
         );
         expect(turn2Entries).toHaveLength(1);
     });
 
-    test('Interactions continuation 503 retry does not duplicate user prompt in stateful session transcript', async () => {
+    test('Interactions continuation 503 fails closed without duplicate user prompt in stateful session transcript', async () => {
         const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
 
         const transcript = [];
@@ -880,6 +887,7 @@ describe('Provider List Caching', () => {
             pollCount += 1;
             if (pollCount === 1) {
                 const err = new Error('Endpoint is unavailable.');
+                err.statusCode = 503;
                 err.data = { statusCode: 503, message: 'Endpoint is unavailable.', responseHeaders: { 'retry-after-ms': '5' } };
                 throw err;
             }
@@ -896,10 +904,10 @@ describe('Provider List Caching', () => {
                 previous_interaction_id: prevIntrId,
             });
 
-        expect(contRes.status).toBe(200);
-        expect(contRes.body.output_text).toBe('turn 2 intr success');
+        expect(contRes.status).toBe(503);
+        expect(contRes.body.message).toContain('Endpoint is unavailable.');
         expect(sessionPromptTurn2Calls).toBe(1);
-        expect(capturedMessageId).toMatch(/^msg/);
+        expect(capturedMessageId).toMatch(/^msg_/);
         const turn2Entries = transcript.filter((t) =>
             JSON.stringify(t.content).includes('second turn'),
         );

@@ -777,7 +777,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           ...(top_p !== undefined ? { top_p } : {}),
         },
       };
-      promptParams.body.messageID = makeId('msg');
+      promptParams.body.messageID = makeId('msg_');
       // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
       const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
       if (promptToolOverrides) {
@@ -1324,6 +1324,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             }
           }
           const nothingStreamed = !rawContent && !rawReasoning && streamedToolCalls.length === 0;
+          if (isContinuation && promptSubmitted && attemptError) {
+            throw normalizeBackendError(attemptError);
+          }
           if (attemptError && nothingStreamed && attempt < maxAttempts && engageProxyFallback(attemptError)) {
             lastStreamAttemptError = attemptError;
             continue;
@@ -1786,6 +1789,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             );
           }
         } catch (loopError: unknown) {
+          if (isNonStreamContinuation && promptSubmitted) {
+            throw normalizeBackendError(loopError);
+          }
           if (attempt < maxAttempts && engageProxyFallback(loopError)) {
             lastResponsesAttemptError = loopError;
             continue;
@@ -1802,6 +1808,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         }
         const polledError = polledResponse?.error ?? (polledResponse?.partial === true ? new Error('Polling returned incomplete response') : null);
         if (polledResponse && polledError != null) {
+          if (isNonStreamContinuation && promptSubmitted) {
+            throw normalizeBackendError(polledError);
+          }
           if (attempt < maxAttempts && engageProxyFallback(polledError)) {
             lastResponsesAttemptError = polledError;
             continue;

@@ -324,7 +324,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           parts,
         },
       };
-      promptParams.body.messageID = makeId('msg');
+      promptParams.body.messageID = makeId('msg_');
       // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
       const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
       if (promptToolOverrides) {
@@ -388,6 +388,9 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
             return polled;
           } catch (e: unknown) {
             lastErr = e;
+            if (parentSessionId && promptSubmitted) {
+              throw normalizeBackendError(e);
+            }
             if (attempt < maxAttempts && engageProxyFallback(e)) continue;
             if (attempt < maxAttempts && isTransientUpstreamError(e)) {
               console.warn(
