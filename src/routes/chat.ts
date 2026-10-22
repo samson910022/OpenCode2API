@@ -573,10 +573,10 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
 
                let collected: Record<string, unknown> | null = null;
                let lastStreamAttemptError: unknown = null;
-               let polledSnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
+               let polledSnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null = null;
                let snapshotPolled = false;
-               let snapshotPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> | null = null;
-               const pollSnapshot = async (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> => {
+               let snapshotPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> | null = null;
+               const pollSnapshot = async (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> => {
                  snapshotPolled = true;
                  if (!snapshotPromise) {
                     snapshotPromise = activePollForAssistantResponse(
@@ -607,41 +607,27 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   if (remainingReasoning) sendDelta(remainingReasoning, true);
                   if (remainingContent) sendDelta(remainingContent, false);
                 };
-                const hasPartialOutput = (): boolean => {
-                  const current = asRecord(collected);
-                  return Boolean(
-                    rawStreamedContent ||
-                    rawStreamedReasoning ||
-                    streamedToolCalls.length > 0 ||
-                    current['content'] ||
-                    current['reasoning'],
-                  );
-                };
                 const recoverSnapshot = async (
                   fallbackError: unknown = null,
-                ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown } | null> => {
+                ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null> => {
                   if (clientDisconnected) return null;
-                  let snapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown };
+                  let snapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean };
                   try {
                     snapshot = await pollSnapshot();
                   } catch (error: unknown) {
                     if (clientDisconnected) return null;
-                    if (hasPartialOutput()) {
-                      logDebug('Ignoring recovery poll failure after partial stream output', { error: toErrorMessage(error) });
-                      return null;
-                    }
                     if (fallbackError != null) throw fallbackError;
                     throw error;
                   }
-                   if (snapshot.error != null) throw snapshot.error;
-                   if (
-                     fallbackError != null &&
-                     !snapshot.content &&
-                     !snapshot.reasoning &&
-                     !(Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0)
-                   ) throw fallbackError;
-                   return snapshot;
-
+                  if (snapshot.error != null) throw snapshot.error;
+                  if (snapshot.partial === true) throw new Error('Recovery poll returned incomplete response');
+                  if (
+                    fallbackError != null &&
+                    !snapshot.content &&
+                    !snapshot.reasoning &&
+                    !(Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0)
+                  ) throw fallbackError;
+                  return snapshot;
                 };
 
               for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -668,6 +654,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                     polledSnapshot = null;
                     snapshotPolled = false;
                     snapshotPromise = null;
+                    fallbackServed = false;
                    filterContentDelta = createToolCallFilter({
                      disableTools: DISABLE_TOOLS,
                      forceStrip: shouldBufferExternalStream,
@@ -830,6 +817,10 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   }
                 }
 
+                if (!hasValidTerminal && !polledSnapshot && !fallbackServed) {
+                  throw new Error('Stream ended without valid terminal');
+                }
+
 
               const flushedReasoningCalls = parseReasoningToolCalls.flush ? parseReasoningToolCalls.flush() : [];
               const flushedContentCalls = parseContentToolCalls.flush ? parseContentToolCalls.flush() : [];
@@ -865,6 +856,12 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               const streamSource = (): string[][] => [[authoritativeSource.reasoning, authoritativeSource.content]];
 
               if (!shouldBufferExternalStream) {
+                if (rawStreamedContent && authoritativeSource.content && !authoritativeSource.content.startsWith(rawStreamedContent)) {
+                  throw new Error('Stream content diverged from authoritative snapshot');
+                }
+                if (rawStreamedReasoning && authoritativeSource.reasoning && !authoritativeSource.reasoning.startsWith(rawStreamedReasoning)) {
+                  throw new Error('Stream reasoning diverged from authoritative snapshot');
+                }
                 appendFilteredDelta(flushedReasoningText, true);
                 appendFilteredDelta(flushedContentText, false);
                 writeVisibleDelta(flushedReasoningText, true);

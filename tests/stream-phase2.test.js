@@ -73,6 +73,17 @@ const { createCollector } = await import('../src/stream/collector.js');
 describe('Phase 2: SSE Framing, Keepalives, Headers, and Wire Integrity', () => {
     beforeEach(() => {
         jest.clearAllMocks();
+        sdkMocks.sessionMessages.mockReset();
+        sdkMocks.sessionMessages.mockImplementation(async () => ([
+            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'Mock response' }] }
+        ]));
+        sdkMocks.eventSubscribe.mockReset();
+        sdkMocks.eventSubscribe.mockImplementation(async () => ({
+            stream: (async function* () {
+                yield { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: SESSION_ID }, delta: 'Hello' } };
+                yield { type: 'message.updated', properties: { info: { sessionID: SESSION_ID, finish: 'stop' } } };
+            })()
+        }));
     });
 
     const buildApp = (overrides = {}) => createApp({
@@ -440,6 +451,125 @@ describe('Phase 2: SSE Framing, Keepalives, Headers, and Wire Integrity', () => 
                 expect(clearTimeoutSpy).toHaveBeenCalled();
             } finally {
                 clearTimeoutSpy.mockRestore();
+            }
+        });
+    });
+
+    describe('6. Premature cut and divergence fail closed (P1-1 & P1-2)', () => {
+        const routeCases = [
+            ['chat', '/v1/chat/completions', { model: 'big-pickle', stream: true, messages: [{ role: 'user', content: 'hi' }] }],
+            ['messages', '/v1/messages', { model: 'big-pickle', stream: true, max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] }],
+            ['responses', '/v1/responses', { model: 'big-pickle', stream: true, input: 'hi' }]
+        ];
+
+        test.each(routeCases)('%s delta -> cut -> recovery poll throws 503 fails closed without success terminal', async (name, endpoint, payload) => {
+            sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+                stream: (async function* () {
+                    yield {
+                        type: 'message.part.updated',
+                        properties: { part: { id: 'p1', type: 'text', sessionID: SESSION_ID }, delta: 'Hello text' }
+                    };
+                })()
+            }));
+            sdkMocks.sessionMessages.mockImplementationOnce(async () => {
+                const err = new Error('Backend 503 Service Unavailable');
+                err.status = 503;
+                throw err;
+            });
+
+            const res = await request(buildApp())
+                .post(endpoint)
+                .set('Authorization', 'Bearer test-key')
+                .set('anthropic-version', '2023-06-01')
+                .send(payload);
+
+            expect(res.headers['content-type']).toContain('text/event-stream');
+            if (name === 'chat') {
+                expect(res.text).toContain('error');
+                expect(res.text).not.toContain('data: [DONE]');
+                expect(res.text).not.toContain('"finish_reason":"stop"');
+            } else if (name === 'messages') {
+                expect(res.text).toContain('event: error');
+                expect(res.text).not.toContain('message_stop');
+                expect(res.text).not.toContain('end_turn');
+                expect(res.text).not.toContain('message_delta');
+            } else if (name === 'responses') {
+                expect(res.text).toContain('response.failed');
+                expect(res.text).not.toContain('response.completed');
+            }
+        });
+
+        test.each(routeCases)('%s delta -> cut -> recovery poll returns partial: true fails closed without success terminal', async (name, endpoint, payload) => {
+            sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+                stream: (async function* () {
+                    yield {
+                        type: 'message.part.updated',
+                        properties: { part: { id: 'p1', type: 'text', sessionID: SESSION_ID }, delta: 'Hello text' }
+                    };
+                })()
+            }));
+            sdkMocks.sessionMessages.mockImplementation(async () => ([{
+                info: { role: 'assistant' },
+                parts: [{ type: 'text', text: 'Partial text that times out' }]
+            }]));
+
+            const res = await request(buildApp({ REQUEST_TIMEOUT_MS: 40 }))
+                .post(endpoint)
+                .set('Authorization', 'Bearer test-key')
+                .set('anthropic-version', '2023-06-01')
+                .send(payload);
+
+            expect(res.headers['content-type']).toContain('text/event-stream');
+            expect(res.text).toContain('Recovery poll returned incomplete response');
+            if (name === 'chat') {
+                expect(res.text).not.toContain('data: [DONE]');
+                expect(res.text).not.toContain('"finish_reason":"stop"');
+            } else if (name === 'messages') {
+                expect(res.text).toContain('event: error');
+                expect(res.text).not.toContain('message_stop');
+                expect(res.text).not.toContain('end_turn');
+                expect(res.text).not.toContain('message_delta');
+            } else if (name === 'responses') {
+                expect(res.text).toContain('response.failed');
+                expect(res.text).not.toContain('response.completed');
+            }
+        });
+
+        test.each(routeCases)('%s raw = "AC" / snapshot = "ABC" divergence on unbuffered text stream fails closed with protocol error', async (name, endpoint, payload) => {
+            sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+                stream: (async function* () {
+                    yield {
+                        type: 'message.part.updated',
+                        properties: { part: { id: 'p1', type: 'text', sessionID: SESSION_ID }, delta: 'AC' }
+                    };
+                })()
+            }));
+            sdkMocks.sessionMessages.mockResolvedValueOnce([
+                {
+                    info: { role: 'assistant', finish: 'stop' },
+                    parts: [{ type: 'text', text: 'ABC' }]
+                }
+            ]);
+
+            const res = await request(buildApp())
+                .post(endpoint)
+                .set('Authorization', 'Bearer test-key')
+                .set('anthropic-version', '2023-06-01')
+                .send(payload);
+
+            expect(res.headers['content-type']).toContain('text/event-stream');
+            expect(res.text).toContain('Stream content diverged from authoritative snapshot');
+            if (name === 'chat') {
+                expect(res.text).not.toContain('data: [DONE]');
+                expect(res.text).not.toContain('"finish_reason":"stop"');
+            } else if (name === 'messages') {
+                expect(res.text).toContain('event: error');
+                expect(res.text).not.toContain('message_stop');
+                expect(res.text).not.toContain('end_turn');
+                expect(res.text).not.toContain('message_delta');
+            } else if (name === 'responses') {
+                expect(res.text).toContain('response.failed');
+                expect(res.text).not.toContain('response.completed');
             }
         });
     });

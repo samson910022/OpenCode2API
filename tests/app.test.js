@@ -1214,7 +1214,7 @@ describe('Proxy OpenAI API', () => {
             const mockEvents = [
                 {
                     type: 'message.part.updated',
-                    properties: { part: { type: 'text', sessionID: sessionId }, delta: 'I need to search. ' }
+                    properties: { part: { id: 'p1', type: 'text', sessionID: sessionId }, delta: 'I need to search. ' }
                 },
                 {
                     type: 'message.updated',
@@ -1223,15 +1223,15 @@ describe('Proxy OpenAI API', () => {
                             sessionID: sessionId,
                             finish: 'stop',
                             parts: [
-                                { type: 'text', text: 'I need to search. ' },
-                                { type: 'tool', id: 'call_internal_1', tool: 'web_fetch', state: { status: 'pending', input: { url: 'https://example.com/weather' } } }
+                                { id: 'p1', type: 'text', text: 'I need to search. ' },
+                                { id: 'call_internal_1', type: 'tool', tool: 'web_fetch', state: { status: 'pending', input: { url: 'https://example.com/weather' } } }
                             ]
                         }
                     }
                 },
                 {
                     type: 'message.part.updated',
-                    properties: { part: { type: 'text', sessionID: sessionId }, delta: 'The weather is 14C.' }
+                    properties: { part: { id: 'p2', type: 'text', sessionID: sessionId }, delta: 'The weather is 14C.' }
                 },
                 {
                     type: 'message.updated',
@@ -1240,8 +1240,8 @@ describe('Proxy OpenAI API', () => {
                             sessionID: sessionId,
                             finish: 'stop',
                             parts: [
-                                { type: 'tool', id: 'call_internal_1', tool: 'web_fetch', state: { status: 'completed', input: { url: 'https://example.com/weather' }, output: '14C' } },
-                                { type: 'text', text: 'The weather is 14C.' }
+                                { id: 'call_internal_1', type: 'tool', tool: 'web_fetch', state: { status: 'completed', input: { url: 'https://example.com/weather' }, output: '14C' } },
+                                { id: 'p2', type: 'text', text: 'The weather is 14C.' }
                             ]
                         }
                     }
@@ -1368,9 +1368,9 @@ describe('Proxy OpenAI API', () => {
         expect(streamed).toContain('Done: 42.');
     });
 
-    test('polling fallback returns the last partial snapshot when the timeout is reached', async () => {
-        // If the message never reports completion, the partial text still beats throwing a
-        // timeout error and losing everything the model produced.
+    test('polling fallback fails closed when timeout is reached with partial response', async () => {
+        // When the message never reports completion and poll reaches timeout, recovery poll
+        // returns partial: true and must fail closed rather than emitting success.
         sdkMocks.sessionMessages.mockImplementation(async () => ([{
             info: { role: 'assistant' },
             parts: [{ type: 'text', text: 'Partial answer that never completes' }]
@@ -1398,7 +1398,9 @@ describe('Proxy OpenAI API', () => {
             });
 
         expect(res.statusCode).toEqual(200);
-        expect(res.text).toContain('Partial answer that never completes');
+        expect(res.text).toContain('Recovery poll returned incomplete response');
+        expect(res.text).not.toContain('data: [DONE]');
+        expect(res.text).not.toContain('"finish_reason":"stop"');
     });
 
     test('streaming surfaces an upstream message error without waiting out the first-delta window', async () => {
@@ -3074,7 +3076,7 @@ describe('Proxy Responses API previous_response_id', () => {
             ['chat', '/v1/chat/completions', { ...chatStreamPayload, tools: [readTool] }],
             ['messages', '/v1/messages', { ...messagesStreamPayload, tools: [{ name: 'read', description: 'Read a file', input_schema: readTool.function.parameters }] }],
             ['responses', '/v1/responses', { model: 'opencode/kimi-k2.5', input: 'Read a file', stream: true, tools: [{ type: 'function', name: 'read', parameters: readTool.function.parameters }] }]
-        ])('%s preserves partial output when recovery polling fails', async (_label, path, payload) => {
+        ])('%s fails closed when recovery polling fails', async (label, path, payload) => {
             sdkMocks.eventSubscribe.mockImplementationOnce(eventStreamThenThrow([
                 { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: 'partial answer' } }
             ]));
@@ -3085,8 +3087,16 @@ describe('Proxy Responses API previous_response_id', () => {
                 .set('anthropic-version', '2023-06-01')
                 .send(payload);
             expect(res.statusCode).toBe(200);
-            expect(visibleTextFor(path, res.text).join('')).toBe('partial answer');
-            expect(res.text).not.toContain('poll failed');
+            expect(res.text).toMatch(/event stream cut|poll failed/);
+            if (label === 'chat') {
+                expect(res.text).not.toContain('data: [DONE]');
+                expect(res.text).not.toContain('finish_reason');
+            } else if (label === 'messages') {
+                expect(res.text).not.toContain('message_stop');
+                expect(res.text).not.toContain('message_delta');
+            } else if (label === 'responses') {
+                expect(res.text).not.toContain('response.completed');
+            }
         });
 
         test.each([

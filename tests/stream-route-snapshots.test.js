@@ -184,7 +184,7 @@ describe('route snapshot source selection', () => {
         expect(res.text).not.toMatch(/"error"\s*:\s*\{/);
     });
 
-    test.each(payloads)('%s keeps a complete raw tool call when the poll snapshot is a timeout partial', async (_label, path, payload) => {
+    test.each(payloads)('%s fails closed when the poll snapshot is a timeout partial', async (label, path, payload) => {
         // finish=tool means the polled message is never terminal, so the poll
         // returns lastPartial with partial: true after the request timeout.
         sdkMocks.sessionMessages.mockResolvedValue([
@@ -196,12 +196,16 @@ describe('route snapshot source selection', () => {
             .set('anthropic-version', '2023-06-01')
             .send(payload);
         expect(res.statusCode).toBe(200);
-        expect(visibleTextFor(path, res.text).join('')).toBe('');
-        const calls = toolCallsFor(path, res.text);
-        expect(calls).toHaveLength(1);
-        expect(calls[0]).toMatchObject({ name: 'read' });
-        expect(JSON.stringify(calls[0].arguments)).toContain('a.txt');
-        expect(res.text).not.toContain('response.failed');
+        expect(res.text).toContain('Recovery poll returned incomplete response');
+        if (label === 'chat') {
+            expect(res.text).not.toContain('data: [DONE]');
+            expect(res.text).not.toContain('finish_reason');
+        } else if (label === 'messages') {
+            expect(res.text).not.toContain('message_stop');
+            expect(res.text).not.toContain('message_delta');
+        } else if (label === 'responses') {
+            expect(res.text).not.toContain('response.completed');
+        }
     }, 15000);
 
     test.each(payloads)('%s delivers only snapshot tool call (b.txt) and does not combine raw streamed call (a.txt)', async (_label, path, payload) => {

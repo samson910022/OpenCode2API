@@ -220,6 +220,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
         let activePromptWithTimeout = promptWithTimeout;
         let activePollForAssistantResponse = pollForAssistantResponse;
         let fallbackToProxy = false;
+        let fallbackServed = false;
         const switchToProxyBundle = (): boolean => {
           if (!proxyClient) return false;
           activeClient = proxyClient;
@@ -640,10 +641,10 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
              else sendTextDelta(filtered);
           };
            let collected: Record<string, unknown> | null = null;
-           let polledSnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
+           let polledSnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null = null;
            let snapshotPolled = false;
-           let snapshotPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> | null = null;
-           const pollSnapshot = async (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> => {
+           let snapshotPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> | null = null;
+           const pollSnapshot = async (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> => {
              snapshotPolled = true;
              if (!snapshotPromise) {
                  snapshotPromise = activePollForAssistantResponse(
@@ -666,27 +667,20 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
              if (!raw) return text;
              return text.startsWith(raw) ? text.slice(raw.length) : '';
            };
-           const hasPartialOutput = (): boolean => {
-             const current = asRecord(collected);
-             return Boolean(rawContent || rawReasoning || streamedToolCalls.length > 0 || current['content'] || current['reasoning']);
-           };
            const recoverSnapshot = async (
              fallbackError: unknown = null,
-           ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown } | null> => {
+           ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null> => {
              if (res.destroyed || res.writableEnded) return null;
-             let snapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown };
+             let snapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean };
              try {
                snapshot = await pollSnapshot();
              } catch (error: unknown) {
                if (res.destroyed || res.writableEnded) return null;
-               if (hasPartialOutput()) {
-                 logDebug('Ignoring messages recovery poll failure after partial stream output', { error: toErrorMessage(error) });
-                 return null;
-               }
                if (fallbackError != null) throw normalizeBackendError(fallbackError);
                throw normalizeBackendError(error);
              }
-             if (snapshot.error != null) throw normalizeBackendError(snapshot.error);
+             if (snapshot.error != null) throw snapshot.error;
+             if (snapshot.partial === true) throw new Error('Recovery poll returned incomplete response');
              if (
                fallbackError != null &&
                !snapshot.content &&
@@ -739,6 +733,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
               nextBlockIndex = 0;
               textIndex = null;
               thinkingIndex = null;
+              fallbackServed = false;
               await sleep(computeRetryDelay(attempt - 1, lastStreamAttemptError));
             }
             try {
@@ -758,6 +753,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                 const presReasoning = unsentSuffix(pres.reasoning, rawReasoning);
                 if (presContent) sendDelta(presContent, false);
                 if (presReasoning) sendDelta(presReasoning, true);
+                if (pres.content || pres.reasoning) fallbackServed = true;
                 collected = { content: pres.content, reasoning: pres.reasoning };
               } else {
                 const collectPromise = collectFromEvents(
@@ -801,6 +797,8 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                 const recovery = await pollSnapshot();
                 if (recovery.error != null) {
                   attemptError = recovery.error;
+                } else if (recovery.partial === true) {
+                  attemptError = new Error('Recovery poll returned incomplete response');
                 } else {
                   polledSnapshot = recovery;
                   const presContent = unsentSuffix(recovery.content, rawContent);
@@ -874,6 +872,9 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                  if (remainingContent) sendDelta(remainingContent, false);
                }
              }
+            if (!hasValidTerminal && !polledSnapshot && !fallbackServed) {
+              throw new Error('Stream ended without valid terminal');
+            }
            if (requestAbortController.signal.aborted || res.destroyed || res.writableEnded) {
              if (sessionId && !disconnectedSessionCleaned) {
                try {
@@ -911,6 +912,12 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
              streamedReasoning = visible.reasoning;
              streamedText = visible.content;
            } else {
+             if (rawContent && authoritativeSource.content && !authoritativeSource.content.startsWith(rawContent)) {
+               throw new Error('Stream content diverged from authoritative snapshot');
+             }
+             if (rawReasoning && authoritativeSource.reasoning && !authoritativeSource.reasoning.startsWith(rawReasoning)) {
+               throw new Error('Stream reasoning diverged from authoritative snapshot');
+             }
              if (flushedReasoningText) sendReasoningDelta(flushedReasoningText);
              if (flushedContentText) sendTextDelta(flushedContentText);
              if (!streamedText && !streamedReasoning) {

@@ -236,6 +236,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
     let activePromptWithTimeout = promptWithTimeout;
     let activePollForAssistantResponse = pollForAssistantResponse;
     let fallbackToProxy = false;
+    let fallbackServed = false;
     let ownedResponsesSessionId: string | null = null;
     let responsesStreamState: ResponsesStreamState | null = null;
     const cleanupOwnedResponsesSession = async (): Promise<void> => {
@@ -1168,9 +1169,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             streamSearchToolParts = polled.toolParts;
           }
         };
-        let recoverySnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
-        let recoveryPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> | null = null;
-        const pollRecoverySnapshot = (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> => {
+        let recoverySnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null = null;
+        let recoveryPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> | null = null;
+        const pollRecoverySnapshot = (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> => {
           if (!recoveryPromise) {
             recoveryPromise = activePollForAssistantResponse(
               sessionId as string,
@@ -1230,6 +1231,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
             recoverySnapshot = null;
             recoveryPromise = null;
+            fallbackServed = false;
             await sleep(computeRetryDelay(attempt - 1, lastStreamAttemptError));
           }
           try {
@@ -1245,6 +1247,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
                 keepStreamToolParts(pres);
                 if (pres.content || pres.reasoning) {
                   replaySnapshotText(pres.content, pres.reasoning);
+                  fallbackServed = true;
                 }
                 collected = { content: pres.content, reasoning: pres.reasoning, toolParts: pres.toolParts };
               }
@@ -1287,6 +1290,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               const recovery = await pollRecoverySnapshot();
               if (recovery.error != null) {
                 attemptError = recovery.error;
+              } else if (recovery.partial === true) {
+                attemptError = new Error('Recovery poll returned incomplete response');
               } else {
                 recoverySnapshot = recovery;
                 keepStreamToolParts(recovery);
@@ -1321,9 +1326,6 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         if (collectedR['error'] != null) {
           throw normalizeBackendError(collectedR['error']);
         }
-         const hasPartialOutput = (): boolean => Boolean(
-           rawContent || rawReasoning || streamedToolCalls.length > 0 || content || reasoning,
-         );
          const hasValidTerminal = Boolean(
            collected &&
            !collectedR['__error'] &&
@@ -1343,21 +1345,18 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
          );
          const recoverSnapshot = async (
            fallbackError: unknown = null,
-         ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown } | null> => {
+         ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null> => {
            if (responsesAbortController.signal.aborted) return null;
-           let polled: { content: string; reasoning: string; error: unknown; toolParts?: unknown };
+           let polled: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean };
            try {
              polled = await pollRecoverySnapshot();
            } catch (error: unknown) {
              if (responsesAbortController.signal.aborted) return null;
-             if (hasPartialOutput()) {
-               logDebug('Ignoring responses recovery poll failure after partial stream output', { error: toErrorMessage(error) });
-               return null;
-             }
              if (fallbackError != null) throw normalizeBackendError(fallbackError);
              throw normalizeBackendError(error);
            }
-           if (polled.error != null) throw normalizeBackendError(polled.error);
+           if (polled.error != null) throw polled.error;
+           if (polled.partial === true) throw new Error('Recovery poll returned incomplete response');
            if (
              fallbackError != null &&
              !polled.content &&
@@ -1396,7 +1395,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
 
          if (responsesAbortController.signal.aborted) return;
 
-         let polledForToolCalls: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
+         let polledForToolCalls: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null = null;
          if (externalToolRegistry.length > 0 && !hasValidTerminal && !recoveryPromise) {
            const polled = await recoverSnapshot();
            if (polled) {
@@ -1405,6 +1404,10 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
                replaySnapshotText(polled.content, polled.reasoning);
              }
            }
+         }
+
+         if (!hasValidTerminal && !recoverySnapshot && !fallbackServed) {
+           throw new Error('Stream ended without valid terminal');
          }
 
 
@@ -1451,6 +1454,12 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
            reasoning = visible.reasoning;
            content = visible.content;
          } else if (!deferVisibleOutput) {
+           if (rawContent && authoritativeSource.content && !authoritativeSource.content.startsWith(rawContent)) {
+             throw new Error('Stream content diverged from authoritative snapshot');
+           }
+           if (rawReasoning && authoritativeSource.reasoning && !authoritativeSource.reasoning.startsWith(rawReasoning)) {
+             throw new Error('Stream reasoning diverged from authoritative snapshot');
+           }
            writeVisibleDelta(flushedReasoningText, true);
            writeVisibleDelta(flushedContentText, false);
          }
