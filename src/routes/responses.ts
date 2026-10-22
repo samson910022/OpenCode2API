@@ -1253,6 +1253,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               const pres = await pollRecoverySnapshot();
               if (pres.error != null) {
                 collected = { error: pres.error };
+              } else if (pres.partial === true) {
+                collected = { error: new Error('Recovery poll returned incomplete response') };
               } else {
                 recoverySnapshot = pres;
                 keepStreamToolParts(pres);
@@ -1749,7 +1751,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           requestForcedResponsesToolCall = makeForcedResponsesToolCallRequester();
           await sleep(computeRetryDelay(attempt - 1, lastResponsesAttemptError));
         }
-        let polledResponse: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
+        let polledResponse: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null = null;
         try {
           if (isNonStreamContinuation && promptSubmitted) {
             polledResponse = await activePollForAssistantResponse(
@@ -1798,20 +1800,21 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           }
           throw normalizeBackendError(loopError);
         }
-                  if (polledResponse && polledResponse.error != null) {
-          if (attempt < maxAttempts && engageProxyFallback(polledResponse.error)) {
-            lastResponsesAttemptError = polledResponse.error;
+        const polledError = polledResponse?.error ?? (polledResponse?.partial === true ? new Error('Polling returned incomplete response') : null);
+        if (polledResponse && polledError != null) {
+          if (attempt < maxAttempts && engageProxyFallback(polledError)) {
+            lastResponsesAttemptError = polledError;
             continue;
           }
-          if (attempt < maxAttempts && isTransientUpstreamError(polledResponse.error)) {
+          if (attempt < maxAttempts && isTransientUpstreamError(polledError)) {
             console.warn(
               `[Proxy] Transient upstream error (attempt ${attempt}/${maxAttempts}), retrying:`,
-              readDataMessage(polledResponse.error),
+              readDataMessage(polledError),
             );
-            lastResponsesAttemptError = polledResponse.error;
+            lastResponsesAttemptError = polledError;
             continue;
           }
-          throw normalizeBackendError(polledResponse.error);
+          throw normalizeBackendError(polledError);
         }
         if (polledResponse) {
           content = polledResponse.content || content;

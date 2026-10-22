@@ -477,7 +477,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
 
                 content = collected.content || '';
                 reasoning = collected.reasoning || '';
-                error = collected.error || null;
+                error = collected.error || (collected.partial === true ? new Error('Polling returned incomplete response') : null);
               } catch (promptError: unknown) {
                 content = '';
                 reasoning = '';
@@ -744,6 +744,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                 const pres = await pollSnapshot();
                 polledSnapshot = pres;
                 if (pres.error != null) throw normalizeBackendError(pres.error);
+                if (pres.partial === true) throw new Error('Recovery poll returned incomplete response');
                 if (res.destroyed || res.writableEnded) {
                   if (keepaliveInterval) clearInterval(keepaliveInterval);
                   return;

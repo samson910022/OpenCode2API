@@ -677,8 +677,10 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                     // through the proxy bundle instead of the event stream.
                     // Deltas go out immediately so the post-loop poll is skipped.
                     await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-                     const pres = (await pollSnapshot()) as { content: string; reasoning: string; error: unknown };
-                     polledSnapshot = pres;
+                    const pres = (await pollSnapshot()) as { content: string; reasoning: string; error: unknown; partial?: boolean };
+                    polledSnapshot = pres;
+                    if (pres.error != null) throw pres.error;
+                    if (pres.partial === true) throw new Error('Recovery poll returned incomplete response');
                     const presReasoning = unsentSuffix(pres.reasoning, rawStreamedReasoning);
                     const presContent = unsentSuffix(pres.content, rawStreamedContent);
                     if (presReasoning) sendDelta(presReasoning, true);
@@ -689,7 +691,6 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                     collected = {
                       content: pres.content,
                       reasoning: pres.reasoning,
-                      ...(pres.error ? { error: pres.error } : {}),
                     };
                   } else {
                     const collectPromise = collectFromEvents(
@@ -1093,7 +1094,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
 
                   content = collected.content || '';
                   reasoning = collected.reasoning || '';
-                  error = collected.error || null;
+                  error = collected.error || (collected.partial === true ? new Error('Polling returned incomplete response') : null);
                 } catch (promptError: unknown) {
                   content = '';
                   reasoning = '';

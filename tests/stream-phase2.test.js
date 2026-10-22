@@ -573,4 +573,175 @@ describe('Phase 2: SSE Framing, Keepalives, Headers, and Wire Integrity', () => 
             }
         });
     });
+
+    describe('7. Poll completion validation and fail-closed behavior (P1-1)', () => {
+        const streamCases = [
+            ['chat', '/v1/chat/completions', { model: 'big-pickle', stream: true, messages: [{ role: 'user', content: 'hi' }] }],
+            ['messages', '/v1/messages', { model: 'big-pickle', stream: true, max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] }],
+            ['responses', '/v1/responses', { model: 'big-pickle', stream: true, input: 'hi' }]
+        ];
+
+        const nonStreamCases = [
+            ['chat', '/v1/chat/completions', { model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] }],
+            ['messages', '/v1/messages', { model: 'big-pickle', max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] }],
+            ['responses', '/v1/responses', { model: 'big-pickle', input: 'hi' }]
+        ];
+
+        function freeUsageError() {
+            return {
+                name: 'APIError',
+                data: {
+                    message: 'Rate limit exceeded. Please try again later.',
+                    statusCode: 429,
+                    isRetryable: true,
+                    responseBody: '{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded."}}',
+                },
+            };
+        }
+
+        const buildProxyApp = (overrides = {}) => createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 40,
+            RETRY_MAX_RETRIES: 1,
+            DISABLE_TOOLS: true,
+            DEBUG: false,
+            UPSTREAM_PROXIES: ['http://10.0.0.1:8080'],
+            UPSTREAM_PROXY_COOLDOWN_MS: 60000,
+            ...overrides,
+        }).app;
+
+        async function armProxyFallback(app) {
+            sdkMocks.sessionPrompt.mockRejectedValueOnce(freeUsageError());
+            const armRes = await request(app)
+                .post('/v1/messages')
+                .set('Authorization', 'Bearer test-key')
+                .set('anthropic-version', '2023-06-01')
+                .send({ model: 'big-pickle', max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] });
+            expect(armRes.statusCode).toBe(200);
+        }
+
+        test.each(streamCases)('%s proxy-mode stream when poll returns partial: true fails closed without success terminal', async (name, endpoint, payload) => {
+            const app = buildProxyApp();
+            await armProxyFallback(app);
+
+            sdkMocks.sessionMessages.mockImplementation(async () => ([{
+                info: { role: 'assistant' },
+                parts: [{ type: 'text', text: 'Partial text that times out' }]
+            }]));
+
+            const res = await request(app)
+                .post(endpoint)
+                .set('Authorization', 'Bearer test-key')
+                .set('anthropic-version', '2023-06-01')
+                .send(payload);
+
+            expect(res.headers['content-type']).toContain('text/event-stream');
+            if (name === 'chat') {
+                expect(res.text).not.toContain('data: [DONE]');
+                expect(res.text).not.toContain('"finish_reason":"stop"');
+            } else if (name === 'messages') {
+                expect(res.text).toContain('event: error');
+                expect(res.text).not.toContain('message_stop');
+                expect(res.text).not.toContain('end_turn');
+            } else if (name === 'responses') {
+                expect(res.text).toContain('response.failed');
+                expect(res.text).not.toContain('response.completed');
+            }
+        });
+
+        test.each(nonStreamCases)('%s non-stream when poll returns partial: true fails closed with error status', async (name, endpoint, payload) => {
+            sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [] } }));
+            sdkMocks.sessionMessages.mockImplementation(async () => ([{
+                info: { role: 'assistant' },
+                parts: [{ type: 'text', text: 'Partial text that times out' }]
+            }]));
+
+            const res = await request(buildApp({ REQUEST_TIMEOUT_MS: 40, RETRY_MAX_RETRIES: 0 }))
+                .post(endpoint)
+                .set('Authorization', 'Bearer test-key')
+                .set('anthropic-version', '2023-06-01')
+                .send(payload);
+
+            expect(res.statusCode).toBeGreaterThanOrEqual(400);
+            expect(res.statusCode).not.toBe(200);
+        });
+
+        test('interactions non-stream when poll returns partial: true fails closed with error status', async () => {
+            sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [] } }));
+            sdkMocks.sessionMessages.mockImplementation(async () => ([{
+                info: { role: 'assistant' },
+                parts: [{ type: 'text', text: 'Partial interaction text' }]
+            }]));
+
+            const res = await request(buildApp({ REQUEST_TIMEOUT_MS: 40, RETRY_MAX_RETRIES: 0 }))
+                .post('/v1beta/interactions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'big-pickle', input: 'hi' });
+
+            expect(res.statusCode).toBeGreaterThanOrEqual(400);
+            expect(res.statusCode).not.toBe(200);
+            expect(res.body?.status).not.toBe('completed');
+        });
+
+        test('interactions stream when poll returns partial: true fails closed without interaction.completed', async () => {
+            sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [] } }));
+            sdkMocks.sessionMessages.mockImplementation(async () => ([{
+                info: { role: 'assistant' },
+                parts: [{ type: 'text', text: 'Partial interaction text' }]
+            }]));
+
+            const res = await request(buildApp({ REQUEST_TIMEOUT_MS: 40, RETRY_MAX_RETRIES: 0 }))
+                .post('/v1beta/interactions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'big-pickle', input: 'hi', stream: true });
+
+            expect(res.headers['content-type']).toContain('text/event-stream');
+            expect(res.text).toContain('"type":"error"');
+            expect(res.text).not.toContain('interaction.completed');
+        });
+
+        test('interactions non-stream when poll returns error != null with text fails closed with error status', async () => {
+            sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [] } }));
+            sdkMocks.sessionMessages.mockImplementation(async () => ([{
+                info: {
+                    role: 'assistant',
+                    finish: 'stop',
+                    error: { name: 'AssistantError', message: 'Failed mid-turn' }
+                },
+                parts: [{ type: 'text', text: 'Some text generated before error' }]
+            }]));
+
+            const res = await request(buildApp({ REQUEST_TIMEOUT_MS: 40, RETRY_MAX_RETRIES: 0 }))
+                .post('/v1beta/interactions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'big-pickle', input: 'hi' });
+
+            expect(res.statusCode).toBeGreaterThanOrEqual(400);
+            expect(res.statusCode).not.toBe(200);
+            expect(res.body?.status).not.toBe('completed');
+        });
+
+        test('interactions stream when poll returns error != null with text fails closed without interaction.completed', async () => {
+            sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [] } }));
+            sdkMocks.sessionMessages.mockImplementation(async () => ([{
+                info: {
+                    role: 'assistant',
+                    finish: 'stop',
+                    error: { name: 'AssistantError', message: 'Failed mid-turn' }
+                },
+                parts: [{ type: 'text', text: 'Some text generated before error' }]
+            }]));
+
+            const res = await request(buildApp({ REQUEST_TIMEOUT_MS: 40, RETRY_MAX_RETRIES: 0 }))
+                .post('/v1beta/interactions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'big-pickle', input: 'hi', stream: true });
+
+            expect(res.headers['content-type']).toContain('text/event-stream');
+            expect(res.text).toContain('"type":"error"');
+            expect(res.text).not.toContain('interaction.completed');
+        });
+    });
 });

@@ -341,6 +341,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         reasoning: string;
         error: unknown;
         toolParts?: unknown;
+        partial?: boolean;
       }> => {
         let lastErr: unknown = null;
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -382,7 +383,8 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
               requestAbortController.signal,
             );
 
-            if (polled.error && !polled.content && !polled.reasoning) throw normalizeBackendError(polled.error);
+            if (polled.error != null) throw normalizeBackendError(polled.error);
+            if (polled.partial === true) throw new Error('Polling returned incomplete response');
             return polled;
           } catch (e: unknown) {
             lastErr = e;
