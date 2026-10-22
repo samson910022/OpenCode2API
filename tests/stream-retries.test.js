@@ -551,6 +551,75 @@ describe('Provider List Caching', () => {
         expect(sdkMocks.configProviders).toHaveBeenCalledTimes(1);
     });
 
+    test('Provider cache reconnect race: in-flight providers call does not restore invalidated cache on late resolution', async () => {
+        sdkMocks.configProviders.mockClear();
+        const { ctx } = createApp(baseConfig({}));
+
+        let resolveInFlight;
+        const inFlightBackendPromise = new Promise((resolve) => {
+            resolveInFlight = resolve;
+        });
+
+        let callCount = 0;
+        sdkMocks.configProviders.mockImplementation(async () => {
+            callCount += 1;
+            if (callCount === 1) {
+                return inFlightBackendPromise;
+            }
+            return {
+                data: {
+                    providers: [{
+                        id: 'fresh-opencode',
+                        models: { 'fresh-model': { name: 'Fresh Model' } }
+                    }]
+                }
+            };
+        });
+
+        try {
+            // 1. First fetch starts and remains in flight
+            const flight1Promise = ctx.getProvidersList();
+            expect(callCount).toBe(1);
+
+            // 2. Trigger backend reconnect/invalidation while fetch is in flight
+            notifyBackendReconnect();
+
+            // 3. The in-flight fetch resolves late with stale provider info
+            resolveInFlight({
+                data: {
+                    providers: [{
+                        id: 'stale-opencode',
+                        models: { 'stale-model': { name: 'Stale Model' } }
+                    }]
+                }
+            });
+
+            const flight1Result = await flight1Promise;
+            expect(flight1Result[0].id).toBe('stale-opencode');
+
+            // 4. Stale data must not overwrite the invalidated cache; subsequent call triggers fresh fetch
+            const freshResult = await ctx.getProvidersList();
+            expect(freshResult[0].id).toBe('fresh-opencode');
+            expect(sdkMocks.configProviders).toHaveBeenCalledTimes(2);
+
+            // 5. Subsequent call hits the fresh cache
+            const cachedFresh = await ctx.getProvidersList();
+            expect(cachedFresh[0].id).toBe('fresh-opencode');
+            expect(sdkMocks.configProviders).toHaveBeenCalledTimes(2);
+        } finally {
+            sdkMocks.configProviders.mockImplementation(async () => ({
+                data: {
+                    providers: [{
+                        id: 'opencode',
+                        models: {
+                            'kimi-k2.5': { name: 'Kimi k2.5' }
+                        }
+                    }]
+                }
+            }));
+        }
+    });
+
     test('Responses continuation 503 retry preserves parent session AND does not call session.create()', async () => {
         const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
 

@@ -174,8 +174,10 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   let cachedProvidersList: ProviderInfo[] | null = null;
   let cachedProvidersAt = 0;
   let pendingProvidersPromise: Promise<ProviderInfo[]> | null = null;
+  let providersCacheEpoch = 0;
 
   const invalidateProvidersCache = (): void => {
+    providersCacheEpoch += 1;
     cachedProvidersList = null;
     cachedProvidersAt = 0;
     pendingProvidersPromise = null;
@@ -191,6 +193,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     if (pendingProvidersPromise) {
       return pendingProvidersPromise;
     }
+    const epoch = providersCacheEpoch;
     pendingProvidersPromise = (async () => {
       try {
         const providersRes = (await client.config.providers()) as unknown;
@@ -198,14 +201,20 @@ export function createApp(config: ProxyConfig): CreateAppResult {
         const list = Array.isArray(providersRaw)
           ? (providersRaw as ProviderInfo[])
           : Object.entries(asRecord(providersRaw)).map(([id, info]) => ({ ...(asRecord(info) as object), id }) as ProviderInfo);
-        cachedProvidersList = list;
-        cachedProvidersAt = Date.now();
+        if (providersCacheEpoch === epoch) {
+          cachedProvidersList = list;
+          cachedProvidersAt = Date.now();
+        }
         return list;
       } catch (err: unknown) {
-        invalidateProvidersCache();
+        if (providersCacheEpoch === epoch) {
+          invalidateProvidersCache();
+        }
         throw err;
       } finally {
-        pendingProvidersPromise = null;
+        if (providersCacheEpoch === epoch) {
+          pendingProvidersPromise = null;
+        }
       }
     })();
     return pendingProvidersPromise;
