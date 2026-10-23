@@ -242,10 +242,10 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
     let responsesStreamState: ResponsesStreamState | null = null;
     const cleanupOwnedResponsesSession = async (): Promise<void> => {
       const ownedSessionId = ownedResponsesSessionId;
-      ownedResponsesSessionId = null;
       if (!ownedSessionId) return;
       try {
         await activeClient.session.delete({ path: { id: ownedSessionId } });
+        if (ownedResponsesSessionId === ownedSessionId) ownedResponsesSessionId = null;
       } catch (error: unknown) {
         logDebug('Failed to cleanup owned responses session', { sessionId: ownedSessionId, error: toErrorMessage(error) });
       }
@@ -365,7 +365,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       const previousState =
         typeof previousResponseId === 'string' && previousResponseId ? getResponseState(previousResponseId) : null;
       if (stream) responsesStreamState = initializeResponsesStream(model, previousState?.model, tools, parallelToolCalls);
-      if (previousResponseId && !previousState) {
+      if (previousResponseId && (!previousState || !previousState.checkpointId)) {
         rejectInvalidRequest('Invalid or expired previous_response_id', 'invalid_previous_response_id');
         return;
       }
@@ -658,8 +658,19 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         // ignore
       }
 
-      let sessionId: string | null = previousState?.sessionId || null;
-      if (!sessionId) {
+      let sessionId: string | null = null;
+      if (previousState) {
+        const forkRes = (await withTimeout(
+          activeClient.session.fork({
+            path: { id: previousState.sessionId },
+          }),
+          REQUEST_TIMEOUT_MS,
+          'fork continuation session',
+        )) as unknown;
+        sessionId = (asRecord(asRecord(forkRes)['data'])['id'] as string | undefined) ?? null;
+        if (!sessionId) throw new Error('Failed to fork OpenCode continuation session');
+        ownedResponsesSessionId = sessionId;
+      } else {
         const sessionRes = (await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
         sessionId = (asRecord(asRecord(sessionRes)['data'])['id'] as string | undefined) ?? null;
         if (!sessionId) {
@@ -1171,8 +1182,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             streamSearchToolParts = polled.toolParts;
           }
         };
-        let recoverySnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null = null;
-        let recoveryPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> | null = null;
+        let recoverySnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; partial?: boolean } | null = null;
+        let recoveryPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; partial?: boolean }> | null = null;
+        let currentAssistantMessageId: string | null = null;
         const isContinuation = Boolean(previousState?.sessionId);
         const hasRecoveryEvidence = (snapshot: { content: string; reasoning: string; toolParts?: unknown }): boolean =>
           Boolean(
@@ -1180,7 +1192,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               snapshot.reasoning ||
               (Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0),
           );
-        const pollRecoverySnapshot = (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> => {
+        const pollRecoverySnapshot = (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; partial?: boolean }> => {
           if (!recoveryPromise) {
             recoveryPromise = activePollForAssistantResponse(
               sessionId as string,
@@ -1206,11 +1218,10 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             const retriedSessionId = sessionId;
             if (!isContinuation) {
               promptSubmitted = false;
-              if (retriedSessionId) {
-                try {
-                  await activeClient.session.delete({ path: { id: retriedSessionId } });
-                } catch (e: unknown) {
-                  logDebug('Failed to delete retried responses session', { sessionId: retriedSessionId, error: toErrorMessage(e) });
+              if (retriedSessionId && ownedResponsesSessionId === retriedSessionId) {
+                await cleanupOwnedResponsesSession();
+                if (ownedResponsesSessionId === retriedSessionId) {
+                  throw new Error('Failed to cleanup retried OpenCode session');
                 }
               }
               const retrySessionRes = (await withTimeout(
@@ -1223,8 +1234,6 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               ownedResponsesSessionId = sessionId;
               promptParams.path.id = sessionId;
             } else {
-              sessionId = previousState!.sessionId;
-              promptParams.path.id = sessionId;
               if (promptPromise) {
                 await promptPromise.catch(() => {});
               }
@@ -1260,7 +1269,10 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
                 if (isContinuation) {
                   promptSubmitted = true;
                 }
-                await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                const promptResult = await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                const promptInfo = asRecord(asRecord(asRecord(promptResult)['data'])['info']);
+                const promptMessageId = promptInfo['id'] ?? promptInfo['messageID'] ?? promptInfo['messageId'];
+                if (typeof promptMessageId === 'string' && promptMessageId) currentAssistantMessageId = promptMessageId;
                 promptSubmitted = true;
               }
               const pres = await pollRecoverySnapshot();
@@ -1272,12 +1284,18 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
                 collected = { error: new Error('Recovery poll returned empty response') };
               } else {
                 recoverySnapshot = pres;
+                currentAssistantMessageId = pres.assistantMessageId ?? currentAssistantMessageId;
                 keepStreamToolParts(pres);
                 if (pres.content || pres.reasoning) {
                   replaySnapshotText(pres.content, pres.reasoning);
                   fallbackServed = true;
                 }
-                collected = { content: pres.content, reasoning: pres.reasoning, toolParts: pres.toolParts };
+                collected = {
+                  content: pres.content,
+                  reasoning: pres.reasoning,
+                  toolParts: pres.toolParts,
+                  assistantMessageId: pres.assistantMessageId,
+                };
               }
             } else {
               const collectPromise = collectFromEvents(
@@ -1298,7 +1316,10 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
                   promptSubmitted = true;
                 }
                 promptPromise = activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS)
-                  .then(() => {
+                  .then((promptResult: unknown) => {
+                    const promptInfo = asRecord(asRecord(asRecord(promptResult)['data'])['info']);
+                    const promptMessageId = promptInfo['id'] ?? promptInfo['messageID'] ?? promptInfo['messageId'];
+                    if (typeof promptMessageId === 'string' && promptMessageId) currentAssistantMessageId = promptMessageId;
                     promptSubmitted = true;
                   })
                   .catch((err: unknown) => {
@@ -1327,6 +1348,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           }
 
           const collectedRecord = asRecord(collected);
+          if (typeof collectedRecord['assistantMessageId'] === 'string') {
+            currentAssistantMessageId = collectedRecord['assistantMessageId'] as string;
+          }
           let attemptError: unknown = promptError ?? (collectedRecord['error'] ?? collectedRecord['__error'] ?? null);
           if (!attemptError && (collectedRecord['noData'] || collectedRecord['cut'] || collectedRecord['idleTimeout'])) {
             try {
@@ -1343,7 +1367,13 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
                 recoverySnapshot = recovery;
                 keepStreamToolParts(recovery);
                 replaySnapshotText(recovery.content, recovery.reasoning);
-                collected = { content: recovery.content, reasoning: recovery.reasoning, toolParts: recovery.toolParts };
+                currentAssistantMessageId = recovery.assistantMessageId ?? currentAssistantMessageId;
+                collected = {
+                  content: recovery.content,
+                  reasoning: recovery.reasoning,
+                  toolParts: recovery.toolParts,
+                  assistantMessageId: recovery.assistantMessageId,
+                };
               }
             } catch (pollErr: unknown) {
               attemptError = pollErr;
@@ -1395,9 +1425,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
          );
          const recoverSnapshot = async (
            fallbackError: unknown = null,
-         ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null> => {
+         ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; partial?: boolean } | null> => {
            if (responsesAbortController.signal.aborted) return null;
-           let polled: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean };
+           let polled: { content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; partial?: boolean };
            try {
              polled = await pollRecoverySnapshot();
            } catch (error: unknown) {
@@ -1412,6 +1442,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
              return null;
            }
            recoverySnapshot = polled;
+           currentAssistantMessageId = polled.assistantMessageId ?? currentAssistantMessageId;
            return polled;
          };
          const needsRecovery = Boolean(
@@ -1444,7 +1475,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
 
          if (responsesAbortController.signal.aborted) return;
 
-         let polledForToolCalls: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null = null;
+         let polledForToolCalls: { content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; partial?: boolean } | null = null;
          if (externalToolRegistry.length > 0 && !hasValidTerminal && !recoveryPromise) {
            const polled = await recoverSnapshot();
            if (polled) {
@@ -1575,9 +1606,13 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
              }
            }
            if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
-             const forcedResponse = await requestForcedResponsesToolCall();
-             if (forcedResponse) {
-               const forcedReasoning = typeof forcedResponse['reasoning'] === 'string' ? forcedResponse['reasoning'] as string : '';
+              const forcedResponse = await requestForcedResponsesToolCall();
+              if (forcedResponse) {
+                currentAssistantMessageId =
+                  typeof forcedResponse['assistantMessageId'] === 'string'
+                    ? (forcedResponse['assistantMessageId'] as string)
+                    : currentAssistantMessageId;
+                const forcedReasoning = typeof forcedResponse['reasoning'] === 'string' ? forcedResponse['reasoning'] as string : '';
                const forcedContent = typeof forcedResponse['content'] === 'string' ? forcedResponse['content'] as string : '';
                parsedToolCalls = mergeToolCallArtifacts(parsedToolCalls, parseJoined(forcedReasoning, forcedContent));
                authoritativeSource = {
@@ -1657,9 +1692,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
          );
          const safeContent = joinedSafe.content;
          const safeReasoning = joinedSafe.reasoning;
-         if (!safeContent.trim() && !safeReasoning.trim() && validatedStreamedToolCalls.length === 0) {
-           throw new Error('Upstream returned no assistant data');
-         }
+          if (!safeContent.trim() && !safeReasoning.trim() && validatedStreamedToolCalls.length === 0) {
+            throw new Error('Upstream returned no assistant data');
+          }
           const streamEvidence = hostedSearch.requested
             ? extractSearchEvidence(streamSearchToolParts)
             : { queries: [] as string[], sources: [] as { url: string; title: string }[] };
@@ -1736,10 +1771,22 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
              output_tokens_details: { reasoning_tokens: reasoningTokens },
            },
          };
-         emit({ type: 'response.completed', sequence_number: nextSeq(), response });
-         res.write('data: [DONE]\n\n');
-         storeResponseState(responseId, sessionId, `${pID}/${mID}`, buildStoredResponseToolCalls(validatedStreamedToolCalls));
-         if (ownedResponsesSessionId === sessionId) ownedResponsesSessionId = null;
+          const stateStored = currentAssistantMessageId
+            ? storeResponseState(
+                responseId,
+                sessionId,
+                `${pID}/${mID}`,
+                buildStoredResponseToolCalls(validatedStreamedToolCalls),
+                currentAssistantMessageId,
+              )
+            : false;
+          if (stateStored) {
+            if (ownedResponsesSessionId === sessionId) ownedResponsesSessionId = null;
+          } else {
+            await cleanupOwnedResponsesSession();
+          }
+          emit({ type: 'response.completed', sequence_number: nextSeq(), response });
+          res.write('data: [DONE]\n\n');
          stopResponsesKeepalive();
          res.end();
          return;
@@ -1755,6 +1802,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       let searchToolParts: unknown[] = [];
       const isNonStreamContinuation = Boolean(previousState?.sessionId);
       let promptSubmitted = false;
+      let currentAssistantMessageId: string | null = null;
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         if (res.writableEnded || res.destroyed) {
           logDebug('Client gone, stop retrying', { sessionId, attempt });
@@ -1766,12 +1814,10 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           if (!isNonStreamContinuation) {
             promptSubmitted = false;
             const retriedSessionId = sessionId;
-            if (ownedResponsesSessionId === retriedSessionId) ownedResponsesSessionId = null;
-            if (retriedSessionId) {
-              try {
-                await activeClient.session.delete({ path: { id: retriedSessionId } });
-              } catch (e: unknown) {
-                logDebug('Failed to delete retried session', { sessionId, error: toErrorMessage(e) });
+            if (retriedSessionId && ownedResponsesSessionId === retriedSessionId) {
+              await cleanupOwnedResponsesSession();
+              if (ownedResponsesSessionId === retriedSessionId) {
+                throw new Error('Failed to cleanup retried OpenCode session');
               }
             }
             const retrySessionRes = (await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
@@ -1779,14 +1825,11 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
             ownedResponsesSessionId = sessionId;
             promptParams.path.id = sessionId;
-          } else {
-            sessionId = previousState!.sessionId;
-            promptParams.path.id = sessionId;
           }
           requestForcedResponsesToolCall = makeForcedResponsesToolCallRequester();
           await sleep(computeRetryDelay(attempt - 1, lastResponsesAttemptError));
         }
-        let polledResponse: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null = null;
+        let polledResponse: { content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; partial?: boolean } | null = null;
         try {
           if (isNonStreamContinuation && promptSubmitted) {
             polledResponse = await activePollForAssistantResponse(
@@ -1796,13 +1839,18 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               responsesAbortController.signal,
               isNonStreamContinuation ? String(promptParams.body['messageID']) : undefined,
             );
+            currentAssistantMessageId = polledResponse.assistantMessageId ?? currentAssistantMessageId;
           } else {
             if (isNonStreamContinuation) {
               promptSubmitted = true;
             }
             responseRes = await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
             promptSubmitted = true;
-            const dataParts: unknown = asRecord(asRecord(responseRes)['data'])['parts'];
+            const promptData = asRecord(asRecord(responseRes)['data']);
+            const promptInfo = asRecord(promptData['info']);
+            const promptMessageId = promptInfo['id'] ?? promptInfo['messageID'] ?? promptInfo['messageId'];
+            if (typeof promptMessageId === 'string' && promptMessageId) currentAssistantMessageId = promptMessageId;
+            const dataParts: unknown = promptData['parts'];
             responseParts = Array.isArray(dataParts) ? (dataParts as unknown[]) : [];
             promptContent = responseParts
               .filter((p) => asRecord(p)['type'] === 'text')
@@ -1824,6 +1872,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               responsesAbortController.signal,
               isNonStreamContinuation ? String(promptParams.body['messageID']) : undefined,
             );
+            currentAssistantMessageId = polledResponse.assistantMessageId ?? currentAssistantMessageId;
           }
         } catch (loopError: unknown) {
           if (isNonStreamContinuation) {
@@ -1877,6 +1926,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         if (polledResponse) {
           content = polledResponse.content || content;
           reasoning = polledResponse.reasoning || reasoning;
+          currentAssistantMessageId = polledResponse.assistantMessageId ?? currentAssistantMessageId;
           polledFilled = true;
           if (Array.isArray(polledResponse.toolParts) && polledResponse.toolParts.length > 0) {
             searchToolParts = polledResponse.toolParts;
@@ -1937,10 +1987,14 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
        let validatedToolCalls: FinalToolCall[] = [];
        try {
          assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
-         if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
-           const forcedResponse = await requestForcedResponsesToolCall();
-           if (forcedResponse) {
-             content = String(forcedResponse['content'] ?? content);
+          if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+            const forcedResponse = await requestForcedResponsesToolCall();
+            if (forcedResponse) {
+              currentAssistantMessageId =
+                typeof forcedResponse['assistantMessageId'] === 'string'
+                  ? (forcedResponse['assistantMessageId'] as string)
+                  : currentAssistantMessageId;
+              content = String(forcedResponse['content'] ?? content);
              reasoning = String(forcedResponse['reasoning'] ?? reasoning);
              parsedToolCalls = parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content);
              assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
@@ -2045,8 +2099,20 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         },
       };
 
-      storeResponseState(responseId, sessionId, `${pID}/${mID}`, buildStoredResponseToolCalls(validatedToolCalls));
-      if (ownedResponsesSessionId === sessionId) ownedResponsesSessionId = null;
+      const stateStored = currentAssistantMessageId
+        ? storeResponseState(
+            responseId,
+            sessionId,
+            `${pID}/${mID}`,
+            buildStoredResponseToolCalls(validatedToolCalls),
+            currentAssistantMessageId,
+          )
+        : false;
+      if (stateStored) {
+        if (ownedResponsesSessionId === sessionId) ownedResponsesSessionId = null;
+      } else {
+        await cleanupOwnedResponsesSession();
+      }
 
       res.json(response);
       return;

@@ -32,6 +32,12 @@ interface BackendEvent {
   properties?: unknown;
 }
 
+function readInfoMessageId(info: Record<string, unknown>): string | null {
+  const value = info['id'] ?? info['messageID'] ?? info['messageId'];
+  if (value == null || typeof value === 'boolean') return null;
+  return String(value);
+}
+
 // --- Mutex Logic with Timeout ---
 export async function getImageDataUri(url: unknown): Promise<string> {
   const urlStr = String(url ?? '');
@@ -216,7 +222,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     intervalMs: number = DEFAULT_POLL_INTERVAL_MS,
     signal?: AbortSignal,
     expectedCurrentUserMessageId?: string,
-  ): Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[]; partial?: boolean; complete?: boolean }> {
+  ): Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[]; assistantMessageId?: string; partial?: boolean; complete?: boolean }> {
     // Drift signal only: backend-minted ses_* IDs should match the canonical
     // shape (see src/session/ids.ts). Never block on mismatch — the schema
     // itself accepts any startsWith("ses") value.
@@ -288,7 +294,15 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
               reasoningLen: reasoning.length,
               error: error ? (asRecord(error)['name'] as unknown) : null,
             });
-            return { content, reasoning, error, toolParts, complete: true };
+            const assistantMessageId = readInfoMessageId(info);
+            return {
+              content,
+              reasoning,
+              error,
+              toolParts,
+              ...(assistantMessageId ? { assistantMessageId } : {}),
+              complete: true,
+            };
           }
           if (content || reasoning || toolParts.length > 0) {
             lastPartial = { content, reasoning, error: null, toolParts };
@@ -352,6 +366,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     let lastFinish: string | null = null;
       let content = '';
       let reasoning = '';
+      let assistantMessageId: string | null = null;
       let bufferedRoleUnknownDeltaSeen = false;
       let sawUserParts = false;
       let sawStaleMessageParts = false;
@@ -604,8 +619,6 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
       };
       const readPartMessageId = (record: Record<string, unknown>): string | null =>
         readPartId(record['messageID'] ?? record['messageId']);
-      const readInfoMessageId = (info: Record<string, unknown>): string | null =>
-        readPartId(info['id'] ?? info['messageID'] ?? info['messageId']);
       const readParentMessageId = (record: Record<string, unknown>): string | null =>
         readPartId(record['parentID'] ?? record['parentId'] ?? record['parent_id']);
       const idPartKey = (messageID: string | null, partID: string): string => `${messageID ?? ''}\u0000${partID}`;
@@ -1083,6 +1096,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
         const result: Record<string, unknown> = {
           content: finalContent,
           reasoning: finalReasoning,
+          ...(assistantMessageId ? { assistantMessageId } : {}),
           ...extra,
         };
         // `authoritative` means reconciliation repaired/replaced live deltas, or
@@ -1490,6 +1504,13 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                   continue;
                 }
                 terminalFinishSeen = true;
+                if (
+                  (role === 'assistant' || resolveMessageRole(messageID) === 'assistant') &&
+                  messageID != null &&
+                  (expectedCurrentUserMessageId === undefined || parentForMessage(messageID, parentID) === expectedCurrentUserMessageId)
+                ) {
+                  assistantMessageId = messageID;
+                }
                 if (!finished) {
                   finished = true;
                   clearAllTimers();

@@ -1156,6 +1156,7 @@ describe('collector continuation turn correlation', () => {
         );
 
         expect(result).toMatchObject({ content: 'Answer', finish: 'stop' });
+        expect(result.assistantMessageId).toBe('assistant-current');
         expect(deltas).toEqual(['Answer']);
     });
 
@@ -1857,6 +1858,7 @@ describe('collector polling finish classification', () => {
             'collector-session', 1000, 1, undefined, currentMessageID,
         );
         expect(result.content).toBe('current answer');
+        expect(result.assistantMessageId).toBe('assistant-current');
         expect(call).toBeGreaterThan(1);
     });
 

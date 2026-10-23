@@ -39,6 +39,7 @@ const sdkMockDefaults = {
     sessionCreate: async () => ({
         data: { id: 'test-session-id' }
     }),
+    sessionFork: async () => ({ data: { id: `test-fork-session-${++forkSequence}` } }),
     sessionPrompt: async (args) => {
         const promptText = args.body.prompt || args.body.parts?.map(part => part.text || '').join(' ') || '';
         const parts = [{ type: 'text', text: 'Mock response' }];
@@ -47,41 +48,60 @@ const sdkMockDefaults = {
             parts.unshift({ type: 'reasoning', text: 'Thinking process...' });
         }
 
-        return { data: { parts } };
+        return {
+            data: {
+                info: {
+                    id: `assistant-${args.path.id}`,
+                    role: 'assistant',
+                    parentID: args.body.messageID,
+                    finish: 'stop'
+                },
+                parts
+            }
+        };
     },
-    sessionMessages: async () => ([
+    sessionMessages: async (args) => ([
         {
-            info: { role: 'assistant', finish: 'stop' },
+            info: {
+                id: `assistant-${args?.path?.id || 'test-session-id'}`,
+                role: 'assistant',
+                parentID: sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0]?.body?.messageID,
+                finish: 'stop'
+            },
             parts: [
                 { type: 'text', text: 'Mock response' }
             ]
         }
     ]),
     sessionDelete: async () => ({}),
-    eventSubscribe: async () => {
-        const sessionId = 'test-session-id';
-        const mockEvents = [
-            { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: 'Thinking...' } },
-            { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: 'Mock' } },
-            { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: ' response' } },
-            { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
-        ];
-
-        return {
-            stream: (async function* () {
-                for (const event of mockEvents) {
-                    yield event;
-                }
-            })()
-        };
-    }
+    eventSubscribe: async () => ({
+        stream: (async function* () {
+            const prompt = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+            const sessionId = prompt?.path?.id || 'test-session-id';
+            const mockEvents = [
+                { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: 'Thinking...' } },
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: 'Mock' } },
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: ' response' } },
+                { type: 'message.updated', properties: { info: {
+                    id: `assistant-${sessionId}`,
+                    role: 'assistant',
+                    parentID: prompt?.body?.messageID,
+                    sessionID: sessionId,
+                    finish: 'stop'
+                } } }
+            ];
+            for (const event of mockEvents) yield event;
+        })()
+    })
 };
 
+let forkSequence = 0;
 const sdkMocks = {
     configProviders: jest.fn(sdkMockDefaults.configProviders),
     configUpdate: jest.fn(sdkMockDefaults.configUpdate),
     toolIds: jest.fn(sdkMockDefaults.toolIds),
     sessionCreate: jest.fn(sdkMockDefaults.sessionCreate),
+    sessionFork: jest.fn(sdkMockDefaults.sessionFork),
     sessionPrompt: jest.fn(sdkMockDefaults.sessionPrompt),
     sessionMessages: jest.fn(sdkMockDefaults.sessionMessages),
     sessionDelete: jest.fn(sdkMockDefaults.sessionDelete),
@@ -139,6 +159,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
         },
         session: {
             create: sdkMocks.sessionCreate,
+            fork: sdkMocks.sessionFork,
             prompt: sdkMocks.sessionPrompt,
             messages: sdkMocks.sessionMessages,
             delete: sdkMocks.sessionDelete
@@ -3411,10 +3432,24 @@ describe('Proxy Responses API previous_response_id', () => {
         });
 
         test('responses stream transfers a newly created owned session to response state', async () => {
-            sdkMocks.sessionMessages.mockResolvedValue([{ info: { role: 'assistant', finish: 'stop' }, parts: [] }]);
+            sdkMocks.sessionMessages.mockImplementation(async (args) => [{
+                info: {
+                    id: `assistant-${args?.path?.id}`,
+                    role: 'assistant',
+                    parentID: sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0]?.body?.messageID,
+                    finish: 'stop'
+                },
+                parts: []
+            }]);
             sdkMocks.eventSubscribe.mockImplementationOnce(eventStream([
                 { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: 'done' } },
-                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
+                { type: 'message.updated', properties: { info: {
+                    id: 'assistant-test-session-id',
+                    role: 'assistant',
+                    parentID: sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0]?.body?.messageID,
+                    sessionID: 'test-session-id',
+                    finish: 'stop'
+                } } }
             ]));
             sdkMocks.sessionCreate.mockClear();
             sdkMocks.sessionDelete.mockClear();
@@ -3442,11 +3477,22 @@ describe('Proxy Responses API previous_response_id', () => {
                 .send({ input: 'And a follow-up', previous_response_id: completed.response.id });
             expect(followUp.statusCode).toBe(200);
             expect(sdkMocks.sessionCreate).toHaveBeenCalledTimes(1);
+            expect(sdkMocks.sessionFork).toHaveBeenCalledWith({
+                path: { id: 'test-session-id' }
+            });
             expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
         });
 
         test('responses non-stream transfers a newly created owned session to response state', async () => {
-            sdkMocks.sessionMessages.mockResolvedValue([{ info: { role: 'assistant', finish: 'stop' }, parts: [] }]);
+            sdkMocks.sessionMessages.mockImplementation(async (args) => [{
+                info: {
+                    id: `assistant-${args?.path?.id}`,
+                    role: 'assistant',
+                    parentID: sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0]?.body?.messageID,
+                    finish: 'stop'
+                },
+                parts: []
+            }]);
             sdkMocks.sessionCreate.mockClear();
             sdkMocks.sessionDelete.mockClear();
             const res = await request(app)
@@ -3468,6 +3514,9 @@ describe('Proxy Responses API previous_response_id', () => {
                 .send({ input: 'And a follow-up', previous_response_id: res.body.id });
             expect(followUp.statusCode).toBe(200);
             expect(sdkMocks.sessionCreate).toHaveBeenCalledTimes(1);
+            expect(sdkMocks.sessionFork).toHaveBeenCalledWith({
+                path: { id: 'test-session-id' }
+            });
             expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
         });
 
@@ -3477,6 +3526,8 @@ describe('Proxy Responses API previous_response_id', () => {
                 .set('Authorization', 'Bearer test-key')
                 .send({ model: 'opencode/kimi-k2.5', input: 'seed' });
             expect(seed.statusCode).toBe(200);
+            const continuationSessionId = 'responses-error-fork';
+            sdkMocks.sessionFork.mockResolvedValueOnce({ data: { id: continuationSessionId } });
             sdkMocks.sessionDelete.mockClear();
             sdkMocks.sessionMessages.mockImplementation(async () => {
                 const latestPrompt = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
@@ -3486,8 +3537,8 @@ describe('Proxy Responses API previous_response_id', () => {
                 }];
             });
             sdkMocks.eventSubscribe.mockImplementationOnce(eventStream([
-                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: '<function_calls>{"name":"read" arguments</function_calls>' } },
-                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: continuationSessionId }, delta: '<function_calls>{"name":"read" arguments</function_calls>' } },
+                { type: 'message.updated', properties: { info: { sessionID: continuationSessionId, finish: 'stop' } } }
             ]));
             const res = await request(app)
                 .post('/v1/responses')
@@ -3499,7 +3550,8 @@ describe('Proxy Responses API previous_response_id', () => {
                     tools: [{ type: 'function', name: 'read', parameters: readTool.function.parameters }]
                 });
             expect(res.text).toContain('response.failed');
-            expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
+            expect(sdkMocks.sessionDelete).toHaveBeenCalledWith({ path: { id: continuationSessionId } });
+            expect(sdkMocks.sessionDelete).not.toHaveBeenCalledWith({ path: { id: 'test-session-id' } });
         });
 
         test.each([
@@ -4380,7 +4432,10 @@ describe('Proxy Responses API previous_response_id', () => {
             .set('Authorization', 'Bearer test-key')
             .send(payload);
         const replyWithToolCall = (callId, namespacedName, args) => sdkMocks.sessionPrompt.mockResolvedValueOnce({
-            data: { parts: [{ type: 'text', text: `<function_calls>{"id":"${callId}","name":"${namespacedName}","arguments":${args}}</function_calls>` }] }
+            data: {
+                info: { id: 'assistant-test-session-id', role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: `<function_calls>{"id":"${callId}","name":"${namespacedName}","arguments":${args}}</function_calls>` }]
+            }
         });
         const streamedCallReply = (callId, namespacedName, args) => sdkMocks.eventSubscribe.mockImplementationOnce(eventStreamLite([
             {
@@ -4390,7 +4445,7 @@ describe('Proxy Responses API previous_response_id', () => {
                     delta: `<function_calls>{"id":"${callId}","name":"${namespacedName}","arguments":${args}}</function_calls>`
                 }
             },
-            { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
+            { type: 'message.updated', properties: { info: { id: 'assistant-test-session-id', role: 'assistant', sessionID: 'test-session-id', finish: 'stop' } } }
         ]));
 
         describe('declaration expansion', () => {
@@ -5664,7 +5719,10 @@ describe('Proxy Responses API previous_response_id', () => {
                         `{"id":"call_cap_${index}","name":"external__read","arguments":{"path":"a-${index}.txt"}}`
                 ).join(',');
                 sdkMocks.sessionPrompt.mockResolvedValueOnce({
-                    data: { parts: [{ type: 'text', text: `<function_calls>[${calls}]</function_calls>` }] }
+                    data: {
+                        info: { id: 'assistant-test-session-id', role: 'assistant', finish: 'stop' },
+                        parts: [{ type: 'text', text: `<function_calls>[${calls}]</function_calls>` }]
+                    }
                 });
                 const first = await postResponses({
                     model: 'opencode/kimi-k2.5',
@@ -5709,7 +5767,10 @@ describe('Proxy Responses API previous_response_id', () => {
                             `{"id":"call_cap_${index}","name":"external__read","arguments":{"path":"a-${index}.txt"}}`
                     ).join(',');
                     sdkMocks.sessionPrompt.mockResolvedValueOnce({
-                        data: { parts: [{ type: 'text', text: `<function_calls>[${calls}]</function_calls>` }] }
+                        data: {
+                            info: { id: 'assistant-test-session-id', role: 'assistant', finish: 'stop' },
+                            parts: [{ type: 'text', text: `<function_calls>[${calls}]</function_calls>` }]
+                        }
                     });
                     const res = await request(debugApp)
                         .post('/v1/responses')

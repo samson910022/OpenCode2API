@@ -234,7 +234,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         typeof previousInteractionId === 'string' && previousInteractionId
           ? getResponseState(previousInteractionId)
           : null;
-      if (previousInteractionId && !previousState) {
+      if (previousInteractionId && (!previousState || !previousState.checkpointId)) {
         res.status(400).json({ error: { message: 'Invalid or expired previous_interaction_id', type: 'invalid_request_error' } });
         return;
       }
@@ -307,15 +307,29 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         return;
       }
 
-      let sessionId: string | null = previousState?.sessionId || null;
-      // Only a session created by this request may be deleted by store:false;
-      // deleting a reused parent session would orphan its stored state.
-       if (!sessionId) {
-        sessionId =
-          ((asRecord(asRecord(await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session'))['data'])['id'] as string | undefined) ?? null);
-         if (!sessionId) throw new Error('Failed to create OpenCode session');
-          ownedSessionIds.add(sessionId);
-
+      let sessionId: string | null = null;
+      // Both new sessions and continuation forks belong to this request until
+      // response state storage succeeds; the stored parent is never mutated.
+      if (previousState) {
+        const forkRes = (await withTimeout(
+          activeClient.session.fork({
+            path: { id: previousState.sessionId },
+          }),
+          REQUEST_TIMEOUT_MS,
+          'fork continuation session',
+        )) as unknown;
+        sessionId = (asRecord(asRecord(forkRes)['data'])['id'] as string | undefined) ?? null;
+        if (!sessionId) throw new Error('Failed to fork OpenCode continuation session');
+        ownedSessionIds.add(sessionId);
+      } else {
+        const sessionRes = (await withTimeout(
+          activeClient.session.create(),
+          REQUEST_TIMEOUT_MS,
+          'create session',
+        )) as unknown;
+        sessionId = (asRecord(asRecord(sessionRes)['data'])['id'] as string | undefined) ?? null;
+        if (!sessionId) throw new Error('Failed to create OpenCode session');
+        ownedSessionIds.add(sessionId);
       }
 
       const parts: Record<string, unknown>[] = [];
@@ -362,6 +376,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         reasoning: string;
         error: unknown;
         toolParts?: unknown;
+        assistantMessageId?: string;
         partial?: boolean;
       }> => {
         let lastErr: unknown = null;
@@ -372,15 +387,12 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
             await ensureActiveModel(activeClient, pID, mID).catch(() => {});
             if (!parentSessionId) {
               promptSubmitted = false;
-               const currentId = sessionId as string;
-               if (currentId) await deleteOwnedSession(currentId);
+              const currentId = sessionId as string;
+              if (currentId) await deleteOwnedSession(currentId);
               const retryRes = (await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
               sessionId = (asRecord(asRecord(retryRes)['data'])['id'] as string | undefined) ?? null;
               if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
-               ownedSessionIds.add(sessionId);
-              promptParams.path.id = sessionId;
-            } else {
-              sessionId = parentSessionId;
+              ownedSessionIds.add(sessionId);
               promptParams.path.id = sessionId;
             }
 
@@ -489,14 +501,15 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
             });
           }
           steps.push({ type: 'model_output', text, annotations });
+          if (store) {
+            const stateStored = polled.assistantMessageId
+              ? storeResponseState(interactionId, sessionId as string, `${pID}/${mID}`, [], polled.assistantMessageId)
+              : false;
+            if (stateStored) ownedSessionIds.delete(sessionId as string);
+            await cleanupOwnedSessions();
+          }
           emit({ type: 'interaction.completed', interaction: { id: interactionId, status: 'completed', output_text: text, steps } });
-           if (store) {
-             // Text+grounding only: no function tool calls to persist, default [] is intentional.
-             storeResponseState(interactionId, sessionId as string, `${pID}/${mID}`);
-             ownedSessionIds.delete(sessionId as string);
-             await cleanupOwnedSessions();
-           }
-           await deleteEphemeralSession();
+          await deleteEphemeralSession();
 
         } finally {
           clearInterval(heartbeat);
@@ -507,9 +520,9 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
 
       const polled = await promptAndPoll();
       // Same parity strip as the stream path above.
-       const text = stripFunctionCalls(polled.content || '');
-       if (!text.trim()) throw new Error('Interactions response contained no visible text');
-       const evidence = hostedSearch.requested ? extractSearchEvidence(polled.toolParts ?? []) : { queries: [] as string[], sources: [] as { url: string; title: string }[] };
+      const text = stripFunctionCalls(polled.content || '');
+      if (!text.trim()) throw new Error('Interactions response contained no visible text');
+      const evidence = hostedSearch.requested ? extractSearchEvidence(polled.toolParts ?? []) : { queries: [] as string[], sources: [] as { url: string; title: string }[] };
       const searchCalls = buildWebSearchCallItems(evidence);
       const annotations = buildCitationAnnotations(text, evidence.sources);
       const steps: Record<string, unknown>[] = [];
@@ -525,13 +538,14 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       }
       steps.push({ type: 'model_output', text, annotations });
       const groundingCount = searchCalls.length;
-       if (store) {
-         // Text+grounding only: no function tool calls to persist, default [] is intentional.
-         storeResponseState(interactionId, sessionId as string, `${pID}/${mID}`);
-         ownedSessionIds.delete(sessionId as string);
-         await cleanupOwnedSessions();
-       }
-       await deleteEphemeralSession();
+      if (store) {
+        const stateStored = polled.assistantMessageId
+          ? storeResponseState(interactionId, sessionId as string, `${pID}/${mID}`, [], polled.assistantMessageId)
+          : false;
+        if (stateStored) ownedSessionIds.delete(sessionId as string);
+        await cleanupOwnedSessions();
+      }
+      await deleteEphemeralSession();
 
       res.json({
         id: interactionId,

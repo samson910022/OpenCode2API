@@ -16,13 +16,30 @@ const sdkMocks = {
     toolIds: jest.fn(async () => ({ data: ['web_fetch', 'filesystem', 'bash'] })),
     sessionCreate: jest.fn(async () => ({ data: { id: 'default-session' } })),
     sessionPrompt: jest.fn(async () => ({ data: { parts: [] } })),
-    sessionMessages: jest.fn(async () => ([
-        { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'Default response' }] }
+    sessionFork: jest.fn(async () => ({ data: { id: `fork-session-${sdkMocks.sessionFork.mock.calls.length}` } })),
+    sessionMessages: jest.fn(async (args) => ([
+        {
+            info: {
+                id: `assistant-${args?.path?.id || 'default-session'}`,
+                role: 'assistant',
+                parentID: sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0]?.body?.messageID,
+                finish: 'stop'
+            },
+            parts: [{ type: 'text', text: 'Default response' }]
+        }
     ])),
     sessionDelete: jest.fn(async () => ({})),
     eventSubscribe: jest.fn(async () => ({
         stream: (async function* () {
-            yield { type: 'message.updated', properties: { info: { sessionID: 'default-session', finish: 'stop' } } };
+            const prompt = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+            const sessionID = prompt?.path?.id || 'default-session';
+            yield { type: 'message.updated', properties: { info: {
+                id: `assistant-${sessionID}`,
+                role: 'assistant',
+                parentID: prompt?.body?.messageID,
+                sessionID,
+                finish: 'stop'
+            } } };
         })()
     }))
 };
@@ -57,6 +74,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
         tool: { ids: sdkMocks.toolIds },
         session: {
             create: sdkMocks.sessionCreate,
+            fork: sdkMocks.sessionFork,
             prompt: sdkMocks.sessionPrompt,
             messages: sdkMocks.sessionMessages,
             delete: sdkMocks.sessionDelete
@@ -179,7 +197,7 @@ describe('Streaming Retries on 503 Transient Error', () => {
     ])('%s polls past the previous assistant until the current message parent is complete', async (_label, path, body) => {
         const sessionId = 'continuation-route-session';
         const stateId = body.previous_response_id ?? body.previous_interaction_id;
-        ctx.storeResponseState(stateId, sessionId, 'opencode/kimi-k2.5');
+        ctx.storeResponseState(stateId, sessionId, 'opencode/kimi-k2.5', [], 'assistant-parent-checkpoint');
         let currentMessageID = null;
         let pollCount = 0;
         sdkMocks.sessionPrompt.mockImplementation(async (params) => {
@@ -240,7 +258,7 @@ describe('Streaming Retries on 503 Transient Error', () => {
     ])('%s fails closed on an empty completed assistant poll snapshot', async (_label, path, body) => {
         const sessionId = 'empty-continuation-session';
         const stateId = body.previous_response_id ?? body.previous_interaction_id;
-        ctx.storeResponseState(stateId, sessionId, 'opencode/kimi-k2.5');
+        ctx.storeResponseState(stateId, sessionId, 'opencode/kimi-k2.5', [], 'assistant-parent-checkpoint');
         let currentMessageID;
         sdkMocks.sessionPrompt.mockImplementation(async (params) => {
             currentMessageID = params.body.messageID;
@@ -280,7 +298,9 @@ describe('Streaming Retries on 503 Transient Error', () => {
 
     test('Responses streaming continuation releases a pre-metadata text delta exactly once', async () => {
         const sessionId = 'pre-metadata-stream-continuation-session';
-        ctx.storeResponseState('pre-metadata-stream-parent', sessionId, 'opencode/kimi-k2.5');
+        const childSessionId = `${sessionId}-child`;
+        ctx.storeResponseState('pre-metadata-stream-parent', sessionId, 'opencode/kimi-k2.5', [], 'assistant-parent-checkpoint');
+        sdkMocks.sessionFork.mockResolvedValueOnce({ data: { id: childSessionId } });
         let currentMessageID;
         sdkMocks.sessionPrompt.mockImplementation(async (params) => {
             currentMessageID = params.body.messageID;
@@ -291,7 +311,7 @@ describe('Streaming Retries on 503 Transient Error', () => {
                 yield {
                     type: 'message.part.delta',
                     properties: {
-                        sessionID: sessionId,
+                        sessionID: childSessionId,
                         messageID: 'assistant-current',
                         partID: 'answer-part',
                         field: 'text',
@@ -306,7 +326,7 @@ describe('Streaming Retries on 503 Transient Error', () => {
                             role: 'assistant',
                             parentID: currentMessageID,
                             finish: 'stop',
-                            sessionID: sessionId,
+                            sessionID: childSessionId,
                         },
                     },
                 };
@@ -339,7 +359,9 @@ describe('Streaming Retries on 503 Transient Error', () => {
 
     test('Responses streaming continuation fails closed on a mismatched part parent after message confirmation', async () => {
         const sessionId = 'part-parent-mismatch-session';
-        ctx.storeResponseState('part-parent-mismatch-parent', sessionId, 'opencode/kimi-k2.5');
+        const childSessionId = `${sessionId}-child`;
+        ctx.storeResponseState('part-parent-mismatch-parent', sessionId, 'opencode/kimi-k2.5', [], 'assistant-parent-checkpoint');
+        sdkMocks.sessionFork.mockResolvedValueOnce({ data: { id: childSessionId } });
         let currentMessageID;
         sdkMocks.sessionPrompt.mockImplementation(async (params) => {
             currentMessageID = params.body.messageID;
@@ -354,7 +376,7 @@ describe('Streaming Retries on 503 Transient Error', () => {
                             id: 'assistant-correlated',
                             role: 'assistant',
                             parentID: currentMessageID,
-                            sessionID: sessionId,
+                            sessionID: childSessionId,
                         },
                     },
                 };
@@ -366,7 +388,7 @@ describe('Streaming Retries on 503 Transient Error', () => {
                             messageID: 'assistant-correlated',
                             parentID: 'another-user-message',
                             type: 'text',
-                            sessionID: sessionId,
+                            sessionID: childSessionId,
                         },
                         delta: 'uncorrelated text',
                     },
@@ -389,7 +411,9 @@ describe('Streaming Retries on 503 Transient Error', () => {
 
     test('Responses streaming continuation fails closed when a confirmed message parent explicitly changes', async () => {
         const sessionId = 'message-parent-mismatch-session';
-        ctx.storeResponseState('message-parent-mismatch-parent', sessionId, 'opencode/kimi-k2.5');
+        const childSessionId = `${sessionId}-child`;
+        ctx.storeResponseState('message-parent-mismatch-parent', sessionId, 'opencode/kimi-k2.5', [], 'assistant-parent-checkpoint');
+        sdkMocks.sessionFork.mockResolvedValueOnce({ data: { id: childSessionId } });
         let currentMessageID;
         sdkMocks.sessionPrompt.mockImplementation(async (params) => {
             currentMessageID = params.body.messageID;
@@ -404,7 +428,7 @@ describe('Streaming Retries on 503 Transient Error', () => {
                             id: 'assistant-correlated',
                             role: 'assistant',
                             parentID: currentMessageID,
-                            sessionID: sessionId,
+                            sessionID: childSessionId,
                         },
                     },
                 };
@@ -415,7 +439,7 @@ describe('Streaming Retries on 503 Transient Error', () => {
                             id: 'assistant-correlated',
                             role: 'assistant',
                             parentID: 'another-user-message',
-                            sessionID: sessionId,
+                            sessionID: childSessionId,
                             finish: 'stop',
                             parts: [{ type: 'text', text: 'uncorrelated text' }],
                         },
@@ -438,7 +462,9 @@ describe('Streaming Retries on 503 Transient Error', () => {
 
     test('Responses streaming continuation accepts a sparse update that omits its retained parent', async () => {
         const sessionId = 'sparse-parent-update-session';
-        ctx.storeResponseState('sparse-parent-update-parent', sessionId, 'opencode/kimi-k2.5');
+        const childSessionId = `${sessionId}-child`;
+        ctx.storeResponseState('sparse-parent-update-parent', sessionId, 'opencode/kimi-k2.5', [], 'assistant-parent-checkpoint');
+        sdkMocks.sessionFork.mockResolvedValueOnce({ data: { id: childSessionId } });
         let currentMessageID;
         sdkMocks.sessionPrompt.mockImplementation(async (params) => {
             currentMessageID = params.body.messageID;
@@ -453,7 +479,7 @@ describe('Streaming Retries on 503 Transient Error', () => {
                             id: 'assistant-sparse',
                             role: 'assistant',
                             parentID: currentMessageID,
-                            sessionID: sessionId,
+                            sessionID: childSessionId,
                         },
                     },
                 };
@@ -463,7 +489,7 @@ describe('Streaming Retries on 503 Transient Error', () => {
                         info: {
                             id: 'assistant-sparse',
                             role: 'assistant',
-                            sessionID: sessionId,
+                            sessionID: childSessionId,
                             finish: 'stop',
                             parts: [{ type: 'text', text: 'sparse continuation answer' }],
                         },
@@ -486,10 +512,12 @@ describe('Streaming Retries on 503 Transient Error', () => {
 
     test('Responses streaming continuation does not succeed from a timestamp-less assistant with a mismatched parent', async () => {
         const sessionId = 'stale-stream-continuation-session';
+        const childSessionId = `${sessionId}-child`;
         const created = createApp(baseConfig({ REQUEST_TIMEOUT_MS: 40, RETRY_MAX_RETRIES: 0 }));
         app = created.app;
         ctx = created.ctx;
-        ctx.storeResponseState('stale-stream-parent', sessionId, 'opencode/kimi-k2.5');
+        ctx.storeResponseState('stale-stream-parent', sessionId, 'opencode/kimi-k2.5', [], 'assistant-parent-checkpoint');
+        sdkMocks.sessionFork.mockResolvedValueOnce({ data: { id: childSessionId } });
 
         sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [] } }));
         sdkMocks.eventSubscribe.mockImplementation(async () => ({
@@ -503,7 +531,7 @@ describe('Streaming Retries on 503 Transient Error', () => {
                             id: 'stale-part',
                             messageID: 'assistant-stale',
                             type: 'text',
-                            sessionID: sessionId,
+                            sessionID: childSessionId,
                         },
                         delta: 'STALE ANSWER',
                     },
@@ -516,7 +544,7 @@ describe('Streaming Retries on 503 Transient Error', () => {
                             role: 'assistant',
                             parentID: 'previous-user-message',
                             finish: 'stop',
-                            sessionID: sessionId,
+                            sessionID: childSessionId,
                         },
                     },
                 };
@@ -1049,10 +1077,13 @@ describe('Provider List Caching', () => {
         const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
 
         sdkMocks.sessionMessages.mockResolvedValue([
-            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1' }] }
+            { info: { id: 'assistant-parent-checkpoint', role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1' }] }
         ]);
         sdkMocks.sessionCreate.mockResolvedValueOnce({ data: { id: 'parent-session-123' } });
-        sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [{ type: 'text', text: 'turn 1' }] } });
+        sdkMocks.sessionPrompt.mockResolvedValue({ data: {
+            info: { id: 'assistant-parent-checkpoint', role: 'assistant', finish: 'stop' },
+            parts: [{ type: 'text', text: 'turn 1' }]
+        } });
         const seedRes = await request(app)
             .post('/v1/responses')
             .set('Authorization', 'Bearer test-key')
@@ -1071,7 +1102,7 @@ describe('Provider List Caching', () => {
                         yield {
                             type: 'session.error',
                             properties: {
-                                sessionID: 'parent-session-123',
+                                sessionID: 'fork-session-1',
                                 error: {
                                     name: 'APIError',
                                     data: { statusCode: 503, message: 'Endpoint is unavailable.', responseHeaders: { 'retry-after-ms': '5' } }
@@ -1081,17 +1112,18 @@ describe('Provider List Caching', () => {
                     } else {
                         yield {
                             type: 'message.part.updated',
-                            properties: { part: { type: 'text', sessionID: 'parent-session-123' }, delta: 'turn 2 success' }
+                            properties: { part: { type: 'text', sessionID: 'fork-session-1' }, delta: 'turn 2 success' }
                         };
                         yield {
                             type: 'message.updated',
-                            properties: { info: { sessionID: 'parent-session-123', finish: 'stop' } }
+                            properties: { info: { id: 'assistant-child-checkpoint', role: 'assistant', parentID: sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0]?.body?.messageID, sessionID: 'fork-session-1', finish: 'stop' } }
                         };
                     }
                 })()
             };
         });
 
+        sdkMocks.sessionFork.mockResolvedValueOnce({ data: { id: 'fork-session-1' } });
         sdkMocks.sessionDelete.mockClear();
         sdkMocks.sessionCreate.mockClear();
         const contRes = await request(app)
@@ -1124,11 +1156,14 @@ describe('Provider List Caching', () => {
                 sessionPromptTurn2Calls += 1;
                 capturedMessageId = params.body?.messageID;
             }
-            return { data: { parts: [{ type: 'text', text: isTurn2 ? 'turn 2' : 'turn 1' }] } };
+            return { data: {
+                info: { id: isTurn2 ? 'assistant-child-checkpoint' : 'assistant-parent-checkpoint', role: 'assistant', parentID: params.body.messageID, finish: 'stop' },
+                parts: [{ type: 'text', text: isTurn2 ? 'turn 2' : 'turn 1' }]
+            } };
         });
 
         sdkMocks.sessionMessages.mockResolvedValue([
-            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1' }] }
+            { info: { id: 'assistant-parent-checkpoint', role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1' }] }
         ]);
         sdkMocks.sessionCreate.mockResolvedValueOnce({ data: { id: 'stateful-parent-session-123' } });
 
@@ -1154,7 +1189,7 @@ describe('Provider List Caching', () => {
                         yield {
                             type: 'session.error',
                             properties: {
-                                sessionID: 'stateful-parent-session-123',
+                                sessionID: 'fork-session-1',
                                 error: {
                                     name: 'APIError',
                                     data: { statusCode: 503, message: 'Endpoint is unavailable.', responseHeaders: { 'retry-after-ms': '5' } }
@@ -1164,17 +1199,18 @@ describe('Provider List Caching', () => {
                     } else {
                         yield {
                             type: 'message.part.updated',
-                            properties: { part: { type: 'text', sessionID: 'stateful-parent-session-123' }, delta: 'turn 2 success' }
+                            properties: { part: { type: 'text', sessionID: 'fork-session-1' }, delta: 'turn 2 success' }
                         };
                         yield {
                             type: 'message.updated',
-                            properties: { info: { sessionID: 'stateful-parent-session-123', finish: 'stop' } }
+                            properties: { info: { id: 'assistant-child-checkpoint', role: 'assistant', parentID: sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0]?.body?.messageID, sessionID: 'fork-session-1', finish: 'stop' } }
                         };
                     }
                 })()
             };
         });
 
+        sdkMocks.sessionFork.mockResolvedValueOnce({ data: { id: 'fork-session-1' } });
         const contRes = await request(app)
             .post('/v1/responses')
             .set('Authorization', 'Bearer test-key')
@@ -1209,7 +1245,7 @@ describe('Provider List Caching', () => {
         let capturedMessageId = null;
 
         sdkMocks.sessionMessages.mockResolvedValue([
-            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1 nonstream' }] }
+            { info: { id: 'assistant-parent-checkpoint', role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1 nonstream' }] }
         ]);
         sdkMocks.sessionCreate.mockResolvedValueOnce({ data: { id: 'stateful-parent-nonstream-789' } });
 
@@ -1219,7 +1255,10 @@ describe('Provider List Caching', () => {
                 sessionPromptTurn2Calls += 1;
                 capturedMessageId = params.body?.messageID;
             }
-            return { data: { parts: [{ type: 'text', text: isTurn2 ? 'turn 2 nonstream' : 'turn 1 nonstream' }] } };
+            return { data: {
+                info: { id: isTurn2 ? 'assistant-child-checkpoint' : 'assistant-parent-checkpoint', role: 'assistant', parentID: params.body.messageID, finish: 'stop' },
+                parts: [{ type: 'text', text: isTurn2 ? 'turn 2 nonstream' : 'turn 1 nonstream' }]
+            } };
         });
 
         const seedRes = await request(app)
@@ -1251,7 +1290,7 @@ describe('Provider List Caching', () => {
                 throw err;
             }
             return [
-                { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 2 nonstream success' }] }
+                { info: { id: 'assistant-child-checkpoint', role: 'assistant', parentID: capturedMessageId, finish: 'stop' }, parts: [{ type: 'text', text: 'turn 2 nonstream success' }] }
             ];
         });
 
@@ -1292,7 +1331,7 @@ describe('Provider List Caching', () => {
             return { data: { parts: [] } };
         });
         sdkMocks.sessionMessages.mockResolvedValueOnce([
-            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1 intr' }] }
+            { info: { id: 'assistant-intr-parent-checkpoint', role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1 intr' }] }
         ]);
 
         const seedRes = await request(app)
@@ -1345,7 +1384,7 @@ describe('Provider List Caching', () => {
         sdkMocks.sessionCreate.mockResolvedValueOnce({ data: { id: 'intr-parent-session-123' } });
         sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [] } });
         sdkMocks.sessionMessages.mockResolvedValueOnce([
-            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1 intr' }] }
+            { info: { id: 'assistant-intr-parent-checkpoint', role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1 intr' }] }
         ]);
 
         const seedRes = await request(app)
@@ -1361,7 +1400,7 @@ describe('Provider List Caching', () => {
         let promptCount = 0;
         sdkMocks.sessionPrompt.mockImplementation(async (params) => {
             promptCount += 1;
-            expect(params.path.id).toBe('intr-parent-session-123');
+            expect(params.path.id).toBe('fork-session-1');
             if (promptCount === 1) {
                 const err = new Error('Endpoint is unavailable.');
                 err.statusCode = 503;
@@ -1375,6 +1414,7 @@ describe('Provider List Caching', () => {
             { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 2 intr success' }] }
         ]);
 
+        sdkMocks.sessionFork.mockResolvedValueOnce({ data: { id: 'fork-session-1' } });
         sdkMocks.sessionCreate.mockClear();
         sdkMocks.sessionDelete.mockClear();
 
@@ -1400,10 +1440,13 @@ describe('Provider List Caching', () => {
         const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
 
         sdkMocks.sessionMessages.mockResolvedValue([
-            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1' }] }
+            { info: { id: 'assistant-parent-checkpoint', role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1' }] }
         ]);
         sdkMocks.sessionCreate.mockResolvedValueOnce({ data: { id: 'resp-stream-parent-456' } });
-        sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [{ type: 'text', text: 'turn 1' }] } });
+        sdkMocks.sessionPrompt.mockResolvedValue({ data: {
+            info: { id: 'assistant-parent-checkpoint', role: 'assistant', finish: 'stop' },
+            parts: [{ type: 'text', text: 'turn 1' }]
+        } });
         const seedRes = await request(app)
             .post('/v1/responses')
             .set('Authorization', 'Bearer test-key')
@@ -1447,10 +1490,13 @@ describe('Provider List Caching', () => {
         const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
 
         sdkMocks.sessionMessages.mockResolvedValue([
-            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1 nonstream' }] }
+            { info: { id: 'assistant-parent-checkpoint', role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1 nonstream' }] }
         ]);
         sdkMocks.sessionCreate.mockResolvedValueOnce({ data: { id: 'resp-nonstream-parent-789' } });
-        sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [{ type: 'text', text: 'turn 1 nonstream' }] } });
+        sdkMocks.sessionPrompt.mockResolvedValue({ data: {
+            info: { id: 'assistant-parent-checkpoint', role: 'assistant', finish: 'stop' },
+            parts: [{ type: 'text', text: 'turn 1 nonstream' }]
+        } });
 
         const seedRes = await request(app)
             .post('/v1/responses')

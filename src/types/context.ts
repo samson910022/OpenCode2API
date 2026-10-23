@@ -59,7 +59,7 @@ export interface CollectorHandle {
     intervalMs?: number,
     signal?: AbortSignal,
     expectedCurrentUserMessageId?: string,
-  ) => Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[]; partial?: boolean; complete?: boolean }>;
+  ) => Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[]; assistantMessageId?: string; partial?: boolean; complete?: boolean }>;
   collectFromEvents: (
     sessionId: string,
     timeoutMs: number,
@@ -115,7 +115,7 @@ export interface AppContext {
   logDebug: (...args: unknown[]) => void;
   responseState: Map<string, ResponseStateEntry>;
   getResponseState: (responseId: unknown) => ResponseStateEntry | null;
-  storeResponseState: (responseId: unknown, sessionId: unknown, model: unknown, toolCalls?: unknown) => void;
+  storeResponseState: (responseId: unknown, sessionId: unknown, model: unknown, toolCalls?: unknown, checkpointId?: unknown) => boolean;
   sweepResponseState: () => Promise<void>;
   TOOL_MODE: ToolModeSet;
   TOOL_GUARD_MESSAGE: string;

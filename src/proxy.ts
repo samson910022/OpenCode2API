@@ -313,6 +313,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   };
 
   const responseState = new Map<string, ResponseStateEntry>();
+  const pendingExpiredResponseSessionIds = new Set<string>();
   const RESPONSE_STATE_TTL_MS = 30 * 60 * 1000;
   const RESPONSE_STATE_SWEEP_INTERVAL_MS = 60 * 1000;
   const RESPONSE_TOOL_CALL_STATE_LIMIT = 128;
@@ -341,36 +342,53 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     if (!state) return null;
     if (state.expiresAt <= Date.now()) {
       responseState.delete(responseId);
+      pendingExpiredResponseSessionIds.add(state.sessionId);
       return null;
     }
     return state;
   };
-  const storeResponseState = (responseId: unknown, sessionId: unknown, model: unknown, toolCalls: unknown = []): void => {
-    if (!responseId || !sessionId || typeof responseId !== 'string' || typeof sessionId !== 'string') return;
+  const storeResponseState = (
+    responseId: unknown,
+    sessionId: unknown,
+    model: unknown,
+    toolCalls: unknown = [],
+    checkpointId: unknown = undefined,
+  ): boolean => {
+    if (
+      !responseId ||
+      !sessionId ||
+      typeof responseId !== 'string' ||
+      typeof sessionId !== 'string' ||
+      typeof checkpointId !== 'string' ||
+      !checkpointId.trim()
+    ) return false;
     responseState.set(responseId, {
       sessionId,
+      checkpointId,
       model: typeof model === 'string' ? model : String(model ?? ''),
       expiresAt: Date.now() + RESPONSE_STATE_TTL_MS,
       toolCalls: normalizeResponseToolCallState(toolCalls),
     });
+    return true;
   };
   const sweepResponseState = async (): Promise<void> => {
     const now = Date.now();
-    const expired: ResponseStateEntry[] = [];
     for (const [id, state] of responseState.entries()) {
       if (state.expiresAt <= now) {
-        expired.push(state);
         responseState.delete(id);
+        pendingExpiredResponseSessionIds.add(state.sessionId);
       }
     }
-    if (!expired.length) return;
-    const liveSessionIds = new Set([...responseState.values()].map((s) => s.sessionId));
-    for (const state of expired) {
-      if (liveSessionIds.has(state.sessionId)) continue;
+    for (const sessionId of pendingExpiredResponseSessionIds) {
+      const stillReferenced = [...responseState.values()].some(
+        (state) => state.sessionId === sessionId && state.expiresAt > Date.now(),
+      );
+      if (stillReferenced) continue;
       try {
-        await client.session.delete({ path: { id: state.sessionId } });
+        await client.session.delete({ path: { id: sessionId } });
+        pendingExpiredResponseSessionIds.delete(sessionId);
       } catch (e: unknown) {
-        logDebug('Failed to delete expired response session', { sessionId: state.sessionId, error: toErrorMessage(e) });
+        logDebug('Failed to delete expired response session', { sessionId, error: toErrorMessage(e) });
       }
     }
   };

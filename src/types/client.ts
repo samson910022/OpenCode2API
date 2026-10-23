@@ -2,6 +2,7 @@
 
 export interface SessionNamespace {
   create: (args?: unknown) => Promise<unknown>;
+  fork: (args: { path: { id: string } }) => Promise<unknown>;
   prompt: (args: unknown) => Promise<unknown>;
   messages: (args: unknown) => Promise<unknown>;
   delete: (args: unknown) => Promise<unknown>;

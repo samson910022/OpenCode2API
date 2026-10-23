@@ -15,6 +15,8 @@ export interface ResponseToolCallState {
 /** Stateful Responses continuation entry (previous_response_id). */
 export interface SessionInfo {
   sessionId: string;
+  /** Completed assistant message ID used as the fork checkpoint for continuations. */
+  checkpointId?: string;
   model: string;
   expiresAt: number;
   toolCalls?: ResponseToolCallState[];

@@ -11,10 +11,12 @@ const sdkMocks = {
     configUpdate: jest.fn(async () => ({})),
     toolIds: jest.fn(async () => ({ data: ['websearch', 'webfetch'] })),
     sessionCreate: jest.fn(async () => ({ data: { id: 'intr-session' } })),
+    sessionFork: jest.fn(async () => ({ data: { id: `intr-fork-${sdkMocks.sessionFork.mock.calls.length}` } })),
     sessionPrompt: jest.fn(async () => ({ data: { parts: [] } })),
-    sessionMessages: jest.fn(async () => ([
+    sessionMessages: jest.fn(async (args) => ([
         {
             info: {
+                id: `assistant-${args?.path?.id || 'intr-session'}`,
                 role: 'assistant',
                 parentID: sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0]?.body?.messageID,
                 finish: 'stop',
@@ -38,7 +40,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
     createOpencodeClient: jest.fn(() => ({
         config: { providers: sdkMocks.configProviders, update: sdkMocks.configUpdate },
         tool: { ids: sdkMocks.toolIds },
-        session: { create: sdkMocks.sessionCreate, prompt: sdkMocks.sessionPrompt, messages: sdkMocks.sessionMessages, delete: sdkMocks.sessionDelete },
+        session: { create: sdkMocks.sessionCreate, fork: sdkMocks.sessionFork, prompt: sdkMocks.sessionPrompt, messages: sdkMocks.sessionMessages, delete: sdkMocks.sessionDelete },
         event: { subscribe: sdkMocks.eventSubscribe },
     })),
 }));
@@ -126,7 +128,7 @@ describe('POST /v1beta/interactions', () => {
         expect(res.body.id).toMatch(/^intr_/);
     });
 
-    test('previous_interaction_id continues the session; store:false skips persistence', async () => {
+    test('previous_interaction_id forks the stored checkpoint; store:false skips persistence', async () => {
         const app = createApp(baseConfig({})).app;
         const first = await request(app).post('/v1beta/interactions').send({ model: 'opencode/kimi-k2.5', input: 'hi' });
         const second = await request(app).post('/v1beta/interactions').send({
@@ -135,8 +137,11 @@ describe('POST /v1beta/interactions', () => {
             previous_interaction_id: first.body.id,
         });
         expect(second.statusCode).toBe(200);
-        // stored session reused: only one session.create across both calls
+        // Continuations fork from the stored checkpoint without creating a blank session.
         expect(sdkMocks.sessionCreate.mock.calls.length).toBe(1);
+        expect(sdkMocks.sessionFork).toHaveBeenCalledWith({
+            path: { id: 'intr-session' },
+        });
         const bad = await request(app).post('/v1beta/interactions').send({
             model: 'opencode/kimi-k2.5',
             input: 'hi',
@@ -152,7 +157,7 @@ describe('POST /v1beta/interactions', () => {
         expect(sdkMocks.sessionDelete).toHaveBeenCalled();
     });
 
-    test('store:false with previous_interaction_id keeps the shared parent session', async () => {
+    test('store:false with previous_interaction_id deletes only its fork, not the parent', async () => {
         const app = createApp(baseConfig({})).app;
         const first = await request(app).post('/v1beta/interactions').send({ model: 'opencode/kimi-k2.5', input: 'hi' });
         expect(first.statusCode).toBe(200);
@@ -164,8 +169,8 @@ describe('POST /v1beta/interactions', () => {
             store: false,
         });
         expect(second.statusCode).toBe(200);
-        // Reused parent session must survive an ephemeral continuation.
-        expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
+        expect(sdkMocks.sessionDelete).toHaveBeenCalledWith({ path: { id: 'intr-fork-1' } });
+        expect(sdkMocks.sessionDelete).not.toHaveBeenCalledWith({ path: { id: 'intr-session' } });
         expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
     });
 
@@ -394,7 +399,8 @@ describe('POST /v1beta/interactions', () => {
             previous_interaction_id: stored.body.id,
         });
         expect(failedContinuation.statusCode).toBeGreaterThanOrEqual(400);
-        expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
+        expect(sdkMocks.sessionDelete).toHaveBeenCalledWith({ path: { id: 'intr-fork-1' } });
+        expect(sdkMocks.sessionDelete).not.toHaveBeenCalledWith({ path: { id: 'intr-session' } });
         expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
     });
     test('retry cleanup retains every owned session ID until deletion succeeds', async () => {
@@ -521,7 +527,7 @@ describe('POST /v1beta/interactions', () => {
         expect(sdkMocks.sessionPrompt).not.toHaveBeenCalled();
         expect(sdkMocks.sessionMessages).not.toHaveBeenCalled();
     });
-    test('stream previous_interaction_id reuses stored session', async () => {
+    test('stream previous_interaction_id forks the stored checkpoint', async () => {
         const app = createApp(baseConfig({})).app;
         const first = await request(app).post('/v1beta/interactions').send({ model: 'opencode/kimi-k2.5', input: 'hi' });
         expect(first.statusCode).toBe(200);
@@ -533,7 +539,7 @@ describe('POST /v1beta/interactions', () => {
         expect(second.text).not.toContain('[DONE]');
         expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
     });
-    test('stream store false deletes owned session but keeps shared parent', async () => {
+    test('stream store false deletes only its fork and keeps the shared parent', async () => {
         const app = createApp(baseConfig({})).app;
         jest.clearAllMocks();
         sdkMocks.toolIds.mockResolvedValue({ data: ['websearch', 'webfetch'] });
@@ -546,7 +552,8 @@ describe('POST /v1beta/interactions', () => {
         sdkMocks.toolIds.mockResolvedValue({ data: ['websearch', 'webfetch'] });
         const second = await request(app).post('/v1beta/interactions').send({ model: 'opencode/kimi-k2.5', input: 'follow-up', previous_interaction_id: first.body.id, stream: true, store: false });
         expect(second.statusCode).toBe(200);
-        expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
+        expect(sdkMocks.sessionDelete).toHaveBeenCalledWith({ path: { id: 'intr-fork-1' } });
+        expect(sdkMocks.sessionDelete).not.toHaveBeenCalledWith({ path: { id: 'intr-session' } });
         expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
     });
 });
