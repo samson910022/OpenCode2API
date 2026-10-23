@@ -1107,7 +1107,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               summary_index: 0,
               delta: filtered,
             });
-          } else if (filtered.trim()) {
+          } else if (announcedContent || filtered.trim()) {
             const entry = ensureOutputScaffold();
             emit({
               type: 'response.output_text.delta',
@@ -1487,7 +1487,10 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
            );
            reasoning = visible.reasoning;
            content = visible.content;
-         } else if (!deferVisibleOutput) {
+         } else if (deferVisibleOutput) {
+           reasoning = authoritativeSource.reasoning;
+           content = authoritativeSource.content;
+         } else {
            if (rawContent && authoritativeSource.content && !authoritativeSource.content.startsWith(rawContent)) {
              throw new Error('Stream content diverged from authoritative snapshot');
            }
@@ -2061,6 +2064,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       }
       return;
     } finally {
+      stopResponsesKeepalive();
       await cleanupOwnedResponsesSession();
     }
   });

@@ -744,4 +744,128 @@ describe('Phase 2: SSE Framing, Keepalives, Headers, and Wire Integrity', () => 
             expect(res.text).not.toContain('interaction.completed');
         });
     });
+
+    describe('8. Responses streaming whitespace preservation and authoritative snapshot', () => {
+        test('POST /v1/responses streaming preserves whitespace deltas between words without dropping spaces', async () => {
+            sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+                stream: (async function* () {
+                    yield {
+                        type: 'message.part.updated',
+                        properties: { part: { id: 'p1', type: 'text', sessionID: SESSION_ID }, delta: 'Hello' }
+                    };
+                    yield {
+                        type: 'message.part.updated',
+                        properties: { part: { id: 'p1', type: 'text', sessionID: SESSION_ID }, delta: ' ' }
+                    };
+                    yield {
+                        type: 'message.part.updated',
+                        properties: { part: { id: 'p1', type: 'text', sessionID: SESSION_ID }, delta: 'world' }
+                    };
+                    yield {
+                        type: 'message.updated',
+                        properties: { info: { sessionID: SESSION_ID, finish: 'stop' } }
+                    };
+                })()
+            }));
+
+            const res = await request(buildApp())
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'big-pickle', input: 'hi', stream: true });
+
+            expect(res.statusCode).toBe(200);
+            const lines = res.text.split('\n');
+            const deltaEvents = lines
+                .filter((line) => line.startsWith('data: ') && !line.includes('[DONE]'))
+                .map((line) => JSON.parse(line.slice(6)))
+                .filter((event) => event.type === 'response.output_text.delta');
+
+            const deltas = deltaEvents.map((e) => e.delta);
+            expect(deltas).toContain(' ');
+            expect(deltas.join('')).toBe('Hello world');
+        });
+
+        test('POST /v1/responses streaming with hosted search (deferVisibleOutput = true) updates content from authoritative snapshot when deltas are lost', async () => {
+            sdkMocks.toolIds.mockResolvedValueOnce({ data: ['websearch', 'web_fetch', 'filesystem', 'bash'] });
+            sdkMocks.sessionPrompt.mockResolvedValueOnce({ data: { parts: [] } });
+            sdkMocks.sessionMessages.mockResolvedValueOnce([
+                {
+                    info: { role: 'assistant', finish: 'stop' },
+                    parts: [
+                        { type: 'text', text: 'Authoritative search answer' },
+                        {
+                            type: 'tool',
+                            id: 'call_search_1',
+                            tool: 'websearch',
+                            state: {
+                                status: 'completed',
+                                input: { query: 'test query' },
+                                output: 'Search result: https://example.com/info'
+                            }
+                        }
+                    ]
+                }
+            ]);
+            sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+                stream: (async function* () {
+                    // Deltas are lost: only terminal message update arrives with the complete part snapshot
+                    yield {
+                        type: 'message.updated',
+                        properties: {
+                            info: {
+                                id: 'msg-1',
+                                role: 'assistant',
+                                sessionID: SESSION_ID,
+                                finish: 'stop',
+                                parts: [
+                                    { id: 'p1', messageID: 'msg-1', type: 'text', text: 'Authoritative search answer' },
+                                    {
+                                        id: 'call_search_1',
+                                        type: 'tool',
+                                        tool: 'websearch',
+                                        state: {
+                                            status: 'completed',
+                                            input: { query: 'test query' },
+                                            output: 'Search result: https://example.com/info'
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    };
+                })()
+            }));
+
+            const res = await request(buildApp())
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({
+                    model: 'big-pickle',
+                    input: 'search for something',
+                    tools: [{ type: 'web_search' }],
+                    stream: true
+                });
+
+            expect(res.statusCode).toBe(200);
+            expect(res.headers['content-type']).toContain('text/event-stream');
+            expect(res.text).toContain('response.completed');
+            expect(res.text).not.toContain('response.failed');
+
+            const lines = res.text.split('\n');
+            const deltaEvents = lines
+                .filter((line) => line.startsWith('data: ') && !line.includes('[DONE]'))
+                .map((line) => JSON.parse(line.slice(6)))
+                .filter((event) => event.type === 'response.output_text.delta');
+
+            const deltas = deltaEvents.map((e) => e.delta);
+            expect(deltas.join('')).toContain('Authoritative search answer');
+
+            const completedLine = lines.find((line) => line.startsWith('data: ') && line.includes('response.completed'));
+            expect(completedLine).toBeDefined();
+            const completedEvent = JSON.parse(completedLine.slice(6));
+            const msgItem = completedEvent.response.output.find((item) => item.type === 'message');
+            expect(msgItem).toBeDefined();
+            expect(msgItem.content[0].text).toBe('Authoritative search answer');
+        });
+    });
 });

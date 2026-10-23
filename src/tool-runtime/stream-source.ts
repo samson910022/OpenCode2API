@@ -63,7 +63,7 @@ export function resolveAuthoritativeStreamSource(input: {
   const collected = asRecord(input.collected);
   const rawContent = asText(input.rawContent);
   const rawReasoning = asText(input.rawReasoning);
-  if (collected['authoritative'] === true) {
+  if (collected['authoritative'] === true && collected['error'] == null) {
     const content = asText(collected['content']);
     const reasoning = asText(collected['reasoning']);
     // The collector only marks a real repair, but keep the non-empty guard here

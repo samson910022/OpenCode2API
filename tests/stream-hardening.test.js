@@ -671,6 +671,27 @@ describe('collector authoritative snapshots', () => {
         expect(result.content).not.toContain('world world');
     });
 
+    test('co-occurring part.text and delta on legacy OpenCode server events does not duplicate delta text', async () => {
+        const result = await run([
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: { id: 'p1', messageID: 'msg-1', type: 'text', text: 'Initial', sessionID: 'collector-session' }
+                }
+            },
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: { id: 'p1', messageID: 'msg-1', type: 'text', text: 'Initial reply', sessionID: 'collector-session' },
+                    delta: ' reply'
+                }
+            },
+            stop()
+        ]);
+        expect(result.content).toBe('Initial reply');
+        expect(result.content).not.toContain('reply reply');
+    });
+
     test('flushes orphaned deltas whose part update was dropped', async () => {
         const result = await run([
             { type: 'message.part.delta', properties: { sessionID: 'collector-session', messageID: 'msg-1', partID: 'orphan', field: 'text', delta: 'orphan text' } },

@@ -784,13 +784,19 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
               // answer/tool content. When the role is still unknown the part is
               // stored and filtered at finalize if the role later turns out user.
               if ((partType === 'text' || partType === 'reasoning') && !isUserPart(partMessageID)) {
+                const textUpdated = typeof part['text'] === 'string' && Boolean(part['text']);
                 applyPartSnapshot(part);
                 // Older OpenCode servers carried the streaming delta directly on
                 // message.part.updated; newer servers emit message.part.delta.
                 const delta: unknown = props['delta'];
                 if (typeof delta === 'string' && delta) {
                   const state = ensurePartState(partMessageID, readPartId(part['id']), partType);
-                  appendPartDelta(state, delta);
+                  if (textUpdated) {
+                    state.deltaText += delta;
+                    applyTextDelta(state.type, delta);
+                  } else {
+                    appendPartDelta(state, delta);
+                  }
                 }
               }
               trackToolActivity(part);

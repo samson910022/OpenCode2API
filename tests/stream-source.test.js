@@ -70,6 +70,13 @@ describe('resolveAuthoritativeStreamSource', () => {
         }));
         expect(source).toMatchObject({ kind: 'raw', fromSnapshot: false, content: 'raw content' });
     });
+
+    test('an error-bearing collector falls back to the raw group', () => {
+        const source = resolveAuthoritativeStreamSource(rawInput({
+            collected: { content: 'ignored', reasoning: '', authoritative: true, error: { name: 'Boom' } }
+        }));
+        expect(source).toMatchObject({ kind: 'raw', fromSnapshot: false, content: 'raw content' });
+    });
 });
 
 describe('isMalformedExternalToolCallError', () => {
