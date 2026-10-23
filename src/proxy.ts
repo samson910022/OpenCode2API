@@ -149,8 +149,16 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   // Auth middleware (accepts Authorization: Bearer and x-api-key for Anthropic SDK compat)
   // Runs before bodyParser so unauthenticated requests are rejected immediately without parsing.
   app.use((req: Request, res: Response, next: NextFunction): void => {
-    if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/health/details' || req.path === '/metrics')
+    const normalizedPath = req.path.replace(/\/+$/, '') || '/';
+    if (
+      req.method === 'OPTIONS' ||
+      normalizedPath === '/health' ||
+      normalizedPath === '/' ||
+      normalizedPath === '/health/details' ||
+      normalizedPath === '/metrics'
+    ) {
       return next();
+    }
     if (apiKeyVerifier.keys.length > 0) {
       const authorized = apiKeyVerifier.isAuthorized(
         req as unknown as { headers: { authorization?: unknown; 'x-api-key'?: unknown } },
@@ -168,7 +176,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   });
 
   app.use(bodyParser.json({ limit: '50mb' }));
-  app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
+  app.use(bodyParser.urlencoded({ limit: '1mb', extended: false }));
 
   const PROVIDERS_CACHE_TTL_MS = 30_000;
   let cachedProvidersList: ProviderInfo[] | null = null;

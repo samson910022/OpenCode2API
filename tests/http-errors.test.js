@@ -49,6 +49,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
 const { createApp } = await import('../src/proxy.js');
 const { classifyHttpError } = await import('../src/errors/http.js');
 const { registerErrorHandler } = await import('../src/routes/system.js');
+const { toAnthropicErrorType } = await import('../src/converters/anthropic.js');
 
 describe('Pure HTTP Error Classifier (classifyHttpError)', () => {
     test('classifies entity.parse.failed as 400 invalid_json for OpenAI routes', () => {
@@ -186,6 +187,12 @@ describe('Pure HTTP Error Classifier (classifyHttpError)', () => {
         expect(serializedAnthropic).not.toContain('Database password');
         expect(serializedAnthropic).not.toContain('sensitive raw snippet');
         expect(serializedAnthropic).not.toContain('/var/secrets');
+    });
+});
+
+describe('Anthropic Error Type Mapping (toAnthropicErrorType)', () => {
+    test('maps 415 to invalid_request_error', () => {
+        expect(toAnthropicErrorType(415)).toBe('invalid_request_error');
     });
 });
 
@@ -463,5 +470,38 @@ describe('Terminal Express Error Handler with Supertest', () => {
         await request(testApp).get('/stream');
         expect(nextCalledWith).toBeInstanceOf(Error);
         expect(nextCalledWith.message).toBe('stream broke mid-flight');
+    });
+
+    test('trailing slashes on bypass endpoints (/health/, /health/details/, /metrics/) bypass auth without 401 when API_KEY is configured', async () => {
+        const bypassApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: true,
+            DEBUG: false,
+            HEALTH_DETAILS_ENABLED: true,
+            HEALTH_DETAILS_REQUIRE_AUTH: false,
+            METRICS_ENABLED: true,
+            METRICS_REQUIRE_AUTH: false
+        }).app;
+
+        const healthRes = await request(bypassApp).get('/health/');
+        expect(healthRes.status).toBe(200);
+        expect(healthRes.body.status).toBe('ok');
+
+        const healthDetailsRes = await request(bypassApp).get('/health/details/');
+        expect(healthDetailsRes.status).toBe(200);
+        expect(healthDetailsRes.body.status).toBe('ok');
+
+        const metricsRes = await request(bypassApp).get('/metrics/');
+        expect(metricsRes.status).toBe(200);
+        expect(metricsRes.text).toContain('opencode_internal_tool_mode_requests_total');
+    });
+
+    test('GET /health/ with trailing slash bypasses auth without 401 on default app', async () => {
+        const res = await request(app).get('/health/');
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ status: 'ok', proxy: true });
     });
 });

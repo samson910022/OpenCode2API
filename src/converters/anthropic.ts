@@ -403,6 +403,7 @@ export function toAnthropicErrorType(statusCode: number, upstreamType?: string):
     if (statusCode === 401 || upstreamType === 'invalid_api_key') return 'authentication_error';
     if (statusCode === 403 || upstreamType === 'permission_denied') return 'permission_error';
     if (statusCode === 413) return 'request_too_large';
+    if (statusCode === 415) return 'invalid_request_error';
     if (statusCode === 429 || upstreamType === 'rate_limit_exceeded') return 'rate_limit_error';
     if (statusCode === 529) return 'overloaded_error';
     return 'api_error';
