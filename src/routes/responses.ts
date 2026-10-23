@@ -1192,6 +1192,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
 
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
           collected = null;
+          let promptError: unknown = null;
           if (attempt > 1) {
             const retriedSessionId = sessionId;
             if (!isContinuation) {
@@ -1247,6 +1248,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               // SSE subscribe ignores custom fetch (SDK gap): prompt through the
               // proxy bundle; the poll below fills content/reasoning.
               if (!(isContinuation && promptSubmitted)) {
+                if (isContinuation) {
+                  promptSubmitted = true;
+                }
                 await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
                 promptSubmitted = true;
               }
@@ -1278,11 +1282,17 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               if (isContinuation && promptSubmitted) {
                 // Do NOT prompt again!
               } else {
+                if (isContinuation) {
+                  promptSubmitted = true;
+                }
                 promptPromise = activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS)
                   .then(() => {
                     promptSubmitted = true;
                   })
-                  .catch((err: unknown) => logDebug('Responses prompt error:', toErrorMessage(err)));
+                  .catch((err: unknown) => {
+                    promptError = err;
+                    logDebug('Responses prompt error:', toErrorMessage(err));
+                  });
               }
               const closePromise = getResponsesResClosed();
               const raced = closePromise
@@ -1305,7 +1315,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           }
 
           const collectedRecord = asRecord(collected);
-          let attemptError: unknown = collectedRecord['error'] ?? collectedRecord['__error'] ?? null;
+          let attemptError: unknown = promptError ?? (collectedRecord['error'] ?? collectedRecord['__error'] ?? null);
           if (!attemptError && (collectedRecord['noData'] || collectedRecord['cut'] || collectedRecord['idleTimeout'])) {
             try {
               const recovery = await pollRecoverySnapshot();
@@ -1324,7 +1334,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             }
           }
           const nothingStreamed = !rawContent && !rawReasoning && streamedToolCalls.length === 0;
-          if (isContinuation && promptSubmitted && attemptError) {
+          if (isContinuation && attemptError) {
             throw normalizeBackendError(attemptError);
           }
           if (attemptError && nothingStreamed && attempt < maxAttempts && engageProxyFallback(attemptError)) {
@@ -1764,6 +1774,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               responsesAbortController.signal,
             );
           } else {
+            if (isNonStreamContinuation) {
+              promptSubmitted = true;
+            }
             responseRes = await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
             promptSubmitted = true;
             const dataParts: unknown = asRecord(asRecord(responseRes)['data'])['parts'];
@@ -1789,7 +1802,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             );
           }
         } catch (loopError: unknown) {
-          if (isNonStreamContinuation && promptSubmitted) {
+          if (isNonStreamContinuation) {
             throw normalizeBackendError(loopError);
           }
           if (attempt < maxAttempts && engageProxyFallback(loopError)) {
@@ -1808,7 +1821,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         }
         const polledError = polledResponse?.error ?? (polledResponse?.partial === true ? new Error('Polling returned incomplete response') : null);
         if (polledResponse && polledError != null) {
-          if (isNonStreamContinuation && promptSubmitted) {
+          if (isNonStreamContinuation) {
             throw normalizeBackendError(polledError);
           }
           if (attempt < maxAttempts && engageProxyFallback(polledError)) {

@@ -373,6 +373,9 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           }
           try {
             if (!(parentSessionId && promptSubmitted)) {
+              if (parentSessionId) {
+                promptSubmitted = true;
+              }
               await awaitWithAbort(activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS), requestAbortController.signal);
               promptSubmitted = true;
             }
@@ -388,7 +391,7 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
             return polled;
           } catch (e: unknown) {
             lastErr = e;
-            if (parentSessionId && promptSubmitted) {
+            if (parentSessionId) {
               throw normalizeBackendError(e);
             }
             if (attempt < maxAttempts && engageProxyFallback(e)) continue;

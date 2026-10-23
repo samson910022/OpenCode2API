@@ -914,7 +914,7 @@ describe('Provider List Caching', () => {
         expect(turn2Entries).toHaveLength(1);
     });
 
-    test('Interactions continuation 503 retry preserves parent session AND does not call session.create()', async () => {
+    test('Interactions continuation 503 prompt failure fails closed and preserves parent session', async () => {
         const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
 
         sdkMocks.sessionCreate.mockResolvedValueOnce({ data: { id: 'intr-parent-session-123' } });
@@ -939,6 +939,7 @@ describe('Provider List Caching', () => {
             expect(params.path.id).toBe('intr-parent-session-123');
             if (promptCount === 1) {
                 const err = new Error('Endpoint is unavailable.');
+                err.statusCode = 503;
                 err.data = { statusCode: 503, message: 'Endpoint is unavailable.', responseHeaders: { 'retry-after-ms': '5' } };
                 throw err;
             }
@@ -960,13 +961,106 @@ describe('Provider List Caching', () => {
                 previous_interaction_id: prevIntrId
             });
 
-        expect(contRes.status).toBe(200);
-        expect(contRes.body.output_text).toBe('turn 2 intr success');
+        expect(contRes.status).toBe(503);
+        expect(contRes.body.message).toContain('Endpoint is unavailable.');
+        expect(promptCount).toBe(1);
 
         // Verify parent session was NOT deleted and session.create() was NOT called on retry
         expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
         const deletedIds = sdkMocks.sessionDelete.mock.calls.map(c => c[0]?.path?.id);
         expect(deletedIds).not.toContain('intr-parent-session-123');
+    });
+
+    test('Responses streaming continuation prompt failure fails closed, emits response.failed with 503 and prompts only once', async () => {
+        const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
+
+        sdkMocks.sessionMessages.mockResolvedValue([
+            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1' }] }
+        ]);
+        sdkMocks.sessionCreate.mockResolvedValueOnce({ data: { id: 'resp-stream-parent-456' } });
+        sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [{ type: 'text', text: 'turn 1' }] } });
+        const seedRes = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/kimi-k2.5', input: 'first turn' });
+        expect(seedRes.status).toBe(200);
+        const prevId = seedRes.body.id;
+
+        let sessionPromptTurn2Calls = 0;
+        sdkMocks.sessionPrompt.mockImplementation(async (params) => {
+            sessionPromptTurn2Calls += 1;
+            const err = new Error('Endpoint is unavailable.');
+            err.statusCode = 503;
+            err.data = { statusCode: 503, message: 'Endpoint is unavailable.', responseHeaders: { 'retry-after-ms': '5' } };
+            throw err;
+        });
+
+        sdkMocks.sessionDelete.mockClear();
+        sdkMocks.sessionCreate.mockClear();
+
+        const contRes = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'second turn',
+                stream: true,
+                previous_response_id: prevId,
+            });
+
+        expect(contRes.status).toBe(200);
+        expect(contRes.text).toContain('response.failed');
+        expect(contRes.text).toContain('Endpoint is unavailable.');
+        expect(contRes.text).not.toContain('response.completed');
+        expect(sessionPromptTurn2Calls).toBe(1);
+        expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
+        const deletedIds = sdkMocks.sessionDelete.mock.calls.map(c => c[0]?.path?.id);
+        expect(deletedIds).not.toContain('resp-stream-parent-456');
+    });
+
+    test('Responses non-stream continuation prompt failure fails closed, returns 503 and prompts only once', async () => {
+        const { app } = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 }));
+
+        sdkMocks.sessionMessages.mockResolvedValue([
+            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'turn 1 nonstream' }] }
+        ]);
+        sdkMocks.sessionCreate.mockResolvedValueOnce({ data: { id: 'resp-nonstream-parent-789' } });
+        sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [{ type: 'text', text: 'turn 1 nonstream' }] } });
+
+        const seedRes = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/kimi-k2.5', input: 'first turn nonstream' });
+        expect(seedRes.status).toBe(200);
+        const prevId = seedRes.body.id;
+
+        let sessionPromptTurn2Calls = 0;
+        sdkMocks.sessionPrompt.mockImplementation(async (params) => {
+            sessionPromptTurn2Calls += 1;
+            const err = new Error('Endpoint is unavailable.');
+            err.statusCode = 503;
+            err.data = { statusCode: 503, message: 'Endpoint is unavailable.', responseHeaders: { 'retry-after-ms': '5' } };
+            throw err;
+        });
+
+        sdkMocks.sessionDelete.mockClear();
+        sdkMocks.sessionCreate.mockClear();
+
+        const contRes = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'second turn nonstream',
+                previous_response_id: prevId,
+            });
+
+        expect(contRes.status).toBe(503);
+        expect(contRes.body.message).toContain('Endpoint is unavailable.');
+        expect(sessionPromptTurn2Calls).toBe(1);
+        expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
+        const deletedIds = sdkMocks.sessionDelete.mock.calls.map(c => c[0]?.path?.id);
+        expect(deletedIds).not.toContain('resp-nonstream-parent-789');
     });
 
     test('Responses stream proxy fallback succeeds cleanly without repeating prompts or retaining Attempt 1 error', async () => {
