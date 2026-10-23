@@ -374,6 +374,10 @@ export function notifyBackendReconnect(): void {
   }
 }
 
+export function clearBackendReconnectListeners(): void {
+  backendReconnectListeners.clear();
+}
+
 /**
  * Backend Lifecycle Management
  */

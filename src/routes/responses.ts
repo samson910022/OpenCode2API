@@ -1194,6 +1194,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           collected = null;
           let promptError: unknown = null;
           if (attempt > 1) {
+            if (fallbackToProxy) switchToProxyBundle();
+            await ensureActiveModel(activeClient, pID, mID).catch(() => {});
             const retriedSessionId = sessionId;
             if (!isContinuation) {
               promptSubmitted = false;
@@ -1744,6 +1746,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           return;
         }
         if (attempt > 1) {
+          if (fallbackToProxy) switchToProxyBundle();
+          await ensureActiveModel(activeClient, pID, mID).catch(() => {});
           if (!isNonStreamContinuation) {
             promptSubmitted = false;
             const retriedSessionId = sessionId;

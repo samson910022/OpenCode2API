@@ -27,13 +27,17 @@ const sdkMocks = {
     }))
 };
 
+const httpMocks = {
+    get: jest.fn((_url, _options, callback) => {
+        const cb = typeof _options === 'function' ? _options : callback;
+        cb({ statusCode: 200, headers: {}, on: jest.fn() });
+        return { on: jest.fn(), destroy: jest.fn(), setTimeout: jest.fn() };
+    })
+};
+
 jest.unstable_mockModule('http', () => ({
     default: {
-        get: jest.fn((_url, _options, callback) => {
-            const cb = typeof _options === 'function' ? _options : callback;
-            cb({ statusCode: 200, headers: {}, on: jest.fn() });
-            return { on: jest.fn(), destroy: jest.fn(), setTimeout: jest.fn() };
-        })
+        get: httpMocks.get
     }
 }));
 
@@ -63,7 +67,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
 
 const { isTransientUpstreamError } = await import('../src/errors/upstream.js');
 const { createApp } = await import('../src/proxy.js');
-const { lock, notifyBackendReconnect } = await import('../src/backend/manager.js');
+const { lock, notifyBackendReconnect, clearBackendReconnectListeners } = await import('../src/backend/manager.js');
 
 function freeUsageError() {
     return {
@@ -1113,5 +1117,284 @@ describe('Provider List Caching', () => {
         expect(res.text).toContain('response.completed');
         expect(res.text).not.toContain('Rate limit exceeded');
         expect(promptCalls).toBe(2);
+    });
+});
+
+describe('Backend Lifecycle & Active Model Retries', () => {
+    afterEach(() => {
+        clearBackendReconnectListeners();
+    });
+
+    test('getProvidersList triggers ensureBackend when config.MANAGE_BACKEND: true', async () => {
+        sdkMocks.configProviders.mockClear();
+        httpMocks.get.mockClear();
+
+        // With MANAGE_BACKEND: true, getProvidersList triggers ensureBackend (which calls checkHealth via http.get)
+        const { ctx: ctxManage } = createApp(baseConfig({ MANAGE_BACKEND: true }));
+        const list = await ctxManage.getProvidersList();
+        expect(list).toHaveLength(1);
+        expect(httpMocks.get).toHaveBeenCalled();
+        expect(sdkMocks.configProviders).toHaveBeenCalledTimes(1);
+
+        // With MANAGE_BACKEND: false, getProvidersList does not call ensureBackend
+        httpMocks.get.mockClear();
+        sdkMocks.configProviders.mockClear();
+        const { ctx: ctxNoManage } = createApp(baseConfig({ MANAGE_BACKEND: false }));
+        const listNoManage = await ctxNoManage.getProvidersList();
+        expect(listNoManage).toHaveLength(1);
+        expect(httpMocks.get).not.toHaveBeenCalled();
+        expect(sdkMocks.configProviders).toHaveBeenCalledTimes(1);
+    });
+
+    test('ensureActiveModel is called on retry when proxy fallback switches activeClient (Responses stream)', async () => {
+        sdkMocks.configUpdate.mockClear();
+        const { app } = createApp(baseConfig({
+            RETRY_MAX_RETRIES: 1,
+            UPSTREAM_PROXIES: ['http://10.0.0.1:8080'],
+            UPSTREAM_PROXY_COOLDOWN_MS: 60000,
+        }));
+
+        let sessionCount = 0;
+        sdkMocks.sessionCreate.mockImplementation(async () => {
+            sessionCount += 1;
+            return { data: { id: `resp-fallback-model-${sessionCount}` } };
+        });
+
+        sdkMocks.eventSubscribe.mockImplementation(async () => {
+            return {
+                stream: (async function* () {
+                    if (sessionCount === 1) {
+                        yield {
+                            type: 'session.error',
+                            properties: {
+                                sessionID: 'resp-fallback-model-1',
+                                error: freeUsageError()
+                            }
+                        };
+                    } else {
+                        yield {
+                            type: 'message.part.updated',
+                            properties: {
+                                part: { type: 'text', sessionID: 'resp-fallback-model-2' },
+                                delta: 'Hello from fallback attempt 2'
+                            }
+                        };
+                        yield {
+                            type: 'message.updated',
+                            properties: {
+                                info: { sessionID: 'resp-fallback-model-2', finish: 'stop' }
+                            }
+                        };
+                    }
+                })()
+            };
+        });
+
+        sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [] } }));
+        sdkMocks.sessionMessages.mockResolvedValue([
+            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'Hello from fallback attempt 2' }] }
+        ]);
+
+        const res = await request(app)
+            .post('/v1/responses')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'test active model retry',
+                stream: true
+            });
+
+        expect(res.status).toBe(200);
+        expect(sessionCount).toBe(2);
+        // Attempt 1 calls ensureActiveModel on primary client, Attempt 2 on fallback proxyClient
+        expect(sdkMocks.configUpdate).toHaveBeenCalledTimes(2);
+        expect(sdkMocks.configUpdate).toHaveBeenNthCalledWith(1, {
+            body: { activeModel: { providerID: 'opencode', modelID: 'kimi-k2.5' } }
+        });
+        expect(sdkMocks.configUpdate).toHaveBeenNthCalledWith(2, {
+            body: { activeModel: { providerID: 'opencode', modelID: 'kimi-k2.5' } }
+        });
+    });
+
+    test('ensureActiveModel is called on retry when proxy fallback switches activeClient (Messages stream)', async () => {
+        sdkMocks.configUpdate.mockClear();
+        const { app } = createApp(baseConfig({
+            RETRY_MAX_RETRIES: 1,
+            UPSTREAM_PROXIES: ['http://10.0.0.1:8080'],
+            UPSTREAM_PROXY_COOLDOWN_MS: 60000,
+        }));
+
+        let sessionCount = 0;
+        sdkMocks.sessionCreate.mockImplementation(async () => {
+            sessionCount += 1;
+            return { data: { id: `msg-fallback-model-${sessionCount}` } };
+        });
+
+        sdkMocks.eventSubscribe.mockImplementation(async () => {
+            return {
+                stream: (async function* () {
+                    if (sessionCount === 1) {
+                        yield {
+                            type: 'session.error',
+                            properties: {
+                                sessionID: 'msg-fallback-model-1',
+                                error: freeUsageError()
+                            }
+                        };
+                    } else {
+                        yield {
+                            type: 'message.part.updated',
+                            properties: {
+                                part: { type: 'text', sessionID: 'msg-fallback-model-2' },
+                                delta: 'Hello from messages fallback attempt 2'
+                            }
+                        };
+                        yield {
+                            type: 'message.updated',
+                            properties: {
+                                info: { sessionID: 'msg-fallback-model-2', finish: 'stop' }
+                            }
+                        };
+                    }
+                })()
+            };
+        });
+
+        sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [] } }));
+
+        const res = await request(app)
+            .post('/v1/messages')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                max_tokens: 100,
+                messages: [{ role: 'user', content: 'test active model retry' }],
+                stream: true
+            });
+
+        expect(res.status).toBe(200);
+        expect(sessionCount).toBe(2);
+        // Attempt 1 on primary client, Attempt 2 on fallback proxyClient
+        expect(sdkMocks.configUpdate).toHaveBeenCalledTimes(2);
+        expect(sdkMocks.configUpdate).toHaveBeenNthCalledWith(1, {
+            body: { activeModel: { providerID: 'opencode', modelID: 'kimi-k2.5' } }
+        });
+        expect(sdkMocks.configUpdate).toHaveBeenNthCalledWith(2, {
+            body: { activeModel: { providerID: 'opencode', modelID: 'kimi-k2.5' } }
+        });
+    });
+
+    test('ensureActiveModel is called on retry when proxy fallback switches activeClient (Interactions)', async () => {
+        sdkMocks.configUpdate.mockClear();
+        const { app } = createApp(baseConfig({
+            RETRY_MAX_RETRIES: 1,
+            UPSTREAM_PROXIES: ['http://10.0.0.1:8080'],
+            UPSTREAM_PROXY_COOLDOWN_MS: 60000,
+        }));
+
+        let sessionCount = 0;
+        sdkMocks.sessionCreate.mockImplementation(async () => {
+            sessionCount += 1;
+            return { data: { id: `intr-fallback-model-${sessionCount}` } };
+        });
+
+        sdkMocks.sessionPrompt.mockImplementation(async () => {
+            if (sessionCount === 1) {
+                throw freeUsageError();
+            }
+            return { data: { parts: [] } };
+        });
+
+        sdkMocks.sessionMessages.mockResolvedValue([
+            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'Hello from interactions fallback attempt 2' }] }
+        ]);
+
+        const res = await request(app)
+            .post('/v1beta/interactions')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'test interactions active model retry',
+            });
+
+        expect(res.status).toBe(200);
+        expect(sessionCount).toBe(2);
+        expect(res.body.output_text).toBe('Hello from interactions fallback attempt 2');
+        expect(sdkMocks.configUpdate).toHaveBeenCalledTimes(2);
+        expect(sdkMocks.configUpdate).toHaveBeenNthCalledWith(1, {
+            body: { activeModel: { providerID: 'opencode', modelID: 'kimi-k2.5' } }
+        });
+        expect(sdkMocks.configUpdate).toHaveBeenNthCalledWith(2, {
+            body: { activeModel: { providerID: 'opencode', modelID: 'kimi-k2.5' } }
+        });
+    });
+
+    test('Chat route ensures activeModel is updated on retry when proxy fallback switches activeClient', async () => {
+        sdkMocks.configUpdate.mockClear();
+        const { app } = createApp(baseConfig({
+            UPSTREAM_PROXIES: ['http://10.0.0.1:8080'],
+            UPSTREAM_PROXY_COOLDOWN_MS: 60000,
+            RETRY_MAX_RETRIES: 1,
+        }));
+
+        let sessionCount = 0;
+        sdkMocks.sessionCreate.mockImplementation(async () => {
+            sessionCount += 1;
+            return { data: { id: `chat-fallback-session-${sessionCount}` } };
+        });
+
+        sdkMocks.sessionPrompt.mockImplementation(async () => {
+            if (sessionCount === 1) {
+                throw freeUsageError();
+            }
+            return { data: { parts: [] } };
+        });
+
+        sdkMocks.sessionMessages.mockResolvedValue([
+            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'Hello from chat fallback attempt 2' }] }
+        ]);
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'test chat active model retry' }],
+            });
+
+        expect(res.status).toBe(200);
+        expect(sessionCount).toBe(2);
+        expect(res.body.choices[0].message.content).toBe('Hello from chat fallback attempt 2');
+        expect(sdkMocks.configUpdate).toHaveBeenCalledTimes(2);
+        expect(sdkMocks.configUpdate).toHaveBeenNthCalledWith(1, {
+            body: { activeModel: { providerID: 'opencode', modelID: 'kimi-k2.5' } }
+        });
+        expect(sdkMocks.configUpdate).toHaveBeenNthCalledWith(2, {
+            body: { activeModel: { providerID: 'opencode', modelID: 'kimi-k2.5' } }
+        });
+    });
+
+    test('clearBackendReconnectListeners and ctx.dispose() clean up reconnect listeners', async () => {
+        sdkMocks.configProviders.mockClear();
+
+        // 1. ctx.dispose() removes reconnect listener
+        const { ctx: ctx1 } = createApp(baseConfig({}));
+        await ctx1.getProvidersList();
+        expect(sdkMocks.configProviders).toHaveBeenCalledTimes(1);
+
+        expect(typeof ctx1.dispose).toBe('function');
+        ctx1.dispose();
+
+        // notifyBackendReconnect() does not invalidate disposed ctx cache
+        notifyBackendReconnect();
+        await ctx1.getProvidersList();
+        expect(sdkMocks.configProviders).toHaveBeenCalledTimes(1);
+
+        // 2. clearBackendReconnectListeners clears all listeners globally
+        sdkMocks.configProviders.mockClear();
+        const { ctx: ctx2 } = createApp(baseConfig({}));
+        await ctx2.getProvidersList();
+        expect(sdkMocks.configProviders).toHaveBeenCalledTimes(1);
+
+        clearBackendReconnectListeners();
+        notifyBackendReconnect();
+        await ctx2.getProvidersList();
+        expect(sdkMocks.configProviders).toHaveBeenCalledTimes(1);
     });
 });

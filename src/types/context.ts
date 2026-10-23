@@ -172,6 +172,8 @@ export interface AppContext {
   getDiscoveryLastError: () => string | null;
   /** Wired N×N translator registry (Phase 1 wiring; optional so manual test ctx still compiles). */
   translators?: TranslatorRegistry;
+  /** Cleanup proxy listeners and subscriptions. */
+  dispose?: () => void;
 }
 
 export interface CreateAppResult {

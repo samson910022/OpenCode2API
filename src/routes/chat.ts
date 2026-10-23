@@ -632,6 +632,8 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
 
               for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
                 if (attempt > 1) {
+                  if (fallbackToProxy) switchToProxyBundle();
+                  await ensureActiveModel(activeClient, pID, mID).catch(() => {});
                   try {
                     await activeClient.session.delete({ path: { id: sessionId } });
                   } catch (e: unknown) {
@@ -1065,6 +1067,8 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   return;
                 }
                 if (attempt > 1) {
+                  if (fallbackToProxy) switchToProxyBundle();
+                  await ensureActiveModel(activeClient, pID, mID).catch(() => {});
                   try {
                     await activeClient.session.delete({ path: { id: sessionId } });
                   } catch (e: unknown) {

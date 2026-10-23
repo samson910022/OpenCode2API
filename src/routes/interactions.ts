@@ -143,19 +143,19 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
     let activePromptWithTimeout = promptWithTimeout;
     let activePollForAssistantResponse = pollForAssistantResponse;
     let fallbackToProxy = false;
-    if (proxyPool.isEngaged() && proxyClient) {
-      activeClient = proxyClient;
-      activePromptWithTimeout = proxyPromptWithTimeout;
-      activePollForAssistantResponse = proxyPollForAssistantResponse;
-    }
-    const engageProxyFallback = (err: unknown): boolean => {
-      if (!engageFallbackForFreeLimit(err, proxyPool) || !proxyClient) return false;
+    const switchToProxyBundle = (): boolean => {
+      if (!proxyClient) return false;
       activeClient = proxyClient;
       activePromptWithTimeout = proxyPromptWithTimeout;
       activePollForAssistantResponse = proxyPollForAssistantResponse;
       fallbackToProxy = true;
       return true;
     };
+    const engageProxyFallback = (err: unknown): boolean => {
+      if (!engageFallbackForFreeLimit(err, proxyPool)) return false;
+      return switchToProxyBundle();
+    };
+    if (proxyPool.isEngaged()) switchToProxyBundle();
     const onClientClose = (): void => {
       if (res.writableEnded) return;
       clientGone = true;
@@ -347,6 +347,8 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
           if (res.destroyed || res.writableEnded) throw new Error('Client disconnected');
           if (attempt > 1) {
+            if (fallbackToProxy) switchToProxyBundle();
+            await ensureActiveModel(activeClient, pID, mID).catch(() => {});
             if (!parentSessionId) {
               promptSubmitted = false;
               const currentId = sessionId as string;

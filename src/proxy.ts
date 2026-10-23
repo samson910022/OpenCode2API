@@ -191,7 +191,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     pendingProvidersPromise = null;
   };
 
-  onBackendReconnect(invalidateProvidersCache);
+  const unsubscribeReconnect = onBackendReconnect(invalidateProvidersCache);
 
   const getProvidersList = async (): Promise<ProviderInfo[]> => {
     const now = Date.now();
@@ -204,6 +204,9 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     const epoch = providersCacheEpoch;
     pendingProvidersPromise = (async () => {
       try {
+        if (config.MANAGE_BACKEND) {
+          await ensureBackend(config);
+        }
         const providersRes = (await client.config.providers()) as unknown;
         const providersRaw: unknown = asRecord(asRecord(providersRes)['data'])['providers'] ?? [];
         const list = Array.isArray(providersRaw)
@@ -1152,6 +1155,9 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     getDiscoveryLastErrorAt: () => discoveryLastErrorAt,
     getDiscoveryLastError: () => discoveryLastError,
     translators: ensureTranslatorsRegistered(defaultTranslatorRegistry()),
+    dispose: () => {
+      unsubscribeReconnect();
+    },
   };
 
   // P3: register routes (404 last to preserve catch-all order, error handler after).
