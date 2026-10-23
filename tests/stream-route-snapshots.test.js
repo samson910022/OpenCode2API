@@ -148,18 +148,28 @@ const payloads = [
     }]
 ];
 
+const plainTextPayloads = [
+    ['chat', '/v1/chat/completions', { model: 'opencode/kimi-k2.5', stream: true, messages: [{ role: 'user', content: 'Say hello' }] }],
+    ['messages', '/v1/messages', { model: 'opencode/kimi-k2.5', max_tokens: 100, stream: true, messages: [{ role: 'user', content: 'Say hello' }] }],
+    ['responses', '/v1/responses', { model: 'opencode/kimi-k2.5', input: 'Say hello', stream: true }],
+];
+
 describe('route snapshot source selection', () => {
     beforeEach(() => {
         jest.clearAllMocks();
         sdkMocks.eventSubscribe.mockImplementation(async () => ({
             stream: (async function* () {
                 yield {
+                    type: 'message.updated',
+                    properties: { info: { id: 'assistant-current', role: 'assistant', sessionID: SESSION_ID } },
+                };
+                yield {
                     type: 'message.part.updated',
-                    properties: { part: { type: 'text', sessionID: SESSION_ID }, delta: '<function_calls>{"id":"call_raw_complete","name":"read","arguments":{"path":"a.txt"}}</function_calls>' }
+                    properties: { part: { id: 'raw-part', messageID: 'assistant-current', type: 'text', sessionID: SESSION_ID }, delta: '<function_calls>{"id":"call_raw_complete","name":"read","arguments":{"path":"a.txt"}}</function_calls>' }
                 };
                 // finish=tool keeps the collector waiting for a terminal snapshot;
                 // the tiny idle window then forces the recovery-poll path.
-                yield { type: 'message.updated', properties: { info: { sessionID: SESSION_ID, finish: 'tool' } } };
+                yield { type: 'message.updated', properties: { info: { id: 'assistant-current', role: 'assistant', sessionID: SESSION_ID, finish: 'tool' } } };
             })()
         }));
     });
@@ -180,8 +190,75 @@ describe('route snapshot source selection', () => {
         expect(calls[0]).toMatchObject({ name: 'read' });
         expect(JSON.stringify(calls[0].arguments)).toContain('a.txt');
         expect(sdkMocks.sessionMessages).toHaveBeenCalled();
-        expect(res.text).not.toContain('response.failed');
-        expect(res.text).not.toMatch(/"error"\s*:\s*\{/);
+        if (_label === 'chat') {
+            expect(res.text).toContain('"finish_reason":"tool_calls"');
+            expect(res.text).toContain('data: [DONE]');
+            expect(res.text).not.toMatch(/"error"\s*:\s*\{/);
+        } else if (_label === 'messages') {
+            const frames = readSseData(res.text);
+            const terminalDelta = frames.find((frame) => frame.type === 'message_delta');
+            expect(terminalDelta?.delta?.stop_reason).toBe('tool_use');
+            expect(res.text).toContain('event: message_stop');
+            expect(res.text).not.toContain('[DONE]');
+            expect(res.text).not.toContain('event: error');
+        } else {
+            const frames = readSseData(res.text);
+            expect(frames.at(-1)?.type).toBe('response.completed');
+            expect(res.text).toContain('data: [DONE]');
+            expect(res.text).not.toContain('response.failed');
+            expect(res.text).not.toMatch(/"error"\s*:\s*\{/);
+        }
+    });
+
+    test.each(plainTextPayloads)('%s does not succeed with partial raw text when recovery polling finds an empty completed snapshot', async (label, path, payload) => {
+        sdkMocks.eventSubscribe.mockImplementation(async () => ({
+            stream: (async function* () {
+                yield {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { id: 'partial-text', messageID: 'assistant-current', type: 'text', sessionID: SESSION_ID },
+                        delta: 'partial answer',
+                    },
+                };
+                yield {
+                    type: 'message.updated',
+                    properties: {
+                        info: { id: 'assistant-current', role: 'assistant', sessionID: SESSION_ID, finish: 'tool' },
+                    },
+                };
+            })(),
+        }));
+        sdkMocks.sessionMessages.mockResolvedValue([
+            { info: { id: 'assistant-current', role: 'assistant', finish: 'stop' }, parts: [] },
+        ]);
+
+        const res = await request(buildApp())
+            .post(path)
+            .set('Authorization', 'Bearer test-key')
+            .set('anthropic-version', '2023-06-01')
+            .send(payload);
+
+        expect(res.statusCode).toBe(200);
+        expect(visibleTextFor(path, res.text).join('')).toContain('partial answer');
+        if (label === 'chat') {
+            const frames = readSseData(res.text);
+            expect(frames.at(-1)).toHaveProperty('error');
+            expect(res.text).toContain('data: {"error":');
+            expect(res.text).not.toContain('data: [DONE]');
+            expect(res.text).not.toContain('"finish_reason":"stop"');
+        } else if (label === 'messages') {
+            const frames = readSseData(res.text);
+            expect(frames.at(-1)).toMatchObject({ type: 'error', error: expect.any(Object) });
+            expect(res.text).toContain('event: error');
+            expect(res.text).not.toContain('[DONE]');
+            expect(res.text).not.toContain('message_stop');
+            expect(res.text).not.toContain('message_delta');
+        } else {
+            const frames = readSseData(res.text);
+            expect(frames.at(-1)?.type).toBe('response.failed');
+            expect(res.text).toContain('data: [DONE]');
+            expect(res.text).not.toContain('response.completed');
+        }
     });
 
     test.each(payloads)('%s fails closed when the poll snapshot is a timeout partial', async (label, path, payload) => {

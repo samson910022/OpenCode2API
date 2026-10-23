@@ -139,6 +139,415 @@ describe('Streaming Retries on 503 Transient Error', () => {
         ctx = created.ctx;
     });
 
+    test.each([
+        ['Chat non-stream', '/v1/chat/completions', { model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'look up' }], tools: [{ type: 'function', function: { name: 'lookup', description: 'Lookup', parameters: { type: 'object', properties: {} } } }], tool_choice: 'required' }],
+        ['Chat stream', '/v1/chat/completions', { model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'look up' }], tools: [{ type: 'function', function: { name: 'lookup', description: 'Lookup', parameters: { type: 'object', properties: {} } } }], tool_choice: 'required', stream: true }],
+        ['Responses non-stream', '/v1/responses', { model: 'opencode/kimi-k2.5', input: 'look up', tools: [{ type: 'function', name: 'lookup', description: 'Lookup', parameters: { type: 'object', properties: {} } }], tool_choice: 'required' }],
+        ['Responses stream', '/v1/responses', { model: 'opencode/kimi-k2.5', input: 'look up', tools: [{ type: 'function', name: 'lookup', description: 'Lookup', parameters: { type: 'object', properties: {} } }], tool_choice: 'required', stream: true }],
+    ])('%s allows the required-tool fallback after an empty completed poll, then fails closed', async (label, path, body) => {
+        sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [] } });
+        sdkMocks.sessionMessages.mockResolvedValue([
+            { info: { id: 'empty-assistant', role: 'assistant', finish: 'stop' }, parts: [] },
+        ]);
+        if (body.stream) {
+            sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+                stream: (async function* () {
+                    yield {
+                        type: 'message.updated',
+                        properties: {
+                            info: { id: 'empty-assistant', role: 'assistant', sessionID: 'default-session', finish: 'stop', parts: [] },
+                        },
+                    };
+                })(),
+            }));
+        }
+
+        const response = await request(app).post(path).send(body);
+        const output = response.text || JSON.stringify(response.body);
+
+        expect(output).toContain('external_tool_choice_required');
+        expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(2);
+        expect(output).not.toContain('response.completed');
+        expect(response.body?.status).not.toBe('completed');
+    });
+
+    test.each([
+        ['Responses non-stream continuation', '/v1/responses', { model: 'opencode/kimi-k2.5', input: 'second turn', previous_response_id: 'stored-response', stream: false }],
+        ['Responses stream continuation', '/v1/responses', { model: 'opencode/kimi-k2.5', input: 'second turn', previous_response_id: 'stored-response', stream: true }],
+        ['Interactions non-stream continuation', '/v1beta/interactions', { model: 'opencode/kimi-k2.5', input: 'second turn', previous_interaction_id: 'stored-interaction', stream: false }],
+        ['Interactions stream continuation', '/v1beta/interactions', { model: 'opencode/kimi-k2.5', input: 'second turn', previous_interaction_id: 'stored-interaction', stream: true }],
+    ])('%s polls past the previous assistant until the current message parent is complete', async (_label, path, body) => {
+        const sessionId = 'continuation-route-session';
+        const stateId = body.previous_response_id ?? body.previous_interaction_id;
+        ctx.storeResponseState(stateId, sessionId, 'opencode/kimi-k2.5');
+        let currentMessageID = null;
+        let pollCount = 0;
+        sdkMocks.sessionPrompt.mockImplementation(async (params) => {
+            currentMessageID = params.body.messageID;
+            return { data: { parts: [] } };
+        });
+        sdkMocks.sessionMessages.mockImplementation(async () => {
+            pollCount += 1;
+            const messages = [
+                {
+                    info: { id: 'assistant-prior', role: 'assistant', parentID: 'msg-prior-user', finish: 'stop' },
+                    parts: [{ type: 'text', text: 'prior turn answer' }],
+                },
+                {
+                    info: { id: currentMessageID, role: 'user' },
+                    parts: [{ id: 'current-user-part', type: 'text', text: 'second turn' }],
+                },
+            ];
+            if (pollCount > 1) {
+                messages.push({
+                    info: { id: 'assistant-current', role: 'assistant', parentID: currentMessageID, finish: 'stop' },
+                    parts: [{ type: 'text', text: 'current turn answer' }],
+                });
+            }
+            return messages;
+        });
+
+        const response = await request(app).post(path).send(body);
+        const output = response.text || JSON.stringify(response.body);
+        expect(response.status).toBe(200);
+        expect(output).toContain('current turn answer');
+        expect(output).not.toContain('prior turn answer');
+        expect(pollCount).toBeGreaterThan(1);
+        expect(output).not.toMatch(/"type"\s*:\s*"(?:response\.failed|error)"/);
+        if (body.stream) {
+            if (path === '/v1/responses') {
+                const frames = response.text
+                    .split('\n')
+                    .filter((line) => line.startsWith('data: ') && line !== 'data: [DONE]')
+                    .map((line) => JSON.parse(line.slice(6)));
+                expect(frames.at(-1)?.type).toBe('response.completed');
+                expect(response.text).toContain('data: [DONE]');
+                expect(response.text).not.toContain('response.failed');
+            } else {
+                expect(response.text).toContain('"type":"interaction.completed"');
+                expect(response.text).not.toContain('"type":"error"');
+                expect(response.text).not.toContain('[DONE]');
+            }
+        } else {
+            expect(response.body.status).toBe('completed');
+            expect(response.body.error == null).toBe(true);
+        }
+    });
+
+    test.each([
+        ['Responses non-stream continuation', '/v1/responses', { model: 'opencode/kimi-k2.5', input: 'second turn', previous_response_id: 'empty-response-parent', stream: false }],
+        ['Interactions non-stream continuation', '/v1beta/interactions', { model: 'opencode/kimi-k2.5', input: 'second turn', previous_interaction_id: 'empty-interaction-parent', stream: false }],
+    ])('%s fails closed on an empty completed assistant poll snapshot', async (_label, path, body) => {
+        const sessionId = 'empty-continuation-session';
+        const stateId = body.previous_response_id ?? body.previous_interaction_id;
+        ctx.storeResponseState(stateId, sessionId, 'opencode/kimi-k2.5');
+        let currentMessageID;
+        sdkMocks.sessionPrompt.mockImplementation(async (params) => {
+            currentMessageID = params.body.messageID;
+            return { data: { parts: [] } };
+        });
+        sdkMocks.sessionMessages.mockImplementation(async () => ([
+            { info: { id: currentMessageID, role: 'user' }, parts: [] },
+            {
+                info: { id: 'assistant-empty', role: 'assistant', parentID: currentMessageID, finish: 'stop' },
+                parts: [],
+            },
+        ]));
+
+        const response = await request(app).post(path).send(body);
+
+        expect(response.status).toBeGreaterThanOrEqual(400);
+        expect(response.body.status).not.toBe('completed');
+        expect(response.body).not.toHaveProperty('output_text');
+        expect(JSON.stringify(response.body)).toContain('Polling returned empty response');
+    });
+
+    test('Responses non-stream fails closed on an ordinary empty completed poll snapshot', async () => {
+        sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [] } });
+        sdkMocks.sessionMessages.mockResolvedValue([
+            { info: { id: 'ordinary-empty-assistant', role: 'assistant', finish: 'stop' }, parts: [] },
+        ]);
+
+        const response = await request(app)
+            .post('/v1/responses')
+            .send({ model: 'opencode/kimi-k2.5', input: 'ordinary request', stream: false });
+
+        expect(response.status).toBeGreaterThanOrEqual(400);
+        expect(response.body.status).not.toBe('completed');
+        expect(response.body).not.toHaveProperty('output_text');
+        expect(JSON.stringify(response.body)).toContain('Polling returned empty response');
+    });
+
+    test('Responses streaming continuation releases a pre-metadata text delta exactly once', async () => {
+        const sessionId = 'pre-metadata-stream-continuation-session';
+        ctx.storeResponseState('pre-metadata-stream-parent', sessionId, 'opencode/kimi-k2.5');
+        let currentMessageID;
+        sdkMocks.sessionPrompt.mockImplementation(async (params) => {
+            currentMessageID = params.body.messageID;
+            return { data: { parts: [] } };
+        });
+        sdkMocks.eventSubscribe.mockImplementation(async () => ({
+            stream: (async function* () {
+                yield {
+                    type: 'message.part.delta',
+                    properties: {
+                        sessionID: sessionId,
+                        messageID: 'assistant-current',
+                        partID: 'answer-part',
+                        field: 'text',
+                        delta: 'Continuation answer',
+                    },
+                };
+                yield {
+                    type: 'message.updated',
+                    properties: {
+                        info: {
+                            id: 'assistant-current',
+                            role: 'assistant',
+                            parentID: currentMessageID,
+                            finish: 'stop',
+                            sessionID: sessionId,
+                        },
+                    },
+                };
+            })(),
+        }));
+
+        const response = await request(app)
+            .post('/v1/responses')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'current turn',
+                stream: true,
+                previous_response_id: 'pre-metadata-stream-parent',
+            });
+
+        const frames = response.text
+            .split('\n')
+            .filter((line) => line.startsWith('data: ') && line !== 'data: [DONE]')
+            .map((line) => JSON.parse(line.slice(6)));
+        const textDeltas = frames
+            .filter((frame) => frame.type === 'response.output_text.delta')
+            .map((frame) => frame.delta);
+
+        expect(response.status).toBe(200);
+        expect(textDeltas).toEqual(['Continuation answer']);
+        expect(frames.at(-1)?.type).toBe('response.completed');
+        expect(response.text).toContain('data: [DONE]');
+        expect(response.text).not.toContain('response.failed');
+    });
+
+    test('Responses streaming continuation fails closed on a mismatched part parent after message confirmation', async () => {
+        const sessionId = 'part-parent-mismatch-session';
+        ctx.storeResponseState('part-parent-mismatch-parent', sessionId, 'opencode/kimi-k2.5');
+        let currentMessageID;
+        sdkMocks.sessionPrompt.mockImplementation(async (params) => {
+            currentMessageID = params.body.messageID;
+            return { data: { parts: [] } };
+        });
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+            stream: (async function* () {
+                yield {
+                    type: 'message.updated',
+                    properties: {
+                        info: {
+                            id: 'assistant-correlated',
+                            role: 'assistant',
+                            parentID: currentMessageID,
+                            sessionID: sessionId,
+                        },
+                    },
+                };
+                yield {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: {
+                            id: 'mismatched-part',
+                            messageID: 'assistant-correlated',
+                            parentID: 'another-user-message',
+                            type: 'text',
+                            sessionID: sessionId,
+                        },
+                        delta: 'uncorrelated text',
+                    },
+                };
+            })(),
+        }));
+
+        const response = await request(app).post('/v1/responses').send({
+            model: 'opencode/kimi-k2.5',
+            input: 'continuation',
+            stream: true,
+            previous_response_id: 'part-parent-mismatch-parent',
+        });
+
+        expect(response.text).toContain('response.failed');
+        expect(response.text).toContain('Continuation correlation error');
+        expect(response.text).not.toContain('response.completed');
+        expect(response.text).not.toContain('uncorrelated text');
+    });
+
+    test('Responses streaming continuation fails closed when a confirmed message parent explicitly changes', async () => {
+        const sessionId = 'message-parent-mismatch-session';
+        ctx.storeResponseState('message-parent-mismatch-parent', sessionId, 'opencode/kimi-k2.5');
+        let currentMessageID;
+        sdkMocks.sessionPrompt.mockImplementation(async (params) => {
+            currentMessageID = params.body.messageID;
+            return { data: { parts: [] } };
+        });
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+            stream: (async function* () {
+                yield {
+                    type: 'message.updated',
+                    properties: {
+                        info: {
+                            id: 'assistant-correlated',
+                            role: 'assistant',
+                            parentID: currentMessageID,
+                            sessionID: sessionId,
+                        },
+                    },
+                };
+                yield {
+                    type: 'message.updated',
+                    properties: {
+                        info: {
+                            id: 'assistant-correlated',
+                            role: 'assistant',
+                            parentID: 'another-user-message',
+                            sessionID: sessionId,
+                            finish: 'stop',
+                            parts: [{ type: 'text', text: 'uncorrelated text' }],
+                        },
+                    },
+                };
+            })(),
+        }));
+
+        const response = await request(app).post('/v1/responses').send({
+            model: 'opencode/kimi-k2.5',
+            input: 'continuation',
+            stream: true,
+            previous_response_id: 'message-parent-mismatch-parent',
+        });
+
+        expect(response.text).toContain('response.failed');
+        expect(response.text).toContain('Continuation correlation error');
+        expect(response.text).not.toContain('response.completed');
+    });
+
+    test('Responses streaming continuation accepts a sparse update that omits its retained parent', async () => {
+        const sessionId = 'sparse-parent-update-session';
+        ctx.storeResponseState('sparse-parent-update-parent', sessionId, 'opencode/kimi-k2.5');
+        let currentMessageID;
+        sdkMocks.sessionPrompt.mockImplementation(async (params) => {
+            currentMessageID = params.body.messageID;
+            return { data: { parts: [] } };
+        });
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+            stream: (async function* () {
+                yield {
+                    type: 'message.updated',
+                    properties: {
+                        info: {
+                            id: 'assistant-sparse',
+                            role: 'assistant',
+                            parentID: currentMessageID,
+                            sessionID: sessionId,
+                        },
+                    },
+                };
+                yield {
+                    type: 'message.updated',
+                    properties: {
+                        info: {
+                            id: 'assistant-sparse',
+                            role: 'assistant',
+                            sessionID: sessionId,
+                            finish: 'stop',
+                            parts: [{ type: 'text', text: 'sparse continuation answer' }],
+                        },
+                    },
+                };
+            })(),
+        }));
+
+        const response = await request(app).post('/v1/responses').send({
+            model: 'opencode/kimi-k2.5',
+            input: 'continuation',
+            stream: true,
+            previous_response_id: 'sparse-parent-update-parent',
+        });
+
+        expect(response.text).toContain('response.completed');
+        expect(response.text).toContain('sparse continuation answer');
+        expect(response.text).not.toContain('response.failed');
+    });
+
+    test('Responses streaming continuation does not succeed from a timestamp-less assistant with a mismatched parent', async () => {
+        const sessionId = 'stale-stream-continuation-session';
+        const created = createApp(baseConfig({ REQUEST_TIMEOUT_MS: 40, RETRY_MAX_RETRIES: 0 }));
+        app = created.app;
+        ctx = created.ctx;
+        ctx.storeResponseState('stale-stream-parent', sessionId, 'opencode/kimi-k2.5');
+
+        sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [] } }));
+        sdkMocks.eventSubscribe.mockImplementation(async () => ({
+            stream: (async function* () {
+                // Exercise ordering where deltas precede the assistant metadata
+                // that identifies this as a previous turn.
+                yield {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: {
+                            id: 'stale-part',
+                            messageID: 'assistant-stale',
+                            type: 'text',
+                            sessionID: sessionId,
+                        },
+                        delta: 'STALE ANSWER',
+                    },
+                };
+                yield {
+                    type: 'message.updated',
+                    properties: {
+                        info: {
+                            id: 'assistant-stale',
+                            role: 'assistant',
+                            parentID: 'previous-user-message',
+                            finish: 'stop',
+                            sessionID: sessionId,
+                        },
+                    },
+                };
+            })(),
+        }));
+        sdkMocks.sessionMessages.mockImplementation(async () => ([{
+            info: {
+                id: 'assistant-stale',
+                role: 'assistant',
+                parentID: 'previous-user-message',
+                finish: 'stop',
+            },
+            parts: [{ type: 'text', text: 'STALE ANSWER' }],
+        }]));
+
+        const response = await request(app)
+            .post('/v1/responses')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'current turn',
+                stream: true,
+                previous_response_id: 'stale-stream-parent',
+            });
+
+        expect(response.headers['content-type']).toContain('text/event-stream');
+        expect(response.text).toContain('response.failed');
+        expect(response.text).not.toContain('STALE ANSWER');
+        expect(response.text).not.toContain('response.completed');
+        expect(response.text).not.toContain('response.output_text.delta');
+    });
+
     test('Responses stream retries 503 transient error on attempt 1 and succeeds on attempt 2 before any output', async () => {
         let sessionCount = 0;
         sdkMocks.sessionCreate.mockImplementation(async () => {
@@ -313,9 +722,13 @@ describe('Fail Closed Immediately (No Retry) on Partial Stream Error', () => {
         sdkMocks.eventSubscribe.mockImplementation(async () => ({
             stream: (async function* () {
                 yield {
+                    type: 'message.updated',
+                    properties: { info: { id: 'chat-assistant', role: 'assistant', sessionID: 'chat-partial-1' } }
+                };
+                yield {
                     type: 'message.part.updated',
                     properties: {
-                        part: { type: 'text', sessionID: 'chat-partial-1' },
+                        part: { id: 'chat-part', messageID: 'chat-assistant', type: 'text', sessionID: 'chat-partial-1' },
                         delta: 'First chat chunk'
                     }
                 };
@@ -355,9 +768,13 @@ describe('Fail Closed Immediately (No Retry) on Partial Stream Error', () => {
         sdkMocks.eventSubscribe.mockImplementation(async () => ({
             stream: (async function* () {
                 yield {
+                    type: 'message.updated',
+                    properties: { info: { id: 'responses-assistant', role: 'assistant', sessionID: 'resp-partial-1' } }
+                };
+                yield {
                     type: 'message.part.updated',
                     properties: {
-                        part: { type: 'text', sessionID: 'resp-partial-1' },
+                        part: { id: 'responses-part', messageID: 'responses-assistant', type: 'text', sessionID: 'resp-partial-1' },
                         delta: 'First responses chunk'
                     }
                 };
@@ -398,9 +815,13 @@ describe('Fail Closed Immediately (No Retry) on Partial Stream Error', () => {
         sdkMocks.eventSubscribe.mockImplementation(async () => ({
             stream: (async function* () {
                 yield {
+                    type: 'message.updated',
+                    properties: { info: { id: 'messages-assistant', role: 'assistant', sessionID: 'msg-partial-1' } }
+                };
+                yield {
                     type: 'message.part.updated',
                     properties: {
-                        part: { type: 'text', sessionID: 'msg-partial-1' },
+                        part: { id: 'messages-part', messageID: 'messages-assistant', type: 'text', sessionID: 'msg-partial-1' },
                         delta: 'First messages chunk'
                     }
                 };

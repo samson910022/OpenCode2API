@@ -80,8 +80,9 @@ describe('Phase 2: SSE Framing, Keepalives, Headers, and Wire Integrity', () => 
         sdkMocks.eventSubscribe.mockReset();
         sdkMocks.eventSubscribe.mockImplementation(async () => ({
             stream: (async function* () {
-                yield { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: SESSION_ID }, delta: 'Hello' } };
-                yield { type: 'message.updated', properties: { info: { sessionID: SESSION_ID, finish: 'stop' } } };
+                yield { type: 'message.updated', properties: { info: { id: 'assistant-default', role: 'assistant', sessionID: SESSION_ID } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'part-default', messageID: 'assistant-default', type: 'text', sessionID: SESSION_ID }, delta: 'Hello' } };
+                yield { type: 'message.updated', properties: { info: { id: 'assistant-default', role: 'assistant', sessionID: SESSION_ID, finish: 'stop' } } };
             })()
         }));
     });
@@ -167,8 +168,12 @@ describe('Phase 2: SSE Framing, Keepalives, Headers, and Wire Integrity', () => 
             sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
                 stream: (async function* () {
                     yield {
+                        type: 'message.updated',
+                        properties: { info: { id: 'assistant-message', role: 'assistant', sessionID: SESSION_ID } }
+                    };
+                    yield {
                         type: 'message.part.updated',
-                        properties: { part: { id: 'p1', type: 'text', sessionID: SESSION_ID }, delta: 'Hello text' }
+                        properties: { part: { id: 'p1', messageID: 'assistant-message', type: 'text', sessionID: SESSION_ID }, delta: 'Hello text' }
                     };
                     yield {
                         type: 'session.error',
@@ -199,8 +204,12 @@ describe('Phase 2: SSE Framing, Keepalives, Headers, and Wire Integrity', () => 
             sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
                 stream: (async function* () {
                     yield {
+                        type: 'message.updated',
+                        properties: { info: { id: 'assistant-message', role: 'assistant', sessionID: SESSION_ID } }
+                    };
+                    yield {
                         type: 'message.part.updated',
-                        properties: { part: { id: 'p1', type: 'reasoning', sessionID: SESSION_ID }, delta: 'Thinking deep thoughts' }
+                        properties: { part: { id: 'p1', messageID: 'assistant-message', type: 'reasoning', sessionID: SESSION_ID }, delta: 'Thinking deep thoughts' }
                     };
                     yield {
                         type: 'session.error',
@@ -453,6 +462,146 @@ describe('Phase 2: SSE Framing, Keepalives, Headers, and Wire Integrity', () => 
                 clearTimeoutSpy.mockRestore();
             }
         });
+
+        const runContinuation = (events) => {
+            const client = {
+                event: {
+                    subscribe: async () => ({
+                        stream: (async function* () {
+                            for (const event of events) yield event;
+                        })(),
+                    }),
+                },
+            };
+            return createCollector({ client, logDebug: () => {} }).collectFromEvents(
+                'collector-session',
+                1000,
+                null,
+                null,
+                null,
+                undefined,
+                'expected-user',
+            );
+        };
+
+        test('correlates ownerless and owned tool updates by part ID and releases the newest terminal state', async () => {
+            const result = await runContinuation([
+                {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { id: 'logical-tool-part', type: 'tool', sessionID: 'collector-session', state: { status: 'running' } },
+                    },
+                },
+                {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: {
+                            id: 'logical-tool-part',
+                            messageID: 'assistant-current',
+                            type: 'tool',
+                            sessionID: 'collector-session',
+                            state: { status: 'completed' },
+                        },
+                    },
+                },
+                {
+                    type: 'message.updated',
+                    properties: {
+                        info: {
+                            id: 'assistant-current',
+                            role: 'assistant',
+                            parentID: 'expected-user',
+                            sessionID: 'collector-session',
+                            finish: 'stop',
+                            parts: [{ id: 'logical-tool-part', type: 'tool', state: { status: 'running' } }],
+                        },
+                    },
+                },
+            ]);
+
+            expect(result.finish).toBe('stop');
+            expect(result.cut).toBeUndefined();
+        });
+
+        test("ownerless terminal tool update settles the confirmed owner's active state before a sparse stop", async () => {
+            const result = await runContinuation([
+                {
+                    type: 'message.updated',
+                    properties: {
+                        info: {
+                            id: 'assistant-current',
+                            role: 'assistant',
+                            parentID: 'expected-user',
+                            sessionID: 'collector-session',
+                        },
+                    },
+                },
+                {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: {
+                            id: 'owned-tool-part',
+                            messageID: 'assistant-current',
+                            type: 'tool',
+                            sessionID: 'collector-session',
+                            state: { status: 'running' },
+                        },
+                    },
+                },
+                {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: {
+                            id: 'owned-tool-part',
+                            type: 'tool',
+                            sessionID: 'collector-session',
+                            state: { status: 'completed' },
+                        },
+                    },
+                },
+                {
+                    type: 'message.updated',
+                    properties: {
+                        info: {
+                            id: 'assistant-current',
+                            role: 'assistant',
+                            sessionID: 'collector-session',
+                            finish: 'stop',
+                        },
+                    },
+                },
+            ]);
+
+            expect(result.finish).toBe('stop');
+            expect(result.cut).toBeUndefined();
+        });
+
+        test('a stale completed snapshot cannot clear a live tool update before stop', async () => {
+            const result = await runContinuation([
+                {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { id: 'live-tool-part', type: 'tool', sessionID: 'collector-session', state: { status: 'running' } },
+                    },
+                },
+                {
+                    type: 'message.updated',
+                    properties: {
+                        info: {
+                            id: 'assistant-current',
+                            role: 'assistant',
+                            parentID: 'expected-user',
+                            sessionID: 'collector-session',
+                            finish: 'stop',
+                            parts: [{ id: 'live-tool-part', type: 'tool', state: { status: 'completed' } }],
+                        },
+                    },
+                },
+            ]);
+
+            expect(result.finish).toBe('stop');
+            expect(result.cut).toBe(true);
+        });
     });
 
     describe('6. Premature cut and divergence fail closed (P1-1 & P1-2)', () => {
@@ -539,8 +688,12 @@ describe('Phase 2: SSE Framing, Keepalives, Headers, and Wire Integrity', () => 
             sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
                 stream: (async function* () {
                     yield {
+                        type: 'message.updated',
+                        properties: { info: { id: 'assistant-message', role: 'assistant', sessionID: SESSION_ID } }
+                    };
+                    yield {
                         type: 'message.part.updated',
-                        properties: { part: { id: 'p1', type: 'text', sessionID: SESSION_ID }, delta: 'AC' }
+                        properties: { part: { id: 'p1', messageID: 'assistant-message', type: 'text', sessionID: SESSION_ID }, delta: 'AC' }
                     };
                 })()
             }));
@@ -668,6 +821,51 @@ describe('Phase 2: SSE Framing, Keepalives, Headers, and Wire Integrity', () => 
             expect(res.statusCode).not.toBe(200);
         });
 
+        test.each([
+            ['chat', '/v1/chat/completions', { model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] }],
+            ['messages', '/v1/messages', { model: 'big-pickle', max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] }],
+        ])('%s non-stream fails closed when polling returns an empty completed assistant', async (_name, endpoint, payload) => {
+            sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [] } }));
+            sdkMocks.sessionMessages.mockImplementation(async () => ([{
+                info: { id: 'empty-assistant', role: 'assistant', finish: 'stop' },
+                parts: [],
+            }]));
+
+            const res = await request(buildApp({ REQUEST_TIMEOUT_MS: 40, RETRY_MAX_RETRIES: 0 }))
+                .post(endpoint)
+                .set('Authorization', 'Bearer test-key')
+                .set('anthropic-version', '2023-06-01')
+                .send(payload);
+
+            expect(res.statusCode).toBeGreaterThanOrEqual(400);
+            expect(res.statusCode).not.toBe(200);
+            expect(JSON.stringify(res.body)).toContain('Polling returned empty response');
+        });
+
+        test.each([false, true])('interactions %s fails closed when polling returns an empty completed assistant', async (stream) => {
+            sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [] } }));
+            sdkMocks.sessionMessages.mockImplementation(async () => ([{
+                info: { id: 'empty-assistant', role: 'assistant', finish: 'stop' },
+                parts: [],
+            }]));
+
+            const res = await request(buildApp({ REQUEST_TIMEOUT_MS: 40, RETRY_MAX_RETRIES: 0 }))
+                .post('/v1beta/interactions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'big-pickle', input: 'hi', ...(stream ? { stream: true } : {}) });
+
+            if (stream) {
+                expect(res.headers['content-type']).toContain('text/event-stream');
+                expect(res.text).toContain('"type":"error"');
+                expect(res.text).not.toContain('interaction.completed');
+            } else {
+                expect(res.statusCode).toBeGreaterThanOrEqual(400);
+                expect(res.statusCode).not.toBe(200);
+                expect(res.body?.status).not.toBe('completed');
+                expect(JSON.stringify(res.body)).toContain('Polling returned empty response');
+            }
+        });
+
         test('interactions non-stream when poll returns partial: true fails closed with error status', async () => {
             sdkMocks.sessionPrompt.mockImplementation(async () => ({ data: { parts: [] } }));
             sdkMocks.sessionMessages.mockImplementation(async () => ([{
@@ -750,20 +948,24 @@ describe('Phase 2: SSE Framing, Keepalives, Headers, and Wire Integrity', () => 
             sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
                 stream: (async function* () {
                     yield {
-                        type: 'message.part.updated',
-                        properties: { part: { id: 'p1', type: 'text', sessionID: SESSION_ID }, delta: 'Hello' }
+                        type: 'message.updated',
+                        properties: { info: { id: 'assistant-message', role: 'assistant', sessionID: SESSION_ID } }
                     };
                     yield {
                         type: 'message.part.updated',
-                        properties: { part: { id: 'p1', type: 'text', sessionID: SESSION_ID }, delta: ' ' }
+                        properties: { part: { id: 'p1', messageID: 'assistant-message', type: 'text', sessionID: SESSION_ID }, delta: 'Hello' }
                     };
                     yield {
                         type: 'message.part.updated',
-                        properties: { part: { id: 'p1', type: 'text', sessionID: SESSION_ID }, delta: 'world' }
+                        properties: { part: { id: 'p1', messageID: 'assistant-message', type: 'text', sessionID: SESSION_ID }, delta: ' ' }
+                    };
+                    yield {
+                        type: 'message.part.updated',
+                        properties: { part: { id: 'p1', messageID: 'assistant-message', type: 'text', sessionID: SESSION_ID }, delta: 'world' }
                     };
                     yield {
                         type: 'message.updated',
-                        properties: { info: { sessionID: SESSION_ID, finish: 'stop' } }
+                        properties: { info: { id: 'assistant-message', role: 'assistant', sessionID: SESSION_ID, finish: 'stop' } }
                     };
                 })()
             }));

@@ -215,6 +215,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     timeoutMs: number,
     intervalMs: number = DEFAULT_POLL_INTERVAL_MS,
     signal?: AbortSignal,
+    expectedCurrentUserMessageId?: string,
   ): Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[]; partial?: boolean; complete?: boolean }> {
     // Drift signal only: backend-minted ses_* IDs should match the canonical
     // shape (see src/session/ids.ts). Never block on mismatch — the schema
@@ -241,6 +242,10 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
           const entry = asRecord(messages[i]);
           const info = asRecord(entry['info']);
           if (info['role'] !== 'assistant') continue;
+          if (
+            expectedCurrentUserMessageId !== undefined &&
+            info['parentID'] !== expectedCurrentUserMessageId
+          ) continue;
           const { content, reasoning, toolParts } = extractFromParts(entry['parts'] ?? []);
           const error: unknown = info['error'] ?? null;
           // finish === 'tool' and 'tool-calls' mark an intermediate turn that pauses for a
@@ -315,6 +320,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     firstDeltaTimeoutMs?: number | null,
     idleTimeoutMs?: number | null,
     signal?: AbortSignal,
+    expectedCurrentUserMessageId?: string,
   ): Promise<Record<string, unknown>> {
     if (!isValidSessionId(sessionId)) logDebug('Unexpected backend session ID format', { sessionId });
     if (signal?.aborted) return { content: '', reasoning: '', cancelled: true };
@@ -344,8 +350,12 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     let finished = false;
     let terminalFinishSeen = false;
     let lastFinish: string | null = null;
-    let content = '';
-    let reasoning = '';
+      let content = '';
+      let reasoning = '';
+      let bufferedRoleUnknownDeltaSeen = false;
+      let sawUserParts = false;
+      let sawStaleMessageParts = false;
+      let sawUnverifiedAssistantParts = false;
     let receivedDelta = false;
     let deltaChars = 0;
     let firstDeltaAt: number | null = null;
@@ -524,6 +534,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
         deltaText: string;
         snapshotText: string;
         deltasAfterSnapshot: string;
+        unreleasedDeltas: { delta: string; sequence: number }[];
         order: number;
         messageID: string | null;
         partID: string | null;
@@ -540,6 +551,34 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
       // `messageID`; unknown roles are accepted so old backends keep working.
       const messageRoles = new Map<string, string>();
       const staleMessageIds = new Set<string>();
+      const unverifiedAssistantMessageIds = new Set<string>();
+      const assistantMessageParents = new Map<string, string>();
+      const assistantPartParents = new Map<string, string>();
+      const partMessageOwners = new Map<string, string>();
+      const ambiguousPartMessageOwnerIds = new Set<string>();
+      // Rejected and role-classified part IDs are scoped to their owner message.
+      // ID-less events may use these sets conservatively, but an explicit message
+      // identity always takes precedence when a backend reuses a part ID.
+      const rejectedPartOwners = new Map<string, Set<string>>();
+      const rejectedPartIdsWithoutOwner = new Set<string>();
+      const userPartOwners = new Map<string, Set<string>>();
+      const userPartIdsWithoutOwner = new Set<string>();
+      const assistantPartOwners = new Map<string, Set<string>>();
+      const assistantPartIdsWithoutOwner = new Set<string>();
+      const quarantinedToolParts = new Map<
+        string,
+        { messageID: string | null; partID: string | null; part: unknown; sequence: number }
+      >();
+      // Full message snapshots can lag behind explicit per-part updates. Keep
+      // the most recent tool part update so replayed snapshots cannot regress
+      // a running tool to a stale completed state.
+      interface LatestToolPartUpdate {
+        messageID: string | null;
+        partID: string | null;
+        part: unknown;
+        sequence: number;
+      }
+      const latestToolPartUpdates = new Map<string, LatestToolPartUpdate>();
       let partOrderCounter = 0;
       let eventSeq = 0;
 
@@ -547,24 +586,140 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
         if (value == null || typeof value === 'boolean') return null;
         return String(value);
       };
+      const rememberPartMessageOwner = (messageID: string | null, partID: string | null): void => {
+        if (messageID == null || partID == null || ambiguousPartMessageOwnerIds.has(partID)) return;
+        const previousOwner = partMessageOwners.get(partID);
+        if (previousOwner == null) partMessageOwners.set(partID, messageID);
+        else if (previousOwner !== messageID) {
+          partMessageOwners.delete(partID);
+          ambiguousPartMessageOwnerIds.add(partID);
+        }
+      };
+      const isAmbiguousOwnerlessPart = (messageID: string | null, partID: string | null): boolean =>
+        messageID == null && partID != null && ambiguousPartMessageOwnerIds.has(partID);
+      const resolvePartMessageId = (messageID: string | null, partID: string | null): string | null => {
+        if (messageID != null) return messageID;
+        if (partID == null || ambiguousPartMessageOwnerIds.has(partID)) return null;
+        return partMessageOwners.get(partID) ?? null;
+      };
       const readPartMessageId = (record: Record<string, unknown>): string | null =>
         readPartId(record['messageID'] ?? record['messageId']);
       const readInfoMessageId = (info: Record<string, unknown>): string | null =>
         readPartId(info['id'] ?? info['messageID'] ?? info['messageId']);
+      const readParentMessageId = (record: Record<string, unknown>): string | null =>
+        readPartId(record['parentID'] ?? record['parentId'] ?? record['parent_id']);
       const idPartKey = (messageID: string | null, partID: string): string => `${messageID ?? ''}\u0000${partID}`;
+      const toolPartKey = (messageID: string | null, part: unknown): string => {
+        const record = asRecord(part);
+        const owner = readPartMessageId(record) ?? messageID;
+        const partID = readPartId(record['id']);
+        const identity = partID ?? `noid:${noidKeyFor(record)}`;
+        return idPartKey(owner, identity);
+      };
+      const latestToolUpdateFor = (
+        messageID: string | null,
+        partID: string | null,
+        part: unknown,
+      ): [string, LatestToolPartUpdate] | null => {
+        const exactKey = toolPartKey(messageID, partID == null ? part : { ...asRecord(part), id: partID });
+        if (partID == null) {
+          const exact = latestToolPartUpdates.get(exactKey);
+          return exact ? [exactKey, exact] : null;
+        }
+        let matching = [...latestToolPartUpdates.entries()].filter(([, update]) => update.partID === partID);
+        if (messageID != null) {
+          matching = matching.filter(([, update]) => update.messageID == null || update.messageID === messageID);
+        } else {
+          const unowned = matching.filter(([, update]) => update.messageID == null);
+          if (unowned.length > 0) matching = unowned;
+          else if (new Set(matching.map(([, update]) => update.messageID)).size > 1) matching = [];
+        }
+        return matching.reduce<[string, LatestToolPartUpdate] | null>(
+          (current, candidate) => current == null || candidate[1].sequence > current[1].sequence ? candidate : current,
+          null,
+        );
+      };
+      const rememberToolPartUpdate = (messageID: string | null, part: unknown): void => {
+        if (asRecord(part)['type'] !== 'tool') return;
+        const record = asRecord(part);
+        const partID = readPartId(record['id']);
+        const owner = readPartMessageId(record) ?? messageID;
+        const latest = latestToolUpdateFor(owner, partID, part);
+        let key = latest?.[0] ?? toolPartKey(owner, part);
+        if (latest?.[1].messageID == null && owner != null) {
+          latestToolPartUpdates.delete(key);
+          key = toolPartKey(owner, part);
+        }
+        latestToolPartUpdates.set(key, { messageID: owner ?? latest?.[1].messageID ?? null, partID, part, sequence: ++eventSeq });
+      };
+      const latestToolPart = (messageID: string | null, partID: string | null, part: unknown): unknown => {
+        return latestToolUpdateFor(messageID, partID, part)?.[1].part ?? part;
+      };
+      const isPartOutsideExpectedTurn = (part: Record<string, unknown>): boolean => {
+        const explicitParent = readParentMessageId(part);
+        return expectedCurrentUserMessageId !== undefined && explicitParent != null && explicitParent !== expectedCurrentUserMessageId;
+      };
+      const ownersFor = (owners: Map<string, Set<string>>, partID: string): Set<string> => {
+        let result = owners.get(partID);
+        if (!result) {
+          result = new Set<string>();
+          owners.set(partID, result);
+        }
+        return result;
+      };
+      const rememberPartOwner = (owners: Map<string, Set<string>>, noOwner: Set<string>, messageID: string | null, partID: string): void => {
+        if (messageID == null) noOwner.add(partID);
+        else ownersFor(owners, partID).add(messageID);
+      };
+      const hasPartOwner = (owners: Map<string, Set<string>>, noOwner: Set<string>, messageID: string | null, partID: string): boolean => {
+        if (messageID == null) return noOwner.has(partID) || (owners.get(partID)?.size ?? 0) > 0;
+        return owners.get(partID)?.has(messageID) ?? false;
+      };
+      const rememberRejectedPart = (messageID: string | null, partID: string): void =>
+        rememberPartOwner(rejectedPartOwners, rejectedPartIdsWithoutOwner, messageID, partID);
+      const isRejectedPart = (messageID: string | null, partID: string | null): boolean =>
+        partID != null && hasPartOwner(rejectedPartOwners, rejectedPartIdsWithoutOwner, messageID, partID);
+      const rememberUserPart = (messageID: string | null, partID: string): void =>
+        rememberPartOwner(userPartOwners, userPartIdsWithoutOwner, messageID, partID);
+      const isUserPartId = (messageID: string | null, partID: string | null): boolean =>
+        partID != null && hasPartOwner(userPartOwners, userPartIdsWithoutOwner, messageID, partID);
+      const isAssistantPartId = (messageID: string | null, partID: string | null): boolean =>
+        partID != null && hasPartOwner(assistantPartOwners, assistantPartIdsWithoutOwner, messageID, partID);
+      const isPartOwnerOrUnassigned = (stateMessageID: string | null, messageID: string | null): boolean =>
+        stateMessageID == null || (messageID != null && stateMessageID === messageID);
       const partKeyFor = (messageID: string | null, partID: string | null, type: StreamPartType): string =>
         partID != null ? `id\u0000${idPartKey(messageID, partID)}` : `noid\u0000${type}`;
-      const resolveMessageRole = (messageID: string | null): string | undefined =>
-        messageRoles.get(messageID ?? '');
+      const resolveMessageRole = (messageID: string | null): string | undefined => {
+        if (messageID == null) return undefined;
+        const role = messageRoles.get(messageID);
+        // Only user and assistant have special semantics. Preserve unrecognized
+        // legacy role strings as role-unknown instead of treating them as a
+        // known non-assistant message.
+        return role === 'user' || role === 'assistant' ? role : undefined;
+      };
       const isUserPart = (messageID: string | null): boolean => resolveMessageRole(messageID) === 'user';
+      const roleForPart = (messageID: string | null, partID: string | null): string | undefined => {
+        if (isUserPartId(messageID, partID)) return 'user';
+        if (isAssistantPartId(messageID, partID)) return 'assistant';
+        return resolveMessageRole(messageID);
+      };
+      const isAssistantPartState = (state: StreamPartState): boolean =>
+        roleForPart(state.messageID, state.partID) !== 'user' &&
+        (expectedCurrentUserMessageId === undefined
+          ? roleForPart(state.messageID, state.partID) === 'assistant'
+          : (state.messageID != null && assistantMessageParents.get(state.messageID) === expectedCurrentUserMessageId) ||
+            (state.partID != null && assistantPartParents.get(idPartKey(state.messageID, state.partID)) === expectedCurrentUserMessageId));
+      const isKnownNonAssistantPartState = (state: StreamPartState): boolean => {
+        const role = roleForPart(state.messageID, state.partID);
+        return role === 'user';
+      };
       const findPartState = (messageID: string | null, partID: string | null): StreamPartState | undefined => {
         if (partID == null) return undefined;
         const direct = partStates.get(partKeyFor(messageID, partID, 'text'));
         if (direct) return direct;
-        // Deltas may omit `messageID` while the part update carries it (or vice
-        // versa); fall back to the same part id so early deltas are not lost.
-        const withoutMessageId = partStates.get(partKeyFor(null, partID, 'text'));
-        if (withoutMessageId) return withoutMessageId;
+        // An ownerless early delta can be attached once metadata supplies its
+        // messageID. Never merge state from a different explicit owner.
+        if (messageID != null) return partStates.get(partKeyFor(null, partID, 'text'));
         for (const state of partStates.values()) {
           if (state.partID === partID) return state;
         }
@@ -585,6 +740,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
             deltaText: '',
             snapshotText: '',
             deltasAfterSnapshot: '',
+            unreleasedDeltas: [],
             order: order ?? ++partOrderCounter,
             messageID,
             partID,
@@ -599,6 +755,118 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
         if (order !== undefined) state.order = order;
         return state;
       };
+      const discardMessageParts = (messageID: string, partIds: Set<string> = new Set()): void => {
+        staleMessageIds.add(messageID);
+        unverifiedAssistantMessageIds.delete(messageID);
+        sawStaleMessageParts = true;
+        discardQuarantinedToolParts(messageID, partIds);
+        for (const partID of partIds) rememberRejectedPart(messageID, partID);
+        for (const [key, state] of partStates) {
+          if (state.messageID === messageID || (state.messageID == null && state.partID != null && partIds.has(state.partID))) {
+            if (state.partID != null) rememberRejectedPart(messageID, state.partID);
+            partStates.delete(key);
+          }
+        }
+        for (const [key, pending] of pendingDeltaParts) {
+          if (pending.messageID === messageID || (pending.messageID == null && pending.partID != null && partIds.has(pending.partID))) {
+            if (pending.partID != null) rememberRejectedPart(messageID, pending.partID);
+            pendingDeltaParts.delete(key);
+          }
+        }
+      };
+      const discardUnownedParts = (partIds: Set<string>): void => {
+        sawStaleMessageParts = true;
+        discardQuarantinedToolParts(null, partIds);
+        for (const partID of partIds) rememberRejectedPart(null, partID);
+        for (const [key, state] of partStates) {
+          if (state.messageID == null && state.partID != null && partIds.has(state.partID)) partStates.delete(key);
+        }
+        for (const [key, pending] of pendingDeltaParts) {
+          if (pending.messageID == null && pending.partID != null && partIds.has(pending.partID)) pendingDeltaParts.delete(key);
+        }
+      };
+      const discardPartData = (messageID: string | null, partID: string | null): void => {
+        if (partID == null) return;
+        rememberRejectedPart(messageID, partID);
+        for (const [key, state] of partStates) {
+          if (state.partID === partID && isPartOwnerOrUnassigned(state.messageID, messageID)) partStates.delete(key);
+        }
+        for (const [key, pending] of pendingDeltaParts) {
+          if (pending.partID === partID && isPartOwnerOrUnassigned(pending.messageID, messageID)) pendingDeltaParts.delete(key);
+        }
+        for (const [key, toolPart] of quarantinedToolParts) {
+          if (toolPart.partID === partID && isPartOwnerOrUnassigned(toolPart.messageID, messageID)) quarantinedToolParts.delete(key);
+        }
+      };
+      const parentForMessage = (messageID: string | null, parentID: string | null): string | undefined =>
+        parentID ?? (messageID == null ? undefined : assistantMessageParents.get(messageID));
+      // Use enclosing metadata to correlate legacy parts, but still validate an
+      // explicit part-level parent independently against the expected turn.
+      const parentForPart = (messageID: string | null, partID: string | null): string | undefined => {
+        const owner = resolvePartMessageId(messageID, partID);
+        return (owner == null ? undefined : assistantMessageParents.get(owner)) ??
+          (partID == null ? undefined : assistantPartParents.get(idPartKey(owner, partID)));
+      };
+      const quarantinedToolKey = (messageID: string | null, partID: string | null, part: unknown): string => {
+        const tool = asRecord(part)['tool'];
+        const identity = partID ?? `noid:${typeof tool === 'string' ? tool : 'unknown'}`;
+        return idPartKey(messageID, identity);
+      };
+      const quarantineToolPart = (messageID: string | null, partID: string | null, part: unknown): void => {
+        const latestPart = latestToolPart(messageID, partID, part);
+        const owner = readPartMessageId(asRecord(latestPart)) ?? messageID;
+        let key = quarantinedToolKey(owner, partID, latestPart);
+        let retainedOwner = owner;
+        if (partID != null) {
+          const samePart = [...quarantinedToolParts.entries()].filter(([, queued]) => queued.partID === partID);
+          const compatible = samePart.filter(([, queued]) =>
+            owner == null ? queued.messageID == null : queued.messageID == null || queued.messageID === owner,
+          );
+          const match = owner == null && compatible.length !== 1
+            ? undefined
+            : compatible.sort((left, right) => right[1].sequence - left[1].sequence)[0];
+          if (match) {
+            key = match[0];
+            retainedOwner = owner ?? match[1].messageID;
+          }
+        }
+        const latestUpdate = latestToolUpdateFor(owner, partID, latestPart)?.[1];
+        const sequence = latestUpdate?.sequence ?? ++eventSeq;
+        const existing = quarantinedToolParts.get(key);
+        if (existing && existing.sequence > sequence) return;
+        quarantinedToolParts.set(key, { messageID: retainedOwner, partID, part: latestPart, sequence });
+      };
+      const discardQuarantinedToolParts = (messageID: string | null, partIds: Set<string>): void => {
+        for (const [key, toolPart] of quarantinedToolParts) {
+          if (
+            (messageID != null && toolPart.messageID === messageID) ||
+            (toolPart.messageID == null && toolPart.partID != null && partIds.has(toolPart.partID))
+          ) {
+            quarantinedToolParts.delete(key);
+          }
+        }
+      };
+      const releaseQuarantinedToolParts = (messageID: string | null, partIds: Set<string>): void => {
+        for (const [key, toolPart] of quarantinedToolParts) {
+          const matchesMessage = messageID != null && toolPart.messageID === messageID;
+          const matchesPart =
+            toolPart.partID != null &&
+            partIds.has(toolPart.partID) &&
+            isPartOwnerOrUnassigned(toolPart.messageID, messageID);
+          if (!matchesMessage && !matchesPart) continue;
+          quarantinedToolParts.delete(key);
+          // This function is called only after the enclosing message's exact
+          // parent has been confirmed as the expected continuation turn.
+          trackToolActivity(latestToolPart(toolPart.messageID, toolPart.partID, toolPart.part));
+        }
+      };
+      const isExpectedTurn = (messageID: string | null, parentID: string | null): boolean =>
+        expectedCurrentUserMessageId === undefined || parentForMessage(messageID, parentID) === expectedCurrentUserMessageId;
+      const isOutsideExpectedTurn = (messageID: string | null, parentID: string | null): boolean => {
+        if (expectedCurrentUserMessageId === undefined) return false;
+        const knownParent = parentForMessage(messageID, parentID);
+        return knownParent !== undefined && knownParent !== expectedCurrentUserMessageId;
+      };
       const noteDeltaActivity = (partType: unknown): void => {
         receivedDelta = true;
         if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
@@ -612,9 +880,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
           });
         }
       };
-      const applyTextDelta = (partType: unknown, delta: unknown): void => {
-        const deltaStr = typeof delta === 'string' ? delta : String(delta ?? '');
-        noteDeltaActivity(partType);
+      const emitTextDelta = (partType: StreamPartType, deltaStr: string): void => {
         if (partType === 'reasoning') {
           reasoning += deltaStr;
           if (onDelta) onDelta(deltaStr, true);
@@ -624,11 +890,53 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
         }
         deltaChars += deltaStr.length;
       };
-      const appendPartDelta = (state: StreamPartState, delta: string): void => {
+      const recordPartDelta = (state: StreamPartState, delta: string, afterSnapshot = true): void => {
         state.deltaText += delta;
-        state.deltasAfterSnapshot += delta;
+        if (afterSnapshot) state.deltasAfterSnapshot += delta;
         state.deltaSeq = ++eventSeq;
-        applyTextDelta(state.type, delta);
+        if (isKnownNonAssistantPartState(state)) return;
+        // Continuation deltas do not count as progress until their message/part
+        // is positively correlated to the current user turn. Legacy non-
+        // continuation streams retain their role-unknown compatibility path.
+        if (expectedCurrentUserMessageId === undefined || isAssistantPartState(state)) {
+          noteDeltaActivity(state.type);
+        }
+        if (isAssistantPartState(state)) {
+          emitTextDelta(state.type, delta);
+        } else {
+          // Keep the collector's legacy fallback text internally while
+          // withholding it from the route callback until its role is known.
+          if (state.type === 'reasoning') reasoning += delta;
+          else content += delta;
+          deltaChars += delta.length;
+          if (onDelta) bufferedRoleUnknownDeltaSeen = true;
+          // Do not expose role-unknown legacy deltas to route callbacks. If a
+          // later message update identifies this as assistant, release them;
+          // if it identifies user, purge them. Truly legacy unknown-role text
+          // remains available only through final reconciliation.
+          state.unreleasedDeltas.push({ delta, sequence: state.deltaSeq });
+        }
+      };
+      const releaseAssistantDeltas = (messageID: string | null, partIds: Set<string> = new Set()): void => {
+        const ready: { state: StreamPartState; delta: string; sequence: number }[] = [];
+        for (const state of partStates.values()) {
+          const matchesMessage = messageID != null && state.messageID === messageID;
+          const matchesPart = state.partID != null && partIds.has(state.partID) && isPartOwnerOrUnassigned(state.messageID, messageID);
+          if (!matchesMessage && !matchesPart) continue;
+          if (!isAssistantPartState(state) || state.unreleasedDeltas.length === 0) continue;
+          for (const pending of state.unreleasedDeltas) ready.push({ state, ...pending });
+          state.unreleasedDeltas = [];
+        }
+        ready.sort((left, right) => left.sequence - right.sequence);
+        for (const item of ready) {
+          // These deltas were quarantined before parent metadata arrived, so
+          // start the first-delta/idle activity clocks only when they are valid.
+          noteDeltaActivity(item.state.type);
+          if (onDelta) onDelta(item.delta, item.state.type === 'reasoning');
+        }
+      };
+      const appendPartDelta = (state: StreamPartState, delta: string): void => {
+        recordPartDelta(state, delta);
       };
       // Delta events may omit `messageID` while the part update carries it (or
       // vice versa), so pending lookups fall back to the part id alone. Numeric
@@ -636,8 +944,10 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
       const findPendingKey = (messageID: string | null, partID: string): string | null => {
         const exact = idPartKey(messageID, partID);
         if (pendingDeltaParts.has(exact)) return exact;
-        const withoutMessageId = idPartKey(null, partID);
-        if (pendingDeltaParts.has(withoutMessageId)) return withoutMessageId;
+        if (messageID != null) {
+          const withoutMessageId = idPartKey(null, partID);
+          return pendingDeltaParts.has(withoutMessageId) ? withoutMessageId : null;
+        }
         for (const [key, pending] of pendingDeltaParts) {
           if (pending.partID === partID) return key;
         }
@@ -652,9 +962,18 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
         pendingDeltaParts.delete(key);
         pending.deltas.forEach((delta) => appendPartDelta(state, delta));
       };
+      const releaseAssistantPendingDeltas = (messageID: string | null, partIds: Set<string>): void => {
+        for (const pending of [...pendingDeltaParts.values()]) {
+          const matchesMessage = messageID != null && pending.messageID === messageID;
+          const matchesPart = pending.partID != null && partIds.has(pending.partID) && isPartOwnerOrUnassigned(pending.messageID, messageID);
+          if (!matchesMessage && !matchesPart) continue;
+          const state = ensurePartState(messageID ?? pending.messageID, pending.partID, 'text', pending.order);
+          flushPendingDeltas(state);
+        }
+      };
       const rememberPartRole = (messageID: string | null, role: string | null): void => {
-        if (role == null) return;
-        messageRoles.set(messageID ?? '', role);
+        if (role == null || messageID == null) return;
+        messageRoles.set(messageID, role);
       };
       const isStaleAssistantSnapshot = (info: Record<string, unknown>, role: string | null): boolean => {
         if (role !== 'assistant') return false;
@@ -678,10 +997,18 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
         const type = part['type'];
         if (type !== 'text' && type !== 'reasoning') return;
         if (isStalePart(part)) return;
-        const messageID = readPartMessageId(part);
-        if (messageID && staleMessageIds.has(messageID)) return;
-        if (isUserPart(messageID)) return;
         const partID = readPartId(part['id']);
+        const messageID = resolvePartMessageId(readPartMessageId(part), partID);
+        if (isPartOutsideExpectedTurn(part)) {
+          if (failOnConfirmedPartParentMismatch(messageID, part)) return;
+          discardPartData(messageID, partID);
+          return;
+        }
+        if (messageID && staleMessageIds.has(messageID)) return;
+        if (isRejectedPart(messageID, partID)) return;
+        rememberPartMessageOwner(messageID, partID);
+        const partRole = roleForPart(messageID, partID);
+        if (partRole === 'user') return;
         const pendingKey = partID != null ? findPendingKey(messageID, partID) : null;
         const pendingOrder = pendingKey != null ? pendingDeltaParts.get(pendingKey)?.order : undefined;
         const state = ensurePartState(messageID, partID, type, order ?? pendingOrder);
@@ -712,22 +1039,25 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
       const finalizeCollected = (extra: Record<string, unknown> = {}): Record<string, unknown> => {
         if (pendingDeltaParts.size > 0) {
           for (const [, pending] of pendingDeltaParts) {
-            if (isUserPart(pending.messageID)) continue;
+            const pendingRole = roleForPart(pending.messageID, pending.partID);
+            if (pendingRole === 'user') continue;
             if (pending.messageID && staleMessageIds.has(pending.messageID)) continue;
             const state = ensurePartState(pending.messageID, pending.partID, 'text', pending.order);
-            pending.deltas.forEach((delta) => {
-              state.deltaText += delta;
-              state.deltasAfterSnapshot += delta;
-            });
+            pending.deltas.forEach((delta) => recordPartDelta(state, delta));
           }
           pendingDeltaParts.clear();
         }
 
         const states = [...partStates.values()].filter(
-          (state) => !isUserPart(state.messageID) && !(state.messageID && staleMessageIds.has(state.messageID)),
+          (state) =>
+            !isKnownNonAssistantPartState(state) &&
+            !(state.messageID && staleMessageIds.has(state.messageID)) &&
+            !(state.messageID && unverifiedAssistantMessageIds.has(state.messageID)) &&
+            !(expectedCurrentUserMessageId !== undefined && !isAssistantPartState(state)),
         );
         let finalContent = content;
         let finalReasoning = reasoning;
+        let unresolvedRoleUnknownDeltas = false;
         if (states.length > 0) {
           const joinedFor = (type: StreamPartType): string =>
             states
@@ -737,7 +1067,15 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
               .join('');
           finalContent = joinedFor('text');
           finalReasoning = joinedFor('reasoning');
-        } else if ([...partStates.values()].some((state) => isUserPart(state.messageID))) {
+          unresolvedRoleUnknownDeltas = states.some(
+            (state) => roleForPart(state.messageID, state.partID) == null && state.unreleasedDeltas.length > 0,
+          );
+        } else if (
+          sawUserParts ||
+          sawStaleMessageParts ||
+          sawUnverifiedAssistantParts ||
+          [...partStates.values()].some((state) => isKnownNonAssistantPartState(state))
+        ) {
           // If the only observed states were user messages, clear any leaked content
           finalContent = '';
           finalReasoning = '';
@@ -747,13 +1085,51 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
           reasoning: finalReasoning,
           ...extra,
         };
-        // `authoritative` means the snapshot repaired/replaced the live delta
-        // text. Equal text (or empty/empty) is not a repair and must keep routes
-        // on the raw path so streamed tool artifacts stay available.
-        if (finalContent !== content || finalReasoning !== reasoning) {
+        // `authoritative` means reconciliation repaired/replaced live deltas, or
+        // finalization is the only safe point to expose role-unknown legacy text.
+        // Equal text (or empty/empty) keeps routes on the raw path so streamed
+        // tool artifacts stay available.
+        if (
+          finalContent !== content ||
+          finalReasoning !== reasoning ||
+          (Boolean(onDelta) && bufferedRoleUnknownDeltaSeen && unresolvedRoleUnknownDeltas)
+        ) {
           result['authoritative'] = true;
         }
         return result;
+      };
+
+      function failCollector(error: Error): void {
+        terminalFinishSeen = true;
+        finished = true;
+        clearAllTimers();
+        controller.abort();
+        // A correlation failure invalidates any previously reconciled raw text;
+        // do not let it escape as a successful partial answer.
+        content = '';
+        reasoning = '';
+        partStates.clear();
+        pendingDeltaParts.clear();
+        quarantinedToolParts.clear();
+        resolve(finalizeCollected({ error }));
+      }
+
+      const failOnConfirmedPartParentMismatch = (
+        messageID: string | null,
+        part: Record<string, unknown>,
+      ): boolean => {
+        const explicitParent = readParentMessageId(part);
+        if (
+          expectedCurrentUserMessageId === undefined ||
+          explicitParent == null ||
+          explicitParent === expectedCurrentUserMessageId ||
+          messageID == null ||
+          assistantMessageParents.get(messageID) !== expectedCurrentUserMessageId
+        ) {
+          return false;
+        }
+        failCollector(new Error('Continuation correlation error: assistant part parent mismatch'));
+        return true;
       };
 
       (async (): Promise<void> => {
@@ -772,34 +1148,86 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
                resolve(finalizeCollected({ error: sessionError }));
                break;
              }
-             if (evType === 'message.part.updated' && asRecord(props['part'])['sessionID'] === sessionId) {
-
-              const part = asRecord(props['part']);
-              const partType = part['type'];
-              const partMessageID = readPartMessageId(part);
-              if (isStalePart(part) || (partMessageID != null && staleMessageIds.has(partMessageID))) {
-                continue;
-              }
-              // A user prompt's text/reasoning parts must never become assistant
-              // answer/tool content. When the role is still unknown the part is
-              // stored and filtered at finalize if the role later turns out user.
-              if ((partType === 'text' || partType === 'reasoning') && !isUserPart(partMessageID)) {
-                const textUpdated = typeof part['text'] === 'string' && Boolean(part['text']);
-                applyPartSnapshot(part);
+               if (evType === 'message.part.updated' && asRecord(props['part'])['sessionID'] === sessionId) {
+                 const rawPart = asRecord(props['part']);
+                 const explicitPartMessageID = readPartMessageId(rawPart) ?? readPartMessageId(props);
+                 const partID = readPartId(rawPart['id']);
+                 if (isAmbiguousOwnerlessPart(explicitPartMessageID, partID)) continue;
+                 const part = explicitPartMessageID != null && readPartMessageId(rawPart) == null
+                   ? { ...rawPart, messageID: explicitPartMessageID }
+                   : rawPart;
+                 const partType = part['type'];
+                const partMessageID = resolvePartMessageId(explicitPartMessageID, partID);
+                  if (isPartOutsideExpectedTurn(part)) {
+                    if (failOnConfirmedPartParentMismatch(partMessageID, part)) break;
+                    discardPartData(partMessageID, partID);
+                   continue;
+                }
+                const knownParent = parentForPart(partMessageID, partID);
+                 if (expectedCurrentUserMessageId !== undefined && knownParent != null && knownParent !== expectedCurrentUserMessageId) {
+                   if (partMessageID != null) discardMessageParts(partMessageID, new Set(partID == null ? [] : [partID]));
+                   else if (partID != null) discardUnownedParts(new Set([partID]));
+                   continue;
+                 }
+                 rememberPartMessageOwner(partMessageID, partID);
+                 const missingExpectedTurn = expectedCurrentUserMessageId !== undefined && knownParent !== expectedCurrentUserMessageId;
+                if (missingExpectedTurn) {
+                  sawUnverifiedAssistantParts = true;
+                  if (partMessageID != null) unverifiedAssistantMessageIds.add(partMessageID);
+                 }
+                if (isRejectedPart(partMessageID, partID) || (partMessageID != null && staleMessageIds.has(partMessageID))) continue;
+                if (isStalePart(part) || (partMessageID != null && staleMessageIds.has(partMessageID))) {
+                  if (partMessageID != null && staleMessageIds.has(partMessageID)) {
+                    discardMessageParts(partMessageID, new Set(partID == null ? [] : [partID]));
+                  }
+                  if (isStalePart(part) && partID != null) rememberRejectedPart(partMessageID, partID);
+                  continue;
+                }
+                if (isUserPart(partMessageID) && partID != null) rememberUserPart(partMessageID, partID);
+                if (isUserPart(partMessageID) || isUserPartId(partMessageID, partID)) {
+                  sawUserParts = true;
+                  for (const [key, state] of partStates) {
+                    if (
+                      (partID != null && state.partID === partID && isPartOwnerOrUnassigned(state.messageID, partMessageID)) ||
+                      (partMessageID != null && state.messageID === partMessageID)
+                    ) {
+                      partStates.delete(key);
+                   }
+                 }
+                  for (const [key, pending] of pendingDeltaParts) {
+                    if (
+                      (partID != null && pending.partID === partID && isPartOwnerOrUnassigned(pending.messageID, partMessageID)) ||
+                      (partMessageID != null && pending.messageID === partMessageID)
+                    ) {
+                     pendingDeltaParts.delete(key);
+                   }
+                 }
+               }
+               // A user prompt's text/reasoning parts must never become assistant
+               // answer/tool content. When the role is still unknown the part is
+                // stored and filtered at finalize if the role later turns out user.
+                const partRole = roleForPart(partMessageID, partID);
+                if ((partType === 'text' || partType === 'reasoning') && partRole !== 'user') {
+                  const textUpdated = typeof part['text'] === 'string' && Boolean(part['text']);
+                  applyPartSnapshot(part);
+                  if (finished) break;
                 // Older OpenCode servers carried the streaming delta directly on
                 // message.part.updated; newer servers emit message.part.delta.
                 const delta: unknown = props['delta'];
                 if (typeof delta === 'string' && delta) {
-                  const state = ensurePartState(partMessageID, readPartId(part['id']), partType);
-                  if (textUpdated) {
-                    state.deltaText += delta;
-                    applyTextDelta(state.type, delta);
-                  } else {
-                    appendPartDelta(state, delta);
-                  }
+                  if (isRejectedPart(partMessageID, partID)) continue;
+                  const state = ensurePartState(partMessageID, partID, partType);
+                  recordPartDelta(state, delta, !textUpdated);
                 }
               }
-              trackToolActivity(part);
+                 if (partRole !== 'user') {
+                   rememberToolPartUpdate(partMessageID, part);
+                   if (expectedCurrentUserMessageId === undefined || knownParent === expectedCurrentUserMessageId) {
+                    trackToolActivity(latestToolPart(partMessageID, partID, part));
+                  } else if (partType === 'tool') {
+                    quarantineToolPart(partMessageID, partID, latestToolPart(partMessageID, partID, part));
+                  }
+                }
 
               continue;
             }
@@ -809,18 +1237,38 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
               const field: unknown = props['field'];
               // Text and reasoning deltas both stream through field === 'text'.
               // Tool-input deltas surface via message.part.updated tool state.
-              if (typeof delta === 'string' && delta && field === 'text' && partID != null) {
-                const partMessageID = readPartMessageId(props);
-                if (partMessageID != null && (isUserPart(partMessageID) || staleMessageIds.has(partMessageID))) {
+             if (typeof delta === 'string' && delta && field === 'text' && partID != null) {
+                const explicitPartMessageID = readPartMessageId(props);
+                if (isAmbiguousOwnerlessPart(explicitPartMessageID, partID)) continue;
+                const partMessageID = resolvePartMessageId(explicitPartMessageID, partID);
+                const partRole = roleForPart(partMessageID, partID);
+                if (isPartOutsideExpectedTurn(props)) {
+                  if (failOnConfirmedPartParentMismatch(partMessageID, props)) break;
+                  discardPartData(partMessageID, partID);
                   continue;
                 }
+                const knownParent = parentForPart(partMessageID, partID);
+                if (expectedCurrentUserMessageId !== undefined && knownParent != null && knownParent !== expectedCurrentUserMessageId) {
+                  if (partMessageID != null) discardMessageParts(partMessageID, new Set([partID]));
+                  else discardUnownedParts(new Set([partID]));
+                  continue;
+                }
+                rememberPartMessageOwner(partMessageID, partID);
+                const missingExpectedTurn = expectedCurrentUserMessageId !== undefined && knownParent !== expectedCurrentUserMessageId;
+                if (isRejectedPart(partMessageID, partID) || partRole === 'user' || (partMessageID != null && staleMessageIds.has(partMessageID))) {
+                  continue;
+                }
+                if (missingExpectedTurn) {
+                  sawUnverifiedAssistantParts = true;
+                  if (partMessageID != null) unverifiedAssistantMessageIds.add(partMessageID);
+                 }
                 const state = findPartState(partMessageID, partID);
                 if (state) {
                   appendPartDelta(state, delta);
                 } else {
                   // Type not announced yet; keep the delta (numeric IDs already
                   // stringified) until the part update arrives.
-                  noteDeltaActivity(undefined);
+                  if (!missingExpectedTurn) noteDeltaActivity(undefined);
                   const existingKey = findPendingKey(partMessageID, partID);
                   if (existingKey != null) {
                     pendingDeltaParts.get(existingKey)?.deltas.push(delta);
@@ -837,48 +1285,136 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
               continue;
             }
             if (evType === 'message.updated' && asRecord(props['info'])['sessionID'] === sessionId) {
-              const info = asRecord(props['info']);
-              const finish: unknown = info['finish'];
-              const messageID = readInfoMessageId(info);
-              const role = typeof info['role'] === 'string' ? (info['role'] as string) : null;
-              rememberPartRole(messageID, role);
-              // User prompt snapshots are never assistant output: skipping the
-              // whole update also prevents a user `finish` from ending the turn.
-              if (role === 'user') {
-                if (messageID) {
-                  for (const [key, st] of partStates) {
-                    if (st.messageID === messageID) partStates.delete(key);
-                  }
+                const info = asRecord(props['info']);
+                const finish: unknown = info['finish'];
+                const messageID = readInfoMessageId(info);
+                const role = typeof info['role'] === 'string' ? (info['role'] as string) : null;
+                const parentID = readParentMessageId(info);
+                const previouslyConfirmedParent = messageID == null ? undefined : assistantMessageParents.get(messageID);
+                if (
+                  role !== 'user' &&
+                  expectedCurrentUserMessageId !== undefined &&
+                  previouslyConfirmedParent === expectedCurrentUserMessageId &&
+                  parentID != null &&
+                  parentID !== expectedCurrentUserMessageId
+                ) {
+                  failCollector(new Error('Continuation correlation error: assistant message parent changed'));
+                  break;
                 }
-                if (Array.isArray(info['parts'])) {
-                  for (const rawPart of info['parts'] as unknown[]) {
-                    const pId = readPartId(asRecord(rawPart)['id']);
-                    if (pId != null) {
-                      for (const [key, st] of partStates) {
-                        if (st.partID === pId) partStates.delete(key);
+                if (messageID != null && parentID != null) {
+                  assistantMessageParents.set(messageID, parentID);
+                }
+                if (role !== 'user' && expectedCurrentUserMessageId !== undefined && isOutsideExpectedTurn(messageID, parentID)) {
+                  const partIds = new Set<string>(
+                    (Array.isArray(info['parts']) ? info['parts'] as unknown[] : [])
+                      .map((rawPart) => readPartId(asRecord(rawPart)['id']))
+                      .filter((id): id is string => id != null),
+                  );
+                  if (messageID != null) {
+                    for (const partID of partIds) rememberPartMessageOwner(messageID, partID);
+                    discardMessageParts(messageID, partIds);
+                  } else discardUnownedParts(partIds);
+                  continue;
+                }
+                if (role !== 'user' && !isExpectedTurn(messageID, parentID)) {
+                  sawUnverifiedAssistantParts = true;
+                  if (messageID != null) unverifiedAssistantMessageIds.add(messageID);
+                  rememberPartRole(messageID, role);
+                  // Missing turn metadata is not evidence that this message
+                  // belongs to the continuation. Keep its data quarantined, but
+                  // do not let it emit or finish the expected turn.
+                  if (Array.isArray(info['parts'])) {
+                    (info['parts'] as unknown[]).forEach((rawPart) => {
+                      const part = asRecord(rawPart);
+                      const partID = readPartId(part['id']);
+                      rememberPartMessageOwner(messageID, partID);
+                      if (partID != null && role != null) {
+                        rememberPartOwner(assistantPartOwners, assistantPartIdsWithoutOwner, messageID, partID);
                       }
+                      const messagePart = messageID != null && readPartMessageId(part) == null
+                        ? { ...part, messageID }
+                        : part;
+                      if (part['type'] === 'tool') {
+                        quarantineToolPart(messageID, readPartId(part['id']), messagePart);
+                      }
+                      applyPartSnapshot(messagePart);
+                    });
+                  }
+                  continue;
+                }
+                if (isStaleAssistantSnapshot(info, role)) {
+                  logDebug('Ignoring stale assistant message snapshot', {
+                    sessionId,
+                    messageID,
+                    created: asRecord(info['time'])['created'],
+                  });
+                  if (messageID != null) {
+                    const partIds = new Set<string>(
+                      (Array.isArray(info['parts']) ? info['parts'] as unknown[] : [])
+                        .map((rawPart) => readPartId(asRecord(rawPart)['id']))
+                        .filter((id): id is string => id != null),
+                    );
+                    for (const partID of partIds) rememberPartMessageOwner(messageID, partID);
+                    discardMessageParts(messageID, partIds);
+                  }
+                  continue;
+                }
+                if (role !== 'user' && messageID != null) {
+                  unverifiedAssistantMessageIds.delete(messageID);
+                }
+                rememberPartRole(messageID, role);
+                const classifiedPartIds = new Set<string>();
+                if (role != null) {
+                  for (const rawPart of Array.isArray(info['parts']) ? info['parts'] as unknown[] : []) {
+                    const rawPartRecord = asRecord(rawPart);
+                    const partID = readPartId(asRecord(rawPart)['id']);
+                    if (partID == null) continue;
+                    if (isPartOutsideExpectedTurn(rawPartRecord)) {
+                      if (failOnConfirmedPartParentMismatch(messageID, rawPartRecord)) break;
+                      discardPartData(messageID, partID);
+                      continue;
+                    }
+                    classifiedPartIds.add(partID);
+                    rememberPartMessageOwner(messageID, partID);
+                    if (role === 'user') rememberUserPart(messageID, partID);
+                    else {
+                      rememberPartOwner(assistantPartOwners, assistantPartIdsWithoutOwner, messageID, partID);
+                      if (parentID != null) assistantPartParents.set(idPartKey(messageID, partID), parentID);
                     }
                   }
                 }
-                continue;
-              }
-              // A stale assistant message from before this turn must not overwrite
-              // the live answer. Only apply this when the backend supplies a
-              // creation timestamp; timestamp-less legacy events stay accepted.
-              if (isStaleAssistantSnapshot(info, role)) {
-                logDebug('Ignoring stale assistant message snapshot', {
-                  sessionId,
-                  messageID,
-                  created: asRecord(info['time'])['created'],
-                });
-                if (messageID) {
-                  staleMessageIds.add(messageID);
-                  for (const [key, st] of partStates) {
-                    if (st.messageID === messageID) partStates.delete(key);
+                if (finished) break;
+                // User prompt snapshots are never assistant output: skipping the
+                // whole update also prevents a user `finish` from ending the turn.
+                if (role === 'user') {
+                  sawUserParts = true;
+                  if (messageID != null) {
+                    for (const [key, st] of partStates) {
+                      if (st.messageID === messageID) {
+                        if (st.partID != null) rememberUserPart(messageID, st.partID);
+                        partStates.delete(key);
+                      }
+                    }
                   }
+                  for (const partID of classifiedPartIds) {
+                    for (const [key, st] of partStates) {
+                      if (st.partID === partID && isPartOwnerOrUnassigned(st.messageID, messageID)) partStates.delete(key);
+                    }
+                  }
+                  for (const [key, pending] of pendingDeltaParts) {
+                    const matchesMessage = messageID != null && pending.messageID === messageID;
+                    const matchesPart = pending.partID != null && classifiedPartIds.has(pending.partID) && isPartOwnerOrUnassigned(pending.messageID, messageID);
+                    if (matchesMessage || matchesPart) {
+                      if (pending.partID != null) rememberUserPart(messageID, pending.partID);
+                      pendingDeltaParts.delete(key);
+                    }
+                  }
+                  continue;
                 }
-                continue;
-              }
+                if (role === 'assistant' || expectedCurrentUserMessageId !== undefined) {
+                  releaseAssistantDeltas(messageID, classifiedPartIds);
+                  releaseAssistantPendingDeltas(messageID, classifiedPartIds);
+                }
               if (typeof finish === 'string') lastFinish = finish;
               // An aborted or failed message never produces another delta. Without
               // this, the collector waits out the whole first-delta window before
@@ -899,17 +1435,42 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
               // Reconcile active tool calls and per-part text snapshots from the
               // full message snapshot so we detect pending tools even when only
               // message.updated fires.
-              if (Array.isArray(info['parts'])) {
-                const snapshotParts = info['parts'] as unknown[];
-                snapshotParts.forEach((rawPart, index) => {
-                  const part = asRecord(rawPart);
-                  // `info.parts` is ordered; the array index is authoritative for
-                  // joining multiple text/reasoning parts.
-                  applyPartSnapshot(part, index);
-                  if (part['type'] === 'tool') trackToolState(part);
-                });
+                if (Array.isArray(info['parts'])) {
+                  const snapshotParts = info['parts'] as unknown[];
+                  snapshotParts.forEach((rawPart, index) => {
+                    const part = asRecord(rawPart);
+                    // `info.parts` is ordered; the array index is authoritative for
+                    // joining multiple text/reasoning parts.
+                    const messagePart = {
+                      ...part,
+                      ...(messageID != null && readPartMessageId(part) == null ? { messageID } : {}),
+                      ...(parentID != null && readParentMessageId(part) == null ? { parentID } : {}),
+                    };
+                    rememberPartMessageOwner(messageID, readPartId(part['id']));
+                    if (isPartOutsideExpectedTurn(messagePart)) {
+                      if (failOnConfirmedPartParentMismatch(messageID, messagePart)) return;
+                      discardPartData(messageID, readPartId(part['id']));
+                      return;
+                    }
+                    applyPartSnapshot(messagePart, index);
+                    if (part['type'] === 'tool') {
+                      if (expectedCurrentUserMessageId === undefined) {
+                        trackToolState(latestToolPart(messageID, readPartId(part['id']), messagePart));
+                      } else {
+                        quarantineToolPart(messageID, readPartId(part['id']), messagePart);
+                      }
+                    }
+                  });
+                  if (finished) break;
+                  if (role === 'assistant' || expectedCurrentUserMessageId !== undefined) {
+                    releaseAssistantDeltas(messageID, classifiedPartIds);
+                    releaseAssistantPendingDeltas(messageID, classifiedPartIds);
+                  }
                 // New parts observed after this snapshot must sort after it.
                 partOrderCounter = Math.max(partOrderCounter, snapshotParts.length);
+              }
+              if (expectedCurrentUserMessageId !== undefined) {
+                releaseQuarantinedToolParts(messageID, classifiedPartIds);
               }
               if (finish === 'tool' || finish === 'tool-calls') {
                 // Assistant turn ended pending a tool call; keep waiting for the result.

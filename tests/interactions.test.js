@@ -14,7 +14,11 @@ const sdkMocks = {
     sessionPrompt: jest.fn(async () => ({ data: { parts: [] } })),
     sessionMessages: jest.fn(async () => ([
         {
-            info: { role: 'assistant', finish: 'stop' },
+            info: {
+                role: 'assistant',
+                parentID: sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0]?.body?.messageID,
+                finish: 'stop',
+            },
             parts: [
                 { type: 'text', text: ANSWER_WITH_URL },
                 {
@@ -103,6 +107,7 @@ describe('POST /v1beta/interactions', () => {
             tools: [{ type: 'google_search' }],
         });
         expect(res.statusCode).toBe(200);
+        expect(res.body.output_text).toBe(ANSWER_WITH_URL);
         const call = res.body.steps.find((s) => s.type === 'google_search_call');
         expect(call).toEqual({ type: 'google_search_call', queries: ['latest PostgreSQL release'] });
         const result = res.body.steps.find((s) => s.type === 'google_search_result');
@@ -188,6 +193,55 @@ describe('POST /v1beta/interactions', () => {
         expect(res.text).toContain('step.delta');
         expect(res.text).toContain('interaction.completed');
         expect(sdkMocks.eventSubscribe).not.toHaveBeenCalled();
+    });
+
+    test('non-stream rejects reasoning-only output even when search evidence exists', async () => {
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    { type: 'reasoning', text: 'Private reasoning only' },
+                    {
+                        type: 'tool',
+                        id: 'call_search_reasoning_only',
+                        tool: 'websearch',
+                        state: { status: 'completed', input: { query: 'release notes' }, output: SEARCH_OUTPUT },
+                    },
+                ],
+            },
+        ]);
+        const app = createApp(baseConfig({})).app;
+        const res = await request(app).post('/v1beta/interactions').send({
+            model: 'opencode/kimi-k2.5',
+            input: 'Latest release?',
+            tools: [{ type: 'google_search' }],
+        });
+
+        expect(res.statusCode).toBeGreaterThanOrEqual(400);
+        expect(res.body.status).not.toBe('completed');
+        expect(res.body.output_text).toBeUndefined();
+        expect(JSON.stringify(res.body)).not.toContain('Private reasoning only');
+    });
+
+    test('stream rejects reasoning-only output instead of completing with empty text', async () => {
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'reasoning', text: 'Private reasoning only' }],
+            },
+        ]);
+        const app = createApp(baseConfig({})).app;
+        const res = await request(app).post('/v1beta/interactions').send({
+            model: 'opencode/kimi-k2.5',
+            input: 'Think about this',
+            stream: true,
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.text).toContain('interaction.created');
+        expect(res.text).toContain('"type":"error"');
+        expect(res.text).not.toContain('interaction.completed');
+        expect(res.text).not.toContain('Private reasoning only');
     });
 
     test('non-stream strips tool-call markup from output_text and steps when DISABLE_TOOLS=true', async () => {
@@ -321,6 +375,139 @@ describe('POST /v1beta/interactions', () => {
         expect(res.text).toContain('"type":"error"');
         expect(res.text).not.toContain('interaction.completed');
         expect(res.text).not.toContain('[DONE]');
+    });
+    test('cleans up a request-owned session on error but preserves a reused parent session', async () => {
+        const app = createApp(baseConfig({})).app;
+        sdkMocks.sessionPrompt.mockRejectedValueOnce(new Error('backend down'));
+        const failed = await request(app).post('/v1beta/interactions').send({ model: 'opencode/kimi-k2.5', input: 'hi' });
+        expect(failed.statusCode).toBeGreaterThanOrEqual(400);
+        expect(sdkMocks.sessionDelete).toHaveBeenCalledWith({ path: { id: 'intr-session' } });
+
+        const stored = await request(app).post('/v1beta/interactions').send({ model: 'opencode/kimi-k2.5', input: 'hi' });
+        expect(stored.statusCode).toBe(200);
+        jest.clearAllMocks();
+        sdkMocks.toolIds.mockResolvedValue({ data: ['websearch', 'webfetch'] });
+        sdkMocks.sessionPrompt.mockRejectedValueOnce(new Error('backend down'));
+        const failedContinuation = await request(app).post('/v1beta/interactions').send({
+            model: 'opencode/kimi-k2.5',
+            input: 'follow-up',
+            previous_interaction_id: stored.body.id,
+        });
+        expect(failedContinuation.statusCode).toBeGreaterThanOrEqual(400);
+        expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
+        expect(sdkMocks.sessionCreate).not.toHaveBeenCalled();
+    });
+    test('retry cleanup retains every owned session ID until deletion succeeds', async () => {
+        const app = createApp(baseConfig({ RETRY_MAX_RETRIES: 1 })).app;
+        sdkMocks.sessionCreate
+            .mockResolvedValueOnce({ data: { id: 'retry-owned-session-1' } })
+            .mockResolvedValueOnce({ data: { id: 'retry-owned-session-2' } });
+        sdkMocks.sessionPrompt
+            .mockRejectedValueOnce({ data: { statusCode: 503 } })
+            .mockRejectedValueOnce(new Error('second prompt failure'));
+        const deleteAttempts = [];
+        sdkMocks.sessionDelete.mockImplementation(async ({ path: { id } }) => {
+            deleteAttempts.push(id);
+            if (id === 'retry-owned-session-1' && deleteAttempts.filter((attemptedId) => attemptedId === id).length === 1) {
+                throw new Error('first delete failed');
+            }
+            return {};
+        });
+
+        const response = await request(app).post('/v1beta/interactions').send({
+            model: 'opencode/kimi-k2.5',
+            input: 'retry cleanup',
+        });
+
+        expect(response.statusCode).toBeGreaterThanOrEqual(400);
+        expect(deleteAttempts).toEqual([
+            'retry-owned-session-1',
+            'retry-owned-session-1',
+            'retry-owned-session-2',
+        ]);
+    });
+    test('store:false retries a transient owned-session delete after terminal success', async () => {
+        const app = createApp(baseConfig({})).app;
+        sdkMocks.sessionDelete.mockRejectedValueOnce({ data: { statusCode: 503 } });
+
+        const response = await request(app).post('/v1beta/interactions').send({
+            model: 'opencode/kimi-k2.5',
+            input: 'ephemeral success',
+            store: false,
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(sdkMocks.sessionDelete).toHaveBeenCalledTimes(2);
+        expect(sdkMocks.sessionDelete).toHaveBeenNthCalledWith(1, { path: { id: 'intr-session' } });
+        expect(sdkMocks.sessionDelete).toHaveBeenNthCalledWith(2, { path: { id: 'intr-session' } });
+    });
+    test('store:true preserves the owned session after ordinary success', async () => {
+        const app = createApp(baseConfig({})).app;
+
+        const response = await request(app).post('/v1beta/interactions').send({
+            model: 'opencode/kimi-k2.5',
+            input: 'persisted success',
+            store: true,
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(sdkMocks.sessionCreate).toHaveBeenCalledTimes(1);
+        expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
+    });
+    test('store:true client disconnect retries a transient owned-session delete before prompt resolves', async () => {
+        const app = createApp(baseConfig({})).app;
+        const server = app.listen(0);
+        let markPromptStarted;
+        const promptStarted = new Promise((resolve) => { markPromptStarted = resolve; });
+        let resolvePrompt;
+        let promptResolved = false;
+        const pendingPrompt = new Promise((resolve) => {
+            resolvePrompt = () => {
+                promptResolved = true;
+                resolve({});
+            };
+        });
+        sdkMocks.sessionPrompt.mockImplementationOnce(() => {
+            markPromptStarted();
+            return pendingPrompt;
+        });
+        let markDeleteAttempted;
+        const deleteAttempted = new Promise((resolve) => { markDeleteAttempted = resolve; });
+        let markDeleteSucceeded;
+        const deleteSucceeded = new Promise((resolve) => { markDeleteSucceeded = resolve; });
+        sdkMocks.sessionDelete
+            .mockImplementationOnce(async () => {
+                markDeleteAttempted();
+                throw { data: { statusCode: 503 } };
+            })
+            .mockImplementationOnce(async () => {
+                markDeleteSucceeded();
+                return {};
+            });
+
+        try {
+            const clientRequest = request(server).post('/v1beta/interactions').send({
+                model: 'opencode/kimi-k2.5',
+                input: 'disconnect cleanup',
+                store: true,
+            });
+            // Observe the abort as a handled promise rejection; the cleanup path
+            // is asynchronous and is synchronized separately below.
+            void clientRequest.then(() => undefined, () => undefined);
+            await promptStarted;
+            clientRequest.abort();
+            await deleteAttempted;
+            expect(promptResolved).toBe(false);
+            expect(sdkMocks.sessionDelete).toHaveBeenNthCalledWith(1, { path: { id: 'intr-session' } });
+            resolvePrompt({});
+            await deleteSucceeded;
+
+            expect(sdkMocks.sessionDelete).toHaveBeenCalledTimes(2);
+            expect(sdkMocks.sessionDelete).toHaveBeenNthCalledWith(1, { path: { id: 'intr-session' } });
+            expect(sdkMocks.sessionDelete).toHaveBeenNthCalledWith(2, { path: { id: 'intr-session' } });
+        } finally {
+            await new Promise((resolve) => server.close(resolve));
+        }
     });
     test('function tools stay rejected without touching backend', async () => {
         const app = createApp(baseConfig({})).app;

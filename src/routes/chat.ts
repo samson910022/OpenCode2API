@@ -576,6 +576,12 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                let polledSnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null = null;
                let snapshotPolled = false;
                let snapshotPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> | null = null;
+               const hasRecoveryEvidence = (snapshot: { content: string; reasoning: string; toolParts?: unknown }): boolean =>
+                 Boolean(
+                   snapshot.content ||
+                     snapshot.reasoning ||
+                     (Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0),
+                 );
                const pollSnapshot = async (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> => {
                  snapshotPolled = true;
                  if (!snapshotPromise) {
@@ -621,12 +627,10 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   }
                   if (snapshot.error != null) throw snapshot.error;
                   if (snapshot.partial === true) throw new Error('Recovery poll returned incomplete response');
-                  if (
-                    fallbackError != null &&
-                    !snapshot.content &&
-                    !snapshot.reasoning &&
-                    !(Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0)
-                  ) throw fallbackError;
+                  if (!hasRecoveryEvidence(snapshot)) {
+                    if (fallbackError != null) throw fallbackError;
+                    return null;
+                  }
                   return snapshot;
                 };
 
@@ -679,10 +683,13 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                     // through the proxy bundle instead of the event stream.
                     // Deltas go out immediately so the post-loop poll is skipped.
                     await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-                    const pres = (await pollSnapshot()) as { content: string; reasoning: string; error: unknown; partial?: boolean };
-                    polledSnapshot = pres;
+                    const pres = await pollSnapshot();
                     if (pres.error != null) throw pres.error;
                     if (pres.partial === true) throw new Error('Recovery poll returned incomplete response');
+                    if (!hasRecoveryEvidence(pres) && externalToolChoice.mode !== 'required') {
+                      throw new Error('Recovery poll returned empty response');
+                    }
+                    polledSnapshot = pres;
                     const presReasoning = unsentSuffix(pres.reasoning, rawStreamedReasoning);
                     const presContent = unsentSuffix(pres.content, rawStreamedContent);
                     if (presReasoning) sendDelta(presReasoning, true);
@@ -693,6 +700,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                     collected = {
                       content: pres.content,
                       reasoning: pres.reasoning,
+                      toolParts: pres.toolParts,
                     };
                   } else {
                     const collectPromise = collectFromEvents(
@@ -821,7 +829,9 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                 }
 
                 if (!hasValidTerminal && !polledSnapshot && !fallbackServed) {
-                  throw new Error('Stream ended without valid terminal');
+                  if (streamedToolCalls.length === 0 && externalToolChoice.mode !== 'required') {
+                    throw new Error('Stream ended without valid terminal');
+                  }
                 }
 
 
@@ -1096,9 +1106,18 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                      requestAbortController.signal,
                    );
 
-                  content = collected.content || '';
-                  reasoning = collected.reasoning || '';
-                  error = collected.error || (collected.partial === true ? new Error('Polling returned incomplete response') : null);
+                   content = collected.content || '';
+                   reasoning = collected.reasoning || '';
+                   error =
+                     collected.error ||
+                     (collected.partial === true
+                       ? new Error('Polling returned incomplete response')
+                       : externalToolChoice.mode !== 'required' &&
+                           !content &&
+                           !reasoning &&
+                           !(Array.isArray(collected.toolParts) && collected.toolParts.length > 0)
+                         ? new Error('Polling returned empty response')
+                         : null);
                 } catch (promptError: unknown) {
                   content = '';
                   reasoning = '';

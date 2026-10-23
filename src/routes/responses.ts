@@ -1173,6 +1173,13 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         };
         let recoverySnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null = null;
         let recoveryPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> | null = null;
+        const isContinuation = Boolean(previousState?.sessionId);
+        const hasRecoveryEvidence = (snapshot: { content: string; reasoning: string; toolParts?: unknown }): boolean =>
+          Boolean(
+            snapshot.content ||
+              snapshot.reasoning ||
+              (Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0),
+          );
         const pollRecoverySnapshot = (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> => {
           if (!recoveryPromise) {
             recoveryPromise = activePollForAssistantResponse(
@@ -1180,13 +1187,13 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               REQUEST_TIMEOUT_MS,
               undefined,
               responsesAbortController.signal,
+              isContinuation ? String(promptParams.body['messageID']) : undefined,
             );
           }
           return recoveryPromise;
         };
         let collected: Record<string, unknown> | null = null;
         let lastStreamAttemptError: unknown = null;
-        const isContinuation = Boolean(previousState?.sessionId);
         let promptSubmitted = false;
         let promptPromise: Promise<unknown> | null = null;
 
@@ -1261,6 +1268,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
                 collected = { error: pres.error };
               } else if (pres.partial === true) {
                 collected = { error: new Error('Recovery poll returned incomplete response') };
+              } else if (!hasRecoveryEvidence(pres) && externalToolChoice.mode !== 'required') {
+                collected = { error: new Error('Recovery poll returned empty response') };
               } else {
                 recoverySnapshot = pres;
                 keepStreamToolParts(pres);
@@ -1278,6 +1287,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
                 DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
                 DEFAULT_EVENT_IDLE_TIMEOUT_MS,
                 responsesAbortController.signal,
+                isContinuation ? String(promptParams.body['messageID']) : undefined,
               );
 
               const safeCollect = collectPromise.catch((err: unknown) => ({ __error: err }));
@@ -1325,6 +1335,10 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
                 attemptError = recovery.error;
               } else if (recovery.partial === true) {
                 attemptError = new Error('Recovery poll returned incomplete response');
+              } else if (!hasRecoveryEvidence(recovery)) {
+                if (streamedToolCalls.length === 0 && externalToolChoice.mode !== 'required') {
+                  attemptError = new Error('Recovery poll returned empty response');
+                }
               } else {
                 recoverySnapshot = recovery;
                 keepStreamToolParts(recovery);
@@ -1393,12 +1407,10 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
            }
            if (polled.error != null) throw polled.error;
            if (polled.partial === true) throw new Error('Recovery poll returned incomplete response');
-           if (
-             fallbackError != null &&
-             !polled.content &&
-             !polled.reasoning &&
-             !(Array.isArray(polled.toolParts) && polled.toolParts.length > 0)
-           ) throw normalizeBackendError(fallbackError);
+           if (!hasRecoveryEvidence(polled)) {
+             if (fallbackError != null) throw normalizeBackendError(fallbackError);
+             return null;
+           }
            recoverySnapshot = polled;
            return polled;
          };
@@ -1419,11 +1431,12 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
          if (hostedSearch.requested && streamSearchToolParts.length === 0) {
            try {
              const evPoll = await activePollForAssistantResponse(
-               sessionId as string,
-               Math.min(15000, REQUEST_TIMEOUT_MS),
-               undefined,
-               responsesAbortController.signal,
-             );
+              sessionId as string,
+              Math.min(15000, REQUEST_TIMEOUT_MS),
+              undefined,
+              responsesAbortController.signal,
+              isContinuation ? String(promptParams.body['messageID']) : undefined,
+            );
              if (Array.isArray(evPoll.toolParts)) streamSearchToolParts = evPoll.toolParts;
            } catch {
            }
@@ -1442,9 +1455,11 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
            }
          }
 
-         if (!hasValidTerminal && !recoverySnapshot && !fallbackServed) {
-           throw new Error('Stream ended without valid terminal');
-         }
+          if (!hasValidTerminal && !recoverySnapshot && !fallbackServed) {
+            if (streamedToolCalls.length === 0 && externalToolChoice.mode !== 'required') {
+              throw new Error('Stream ended without valid terminal');
+            }
+          }
 
 
          const flushedReasoningCalls = parseReasoningToolCalls.flush ? parseReasoningToolCalls.flush() : [];
@@ -1779,6 +1794,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               REQUEST_TIMEOUT_MS,
               undefined,
               responsesAbortController.signal,
+              isNonStreamContinuation ? String(promptParams.body['messageID']) : undefined,
             );
           } else {
             if (isNonStreamContinuation) {
@@ -1806,6 +1822,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               REQUEST_TIMEOUT_MS,
               undefined,
               responsesAbortController.signal,
+              isNonStreamContinuation ? String(promptParams.body['messageID']) : undefined,
             );
           }
         } catch (loopError: unknown) {
@@ -1826,7 +1843,19 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           }
           throw normalizeBackendError(loopError);
         }
-        const polledError = polledResponse?.error ?? (polledResponse?.partial === true ? new Error('Polling returned incomplete response') : null);
+        const polledEmpty = Boolean(
+          polledResponse &&
+            !polledResponse.content &&
+            !polledResponse.reasoning &&
+            !(Array.isArray(polledResponse.toolParts) && polledResponse.toolParts.length > 0),
+        );
+        const polledError =
+          polledResponse?.error ??
+          (polledResponse?.partial === true
+            ? new Error('Polling returned incomplete response')
+            : polledEmpty && externalToolChoice.mode !== 'required'
+              ? new Error('Polling returned empty response')
+              : null);
         if (polledResponse && polledError != null) {
           if (isNonStreamContinuation) {
             throw normalizeBackendError(polledError);
@@ -1866,6 +1895,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
              Math.min(15000, REQUEST_TIMEOUT_MS),
              undefined,
              responsesAbortController.signal,
+             isNonStreamContinuation ? String(promptParams.body['messageID']) : undefined,
            );
 
           if (Array.isArray(evPoll.toolParts) && evPoll.toolParts.length > 0) {

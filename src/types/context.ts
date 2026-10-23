@@ -57,7 +57,8 @@ export interface CollectorHandle {
     sessionId: string,
     timeoutMs: number,
     intervalMs?: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    expectedCurrentUserMessageId?: string,
   ) => Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[]; partial?: boolean; complete?: boolean }>;
   collectFromEvents: (
     sessionId: string,
@@ -65,7 +66,8 @@ export interface CollectorHandle {
     onDelta?: ((delta: string, isReasoning?: boolean) => void) | null,
     firstDeltaTimeoutMs?: number | null,
     idleTimeoutMs?: number | null,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    expectedCurrentUserMessageId?: string,
   ) => Promise<Record<string, unknown>>;
 }
 

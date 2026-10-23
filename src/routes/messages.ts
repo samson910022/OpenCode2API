@@ -477,9 +477,18 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                    requestAbortController.signal,
                  );
 
-                content = collected.content || '';
-                reasoning = collected.reasoning || '';
-                error = collected.error || (collected.partial === true ? new Error('Polling returned incomplete response') : null);
+                 content = collected.content || '';
+                 reasoning = collected.reasoning || '';
+                 error =
+                   collected.error ||
+                   (collected.partial === true
+                     ? new Error('Polling returned incomplete response')
+                     : externalToolChoice.mode !== 'required' &&
+                         !content &&
+                         !reasoning &&
+                         !(Array.isArray(collected.toolParts) && collected.toolParts.length > 0)
+                       ? new Error('Polling returned empty response')
+                       : null);
               } catch (promptError: unknown) {
                 content = '';
                 reasoning = '';
@@ -646,6 +655,12 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
            let polledSnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null = null;
            let snapshotPolled = false;
            let snapshotPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> | null = null;
+           const hasRecoveryEvidence = (snapshot: { content: string; reasoning: string; toolParts?: unknown }): boolean =>
+             Boolean(
+               snapshot.content ||
+                 snapshot.reasoning ||
+                 (Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0),
+             );
            const pollSnapshot = async (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> => {
              snapshotPolled = true;
              if (!snapshotPromise) {
@@ -680,16 +695,14 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                if (res.destroyed || res.writableEnded) return null;
                if (fallbackError != null) throw normalizeBackendError(fallbackError);
                throw normalizeBackendError(error);
-             }
-             if (snapshot.error != null) throw snapshot.error;
-             if (snapshot.partial === true) throw new Error('Recovery poll returned incomplete response');
-             if (
-               fallbackError != null &&
-               !snapshot.content &&
-               !snapshot.reasoning &&
-               !(Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0)
-             ) throw normalizeBackendError(fallbackError);
-             return snapshot;
+              }
+              if (snapshot.error != null) throw snapshot.error;
+              if (snapshot.partial === true) throw new Error('Recovery poll returned incomplete response');
+              if (!hasRecoveryEvidence(snapshot)) {
+                if (fallbackError != null) throw normalizeBackendError(fallbackError);
+                return null;
+              }
+              return snapshot;
            };
 
           let lastStreamAttemptError: unknown = null;
@@ -746,9 +759,12 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                 // through the proxy bundle instead of the event stream.
                 await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
                 const pres = await pollSnapshot();
-                polledSnapshot = pres;
                 if (pres.error != null) throw normalizeBackendError(pres.error);
                 if (pres.partial === true) throw new Error('Recovery poll returned incomplete response');
+                if (!hasRecoveryEvidence(pres) && externalToolChoice.mode !== 'required') {
+                  throw new Error('Recovery poll returned empty response');
+                }
+                polledSnapshot = pres;
                 if (res.destroyed || res.writableEnded) {
                   if (keepaliveInterval) clearInterval(keepaliveInterval);
                   return;
@@ -759,7 +775,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                 if (presContent) sendDelta(presContent, false);
                 if (presReasoning) sendDelta(presReasoning, true);
                 if (pres.content || pres.reasoning) fallbackServed = true;
-                collected = { content: pres.content, reasoning: pres.reasoning };
+                collected = { content: pres.content, reasoning: pres.reasoning, toolParts: pres.toolParts };
               } else {
                 const collectPromise = collectFromEvents(
                   sessionId as string,
@@ -804,6 +820,8 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                   attemptError = recovery.error;
                 } else if (recovery.partial === true) {
                   attemptError = new Error('Recovery poll returned incomplete response');
+                } else if (!hasRecoveryEvidence(recovery)) {
+                  attemptError = new Error('Recovery poll returned empty response');
                 } else {
                   polledSnapshot = recovery;
                   const presContent = unsentSuffix(recovery.content, rawContent);
@@ -877,9 +895,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                  if (remainingContent) sendDelta(remainingContent, false);
                }
              }
-            if (!hasValidTerminal && !polledSnapshot && !fallbackServed) {
-              throw new Error('Stream ended without valid terminal');
-            }
+             if (!hasValidTerminal && !polledSnapshot && !fallbackServed) {
+               if (streamedToolCalls.length === 0 && externalToolChoice.mode !== 'required') {
+                 throw new Error('Stream ended without valid terminal');
+               }
+             }
            if (requestAbortController.signal.aborted || res.destroyed || res.writableEnded) {
              if (sessionId && !disconnectedSessionCleaned) {
                try {

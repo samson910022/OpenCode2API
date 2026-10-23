@@ -3478,7 +3478,13 @@ describe('Proxy Responses API previous_response_id', () => {
                 .send({ model: 'opencode/kimi-k2.5', input: 'seed' });
             expect(seed.statusCode).toBe(200);
             sdkMocks.sessionDelete.mockClear();
-            sdkMocks.sessionMessages.mockResolvedValue([{ info: { role: 'assistant', finish: 'stop' }, parts: [] }]);
+            sdkMocks.sessionMessages.mockImplementation(async () => {
+                const latestPrompt = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+                return [{
+                    info: { role: 'assistant', parentID: latestPrompt?.body?.messageID, finish: 'stop' },
+                    parts: [],
+                }];
+            });
             sdkMocks.eventSubscribe.mockImplementationOnce(eventStream([
                 { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: '<function_calls>{"name":"read" arguments</function_calls>' } },
                 { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
@@ -3987,7 +3993,8 @@ describe('Proxy Responses API previous_response_id', () => {
 
         test('Phase 2A mid-stream failure finalizes the announced item and reports it as partial failed output', async () => {
             setToolStream([
-                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: 'Partial answer' } },
+                { type: 'message.updated', properties: { info: { id: 'assistant-partial', role: 'assistant', sessionID: 'test-session-id' } } },
+                { type: 'message.part.updated', properties: { part: { id: 'partial-part', messageID: 'assistant-partial', type: 'text', sessionID: 'test-session-id' }, delta: 'Partial answer' } },
                 { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', error: { name: 'MessageAbortedError', data: { message: 'upstream aborted mid-turn' } } } } },
             ]);
             const res = await request(app)
@@ -5588,6 +5595,38 @@ describe('Proxy Responses API previous_response_id', () => {
                 replyWithToolCall('call_stream_cont', 'external__read', '{"path":"a.txt"}');
                 const first = await postResponses({ model: 'opencode/kimi-k2.5', input: 'Read a.txt', tools: [liteRead] });
                 expect(first.statusCode).toBe(200);
+
+                let continuationMessageID;
+                sdkMocks.sessionPrompt.mockImplementationOnce(async (params) => {
+                    continuationMessageID = params.body.messageID;
+                    return { data: { parts: [] } };
+                });
+                sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+                    stream: (async function* () {
+                        yield {
+                            type: 'message.part.delta',
+                            properties: {
+                                sessionID: 'test-session-id',
+                                messageID: 'assistant-stream-continuation',
+                                partID: 'continuation-answer-part',
+                                field: 'text',
+                                delta: 'Continuation completed',
+                            },
+                        };
+                        yield {
+                            type: 'message.updated',
+                            properties: {
+                                info: {
+                                    id: 'assistant-stream-continuation',
+                                    role: 'assistant',
+                                    parentID: continuationMessageID,
+                                    finish: 'stop',
+                                    sessionID: 'test-session-id',
+                                },
+                            },
+                        };
+                    })(),
+                }));
 
                 const res = await postResponses({
                     previous_response_id: first.body.id,

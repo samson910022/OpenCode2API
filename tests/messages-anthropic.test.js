@@ -170,6 +170,9 @@ describe('POST /v1/messages', () => {
     let app;
     beforeEach(() => {
         jest.clearAllMocks();
+        sdkMocks.sessionMessages.mockReset().mockImplementation(async () => ([
+            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'Hello!' }] }
+        ]));
         const config = { PORT: 10000, API_KEY: 'test-key', OPENCODE_SERVER_URL: 'http://127.0.0.1:10001', REQUEST_TIMEOUT_MS: 5000, DISABLE_TOOLS: true, DEBUG: false };
         app = createApp(config).app;
     });
@@ -574,7 +577,7 @@ describe('POST /v1/messages', () => {
         expect(flat.indexOf('toolu_p_a')).toBeLessThan(flat.indexOf('toolu_p_b'));
     });
     test('tool_choice any forces tool_use on non-stream when first turn is empty', async () => {
-        sdkMocks.sessionMessages.mockResolvedValueOnce([{ info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'hello no tool' }] }]);
+        sdkMocks.sessionMessages.mockResolvedValueOnce([{ info: { role: 'assistant', finish: 'stop' }, parts: [] }]);
         sdkMocks.sessionMessages.mockResolvedValueOnce([{ info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: '<function_calls>[{"id":"toolu_req_1","name":"external__read","arguments":{"path":"a.txt"}}]</function_calls>' }] }]);
         const res = await request(app).post('/v1/messages')
             .set('Authorization', 'Bearer test-key')
@@ -620,6 +623,16 @@ describe('POST /v1/messages', () => {
         expect(res.body.error.code).toBe('external_tool_choice_required');
         expect(String(res.body.error.message)).toContain('required external tool call');
     });
+    test('tool_choice required on non-stream still forces a call after an empty completed poll', async () => {
+        sdkMocks.sessionMessages.mockResolvedValue([{ info: { id: 'empty-assistant', role: 'assistant', finish: 'stop' }, parts: [] }]);
+        const res = await request(app).post('/v1/messages')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/muse-spark-1.3-contributor-free', max_tokens: 100, messages: [{ role: 'user', content: 'Read a.txt' }], tools: [{ name: 'read', description: 'Read', input_schema: { type: 'object' } }], tool_choice: { type: 'any' } });
+
+        expect(res.statusCode).toBe(502);
+        expect(res.body.error.code).toBe('external_tool_choice_required');
+        expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(2);
+    });
     test('tool_choice required without tool on stream returns explicit contract', async () => {
         sdkMocks.sessionMessages.mockResolvedValue([{ info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'hello no tool' }] }]);
         sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({ stream: (async function* () { yield { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'msg-session' }, delta: 'hello no tool' } }; yield { type: 'message.updated', properties: { info: { sessionID: 'msg-session', finish: 'stop' } } }; })() }));
@@ -636,5 +649,21 @@ describe('POST /v1/messages', () => {
         expect(messagesInputDeltas(frames)).toHaveLength(0);
         expect(res.text).not.toContain('[DONE]');
         expect(res.text).not.toContain('external__');
+    });
+    test('tool_choice required on stream still forces a call after an empty completed poll', async () => {
+        sdkMocks.sessionMessages.mockResolvedValue([{ info: { id: 'empty-assistant', role: 'assistant', finish: 'stop' }, parts: [] }]);
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({ stream: (async function* () {
+            yield { type: 'message.updated', properties: { info: { id: 'empty-assistant', role: 'assistant', sessionID: 'msg-session', finish: 'stop', parts: [] } } };
+        })() }));
+
+        const res = await request(app).post('/v1/messages')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/muse-spark-1.3-contributor-free', max_tokens: 100, stream: true, messages: [{ role: 'user', content: 'Read a.txt' }], tools: [{ name: 'read', description: 'Read', input_schema: { type: 'object' } }], tool_choice: { type: 'any' } });
+        const frames = parseMessagesSseFrames(res.text);
+
+        expect(res.statusCode).toBe(200);
+        expect(frames.find((frame) => frame.event === 'error')?.data.error.code).toBe('external_tool_choice_required');
+        expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(2);
+        expect(res.text).not.toContain('[DONE]');
     });
 });
