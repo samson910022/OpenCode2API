@@ -270,6 +270,38 @@ function replay(res: Response, response: IdempotencyWireResponse): void {
   res.end(response.body);
 }
 
+export function isDeterministicPreSubmitFailure(statusCode: number, body?: Buffer): boolean {
+  if (statusCode < 400 || statusCode >= 500) {
+    return false;
+  }
+  if (statusCode === 408 || statusCode === 429) {
+    return false;
+  }
+  if (body && body.length > 0) {
+    try {
+      const parsed = JSON.parse(body.toString('utf8')) as unknown;
+      if (parsed && typeof parsed === 'object') {
+        const record = parsed as Record<string, unknown>;
+        const errObj =
+          record.error && typeof record.error === 'object'
+            ? (record.error as Record<string, unknown>)
+            : null;
+        if (
+          errObj?.retryable === true ||
+          errObj?.type === 'transient_error' ||
+          record.retryable === true ||
+          record.type === 'transient_error'
+        ) {
+          return false;
+        }
+      }
+    } catch {
+      // Unparseable body falls through to deterministic 4xx return
+    }
+  }
+  return true;
+}
+
 function instrumentResponse(
   res: Response,
   endpoint: string,
@@ -397,8 +429,24 @@ function instrumentResponse(
     }
     const response: IdempotencyWireResponse = { statusCode: res.statusCode, headers, body };
     if (!record.submitted) {
-      registry.completeCaptured(record, generation, 'failed', response);
-      runCompletedCallbacks();
+      if (isDeterministicPreSubmitFailure(response.statusCode, response.body)) {
+        registry.completeCaptured(record, generation, 'failed', response);
+        runCompletedCallbacks();
+        return;
+      }
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        if (isSuccessfulResponse(
+          endpoint,
+          response,
+          (bytes) => registry.reserveAssemblyBytes(record, generation, bytes),
+          (bytes) => registry.releaseCaptureBytes(record, generation, bytes),
+        )) {
+          const stored = registry.completeCaptured(record, generation, 'completed', response);
+          if (stored) runCompletedCallbacks();
+          return;
+        }
+      }
+      abandonOrMarkUnknown();
       return;
     }
     const resultConfirmed = record.resultConfirmed &&

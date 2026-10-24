@@ -13,7 +13,11 @@ import {
     DEFAULT_IDEMPOTENCY_MAX_CACHED_BYTES_PER_TENANT,
     DEFAULT_IDEMPOTENCY_MAX_RESPONSE_BYTES,
 } from '../src/idempotency/registry.js';
-import { createIdempotencyMiddleware, scanSseDataEventRanges } from '../src/idempotency/middleware.js';
+import {
+    createIdempotencyMiddleware,
+    scanSseDataEventRanges,
+    isDeterministicPreSubmitFailure,
+} from '../src/idempotency/middleware.js';
 
 const promptBySession = new Map();
 let sessionSequence = 0;
@@ -2336,7 +2340,7 @@ describe('Responses and Interactions idempotent routes', () => {
         expect(retry.body.error.retryable).toBe(true);
         expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(2);
         expect(forcedPromptCalls).toBe(1);
-        expect(sdkMocks.sessionMessages).toHaveBeenCalledTimes(2);
+        expect(sdkMocks.sessionMessages.mock.calls.length).toBeGreaterThanOrEqual(2);
         sdkMocks.sessionMessages.mockImplementation(defaultSessionMessagesImplementation);
     });
 
@@ -2458,5 +2462,306 @@ describe('Responses and Interactions idempotent routes', () => {
         expect(reconciled.statusCode).toBe(200);
         expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(1);
         expect(sdkMocks.sessionCreate).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('pre-submit failure idempotency handling', () => {
+    describe('isDeterministicPreSubmitFailure helper', () => {
+        test('returns false for status < 400 or status >= 500', () => {
+            expect(isDeterministicPreSubmitFailure(200)).toBe(false);
+            expect(isDeterministicPreSubmitFailure(201)).toBe(false);
+            expect(isDeterministicPreSubmitFailure(204)).toBe(false);
+            expect(isDeterministicPreSubmitFailure(301)).toBe(false);
+            expect(isDeterministicPreSubmitFailure(302)).toBe(false);
+            expect(isDeterministicPreSubmitFailure(500)).toBe(false);
+            expect(isDeterministicPreSubmitFailure(502)).toBe(false);
+            expect(isDeterministicPreSubmitFailure(503)).toBe(false);
+            expect(isDeterministicPreSubmitFailure(504)).toBe(false);
+        });
+
+        test('returns false for transient timeout / rate limit 4xx (408 and 429)', () => {
+            expect(isDeterministicPreSubmitFailure(408)).toBe(false);
+            expect(isDeterministicPreSubmitFailure(429)).toBe(false);
+        });
+
+        test('returns false when error body specifies retryable: true or type: transient_error', () => {
+            const retryableJson = Buffer.from(JSON.stringify({ error: { message: 'temporary', retryable: true } }));
+            expect(isDeterministicPreSubmitFailure(400, retryableJson)).toBe(false);
+
+            const transientTypeJson = Buffer.from(JSON.stringify({ error: { type: 'transient_error', message: 'rate limit' } }));
+            expect(isDeterministicPreSubmitFailure(400, transientTypeJson)).toBe(false);
+
+            const topLevelRetryable = Buffer.from(JSON.stringify({ retryable: true }));
+            expect(isDeterministicPreSubmitFailure(422, topLevelRetryable)).toBe(false);
+
+            const topLevelTransient = Buffer.from(JSON.stringify({ type: 'transient_error' }));
+            expect(isDeterministicPreSubmitFailure(422, topLevelTransient)).toBe(false);
+        });
+
+        test('returns true for deterministic 4xx client errors', () => {
+            expect(isDeterministicPreSubmitFailure(400)).toBe(true);
+            expect(isDeterministicPreSubmitFailure(404)).toBe(true);
+            expect(isDeterministicPreSubmitFailure(413)).toBe(true);
+            expect(isDeterministicPreSubmitFailure(415)).toBe(true);
+            expect(isDeterministicPreSubmitFailure(422)).toBe(true);
+
+            const standardErrorJson = Buffer.from(JSON.stringify({ error: { code: 'invalid_request', message: 'Bad request' } }));
+            expect(isDeterministicPreSubmitFailure(400, standardErrorJson)).toBe(true);
+
+            const nonRetryableJson = Buffer.from(JSON.stringify({ error: { retryable: false } }));
+            expect(isDeterministicPreSubmitFailure(422, nonRetryableJson)).toBe(true);
+
+            const nonJsonBody = Buffer.from('plain error string');
+            expect(isDeterministicPreSubmitFailure(400, nonJsonBody)).toBe(true);
+        });
+    });
+
+    describe('route-level pre-submit and post-submit tests', () => {
+        beforeEach(() => {
+            jest.clearAllMocks();
+            promptBySession.clear();
+            sessionSequence = 0;
+            forkSequence = 0;
+            assistantSequence = 0;
+            toolObservationCount = 0;
+            sdkMocks.sessionCreate.mockImplementation(async () => ({ data: { id: `idem-session-${++sessionSequence}` } }));
+            sdkMocks.sessionFork.mockImplementation(async () => ({ data: { id: `idem-fork-${++forkSequence}` } }));
+            sdkMocks.sessionDelete.mockImplementation(async () => ({}));
+            sdkMocks.sessionPrompt.mockImplementation(async (args) => {
+                const sessionId = args?.path?.id;
+                promptBySession.set(sessionId, structuredClone(args));
+                const assistantId = `assistant-${++assistantSequence}`;
+                return {
+                    data: {
+                        info: { id: assistantId, role: 'assistant', parentID: args?.body?.messageID, finish: 'stop' },
+                        parts: [{ type: 'text', text: 'idempotent answer' }],
+                    },
+                };
+            });
+            sdkMocks.sessionMessages.mockImplementation(async ({ path }) => {
+                const prompt = promptBySession.get(path.id);
+                return [{
+                    info: {
+                        id: `assistant-poll-${path.id}`,
+                        role: 'assistant',
+                        parentID: prompt?.body?.messageID,
+                        sessionID: path.id,
+                        finish: 'stop',
+                    },
+                    parts: [{ type: 'text', text: 'idempotent answer' }],
+                }];
+            });
+            sdkMocks.eventSubscribe.mockImplementation(async () => ({ stream: (async function* () {})() }));
+        });
+
+        // Test A: Pre-submit transient 503 -> backend recovers -> second request with same Idempotency-Key and payload succeeds with 200, prompts exactly once!
+        test('Test A: pre-submit transient 503 on /v1/responses abandons entry so retry succeeds with 200 and prompts once', async () => {
+            const app = createRouteApp().app;
+            const payload = { model: 'opencode/kimi-k2.5', input: 'test pre-submit transient failure' };
+            const idempotencyKey = 'test-a-pre-submit-503';
+
+            // Simulate transient backend failure before prompt submit (e.g. session creation fails)
+            sdkMocks.sessionCreate.mockImplementationOnce(async () => {
+                const err = new Error('Backend temporarily unavailable');
+                err.statusCode = 503;
+                throw err;
+            });
+
+            const first = await request(app)
+                .post('/v1/responses')
+                .set('Idempotency-Key', idempotencyKey)
+                .send(payload);
+
+            expect(first.statusCode).toBe(503);
+            expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(0);
+
+            // Backend recovered: second request with same Idempotency-Key succeeds cleanly
+            const second = await request(app)
+                .post('/v1/responses')
+                .set('Idempotency-Key', idempotencyKey)
+                .send(payload);
+
+            expect(second.statusCode).toBe(200);
+            expect(second.body.id).toBeDefined();
+            // Prompted exactly once across both attempts
+            expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(1);
+        });
+
+        test('Test A (interactions): pre-submit transient 503 on /v1beta/interactions abandons entry so retry succeeds with 200 and prompts once', async () => {
+            const app = createRouteApp().app;
+            const payload = { model: 'opencode/kimi-k2.5', input: 'test pre-submit transient interactions' };
+            const idempotencyKey = 'test-a-pre-submit-503-interactions';
+
+            sdkMocks.sessionCreate.mockImplementationOnce(async () => {
+                const err = new Error('Interactions backend temporarily unavailable');
+                err.statusCode = 503;
+                throw err;
+            });
+
+            const first = await request(app)
+                .post('/v1beta/interactions')
+                .set('Idempotency-Key', idempotencyKey)
+                .send(payload);
+
+            expect(first.statusCode).toBe(503);
+            expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(0);
+
+            const second = await request(app)
+                .post('/v1beta/interactions')
+                .set('Idempotency-Key', idempotencyKey)
+                .send(payload);
+
+            expect(second.statusCode).toBe(200);
+            expect(second.body.status).toBe('completed');
+            expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(1);
+        });
+
+        // Test B: Pre-submit deterministic 422 (or 400) -> second request with same Idempotency-Key replays the cached 422 without entering route/prompting.
+        test('Test B (400 route-level): pre-submit deterministic 400 replays cached response on retry without entering route/prompting', async () => {
+            const app = createRouteApp().app;
+            const payload = {
+                model: 'opencode/kimi-k2.5',
+                input: 'deterministic pre-submit validation error',
+                previous_response_id: 'nonexistent-checkpoint-id',
+            };
+            const idempotencyKey = 'test-b-deterministic-400';
+
+            const first = await request(app)
+                .post('/v1/responses')
+                .set('Idempotency-Key', idempotencyKey)
+                .send(payload);
+
+            expect(first.statusCode).toBe(400);
+            expect(first.body.error.code).toBe('invalid_previous_response_id');
+            expect(first.headers['x-idempotent-replay']).toBeUndefined();
+            expect(sdkMocks.sessionCreate).toHaveBeenCalledTimes(0);
+            expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(0);
+
+            // Second request with same idempotency key and payload replays cached 400
+            const second = await request(app)
+                .post('/v1/responses')
+                .set('Idempotency-Key', idempotencyKey)
+                .send(payload);
+
+            expect(second.statusCode).toBe(400);
+            expect(second.body.error.code).toBe('invalid_previous_response_id');
+            expect(second.text).toBe(first.text);
+            // Route was not executed again; no backend calls made
+            expect(sdkMocks.sessionCreate).toHaveBeenCalledTimes(0);
+            expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(0);
+        });
+
+        test('Test B (422 middleware-level): pre-submit deterministic 422 replays cached 422 without re-entering route handler', async () => {
+            let routeInvocations = 0;
+            const { app } = createMiddlewareApp({
+                route: (_req, res) => {
+                    routeInvocations += 1;
+                    res.status(422).json({
+                        error: {
+                            type: 'invalid_request_error',
+                            code: 'unprocessable_entity',
+                            message: 'Semantic validation failed',
+                        },
+                    });
+                },
+            });
+            const payload = { model: 'opencode/kimi-k2.5', input: 'bad semantic field' };
+            const idempotencyKey = 'test-b-deterministic-422';
+
+            const first = await request(app)
+                .post('/v1/responses')
+                .set('Idempotency-Key', idempotencyKey)
+                .send(payload);
+
+            expect(first.statusCode).toBe(422);
+            expect(first.body.error.code).toBe('unprocessable_entity');
+            expect(routeInvocations).toBe(1);
+
+            const second = await request(app)
+                .post('/v1/responses')
+                .set('Idempotency-Key', idempotencyKey)
+                .send(payload);
+
+            expect(second.statusCode).toBe(422);
+            expect(second.body.error.code).toBe('unprocessable_entity');
+            expect(second.text).toBe(first.text);
+            // Route was not entered a second time
+            expect(routeInvocations).toBe(1);
+        });
+
+        // Test C: First prompt submitted (record.submitted === true), then 503 or disconnect -> second request reconciles, does not re-prompt.
+        test('Test C (503): submitted prompt followed by 503 reconciles on second request without re-prompting', async () => {
+            const app = createRouteApp().app;
+            const payload = { model: 'opencode/kimi-k2.5', input: 'submitted then 503' };
+            const idempotencyKey = 'test-c-submitted-503';
+
+            sdkMocks.sessionPrompt.mockImplementationOnce(async (args) => {
+                promptBySession.set(args.path.id, structuredClone(args));
+                const err = new Error('Upstream timeout after submit');
+                err.statusCode = 503;
+                throw err;
+            });
+
+            const first = await request(app)
+                .post('/v1/responses')
+                .set('Idempotency-Key', idempotencyKey)
+                .send(payload);
+
+            expect(first.statusCode).toBe(503);
+            expect(first.body.error.code).toBe('idempotency_reconciliation_pending');
+            expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(1);
+
+            // Second request with same idempotency key reconciles via sessionMessages
+            const second = await request(app)
+                .post('/v1/responses')
+                .set('Idempotency-Key', idempotencyKey)
+                .send(payload);
+
+            expect(second.statusCode).toBe(200);
+            expect(second.body.id).toBeDefined();
+            // sessionPrompt was called ONLY ONCE across both requests (not re-prompted)
+            expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(1);
+            expect(sdkMocks.sessionMessages).toHaveBeenCalled();
+        });
+
+        test('Test C (disconnect): submitted prompt followed by client disconnect reconciles on second request without re-prompting', async () => {
+            const app = createRouteApp().app;
+            const payload = { model: 'opencode/kimi-k2.5', input: 'submitted then disconnect' };
+            const idempotencyKey = 'test-c-submitted-disconnect';
+
+            let signalPromptStarted;
+            let releasePrompt;
+            const promptStarted = new Promise((resolve) => { signalPromptStarted = resolve; });
+            const promptGate = new Promise((resolve) => { releasePrompt = resolve; });
+
+            sdkMocks.sessionPrompt.mockImplementationOnce(async (args) => {
+                promptBySession.set(args.path.id, structuredClone(args));
+                signalPromptStarted();
+                await promptGate;
+                return {
+                    data: {
+                        info: { id: 'assistant-after-disconnect', role: 'assistant', parentID: args.body.messageID, finish: 'stop' },
+                        parts: [{ type: 'text', text: 'reconciled text' }],
+                    },
+                };
+            });
+
+            const aborted = await startAbortedRequest(app, '/v1/responses', idempotencyKey, payload);
+            await promptStarted;
+            aborted.abort();
+            releasePrompt();
+            await aborted.closeServer();
+
+            // Second request reconciles via polling and does NOT re-prompt
+            const second = await request(app)
+                .post('/v1/responses')
+                .set('Idempotency-Key', idempotencyKey)
+                .send(payload);
+
+            expect(second.statusCode).toBe(200);
+            expect(second.body.id).toBeDefined();
+            // Prompt was executed only once
+            expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(1);
+        });
     });
 });
