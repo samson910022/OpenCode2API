@@ -24,14 +24,19 @@ import {
   buildProxyConfig,
   DEFAULT_REQUEST_TIMEOUT_MS,
 } from './config/proxy-config.js';
-import { buildBackendAuthHeaders, ensureBackend, backendState } from './backend/manager.js';
+import {
+  buildBackendAuthHeaders,
+  ensureBackend,
+  backendState,
+  onBackendReconnect,
+} from './backend/manager.js';
 import { createCollector } from './stream/collector.js';
 import { createProxyPool } from './upstream-proxy/pool.js';
 import { registerChatRoutes } from './routes/chat.js';
 import { registerResponsesRoutes } from './routes/responses.js';
 import { registerMessagesRoutes } from './routes/messages.js';
 import { registerInteractionsRoutes } from './routes/interactions.js';
-import { registerSystemRoutes, registerNotFoundRoute } from './routes/system.js';
+import { registerSystemRoutes, registerNotFoundRoute, registerErrorHandler } from './routes/system.js';
 import type { ProxyConfig } from './types/config.js';
 import type {
   AppContext,
@@ -46,6 +51,10 @@ import { asRecord, toErrorMessage } from './utils/guards.js';
 import { buildEffectiveApiKeys, createApiKeyVerifier } from './auth/keys.js';
 import { defaultTranslatorRegistry } from './converters/registry.js';
 import { ensureTranslatorsRegistered } from './converters/wire.js';
+import { classifyHttpError, isAnthropicMessagesPath } from './errors/http.js';
+import { createIdempotencyMiddleware } from './idempotency/middleware.js';
+import { IdempotencyRegistry } from './idempotency/registry.js';
+import { makeId } from './converters/json.js';
 
 // P4: thin re-exports to preserve original import paths
 // (tests/env-alias.test.js, stream-hardening.test.js import these from '../src/proxy.js').
@@ -124,15 +133,14 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   const maxAttempts = maxRetries + 1;
 
   const app: Application = express();
+  app.disable('x-powered-by');
   app.use(
     cors({
       origin: '*',
       methods: ['GET', 'POST', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'anthropic-version'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'anthropic-version', 'Idempotency-Key'],
     }),
   );
-  app.use(bodyParser.json({ limit: '50mb' }));
-  app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
   const clientHeaders = buildBackendAuthHeaders(OPENCODE_SERVER_PASSWORD);
   const rawClient: OpencodeClient = createOpencodeClient({ baseUrl: OPENCODE_SERVER_URL, headers: clientHeaders });
@@ -145,32 +153,200 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   // instead of assuming a shared reference.
   const effectiveApiKeys: string[] = buildEffectiveApiKeys(API_KEY, API_KEYS);
   const apiKeyVerifier = createApiKeyVerifier(effectiveApiKeys);
+  const rejectRequestAndClose = (req: Request, res: Response, status: number, body: unknown): void => {
+    let cleanedUp = false;
+    const cleanup = (): void => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      req.off('error', ignoreRequestError);
+      req.off('close', cleanup);
+    };
+    const ignoreRequestError = (): void => cleanup();
+    req.once('error', ignoreRequestError);
+    req.once('close', cleanup);
+    res.setHeader('Connection', 'close');
+    res.status(status).json(body);
+    req.resume();
+  };
 
   // Auth middleware (accepts Authorization: Bearer and x-api-key for Anthropic SDK compat)
+  // Runs before bodyParser so unauthenticated requests are rejected immediately without parsing.
   app.use((req: Request, res: Response, next: NextFunction): void => {
-    if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/health/details' || req.path === '/metrics')
+    const normalizedPath = req.path.replace(/\/+$/, '') || '/';
+    if (
+      req.method === 'OPTIONS' ||
+      normalizedPath === '/health' ||
+      normalizedPath === '/' ||
+      normalizedPath === '/health/details' ||
+      normalizedPath === '/metrics'
+    ) {
       return next();
+    }
     if (apiKeyVerifier.keys.length > 0) {
       const authorized = apiKeyVerifier.isAuthorized(
         req as unknown as { headers: { authorization?: unknown; 'x-api-key'?: unknown } },
       );
       if (!authorized) {
-        if (req.path === '/v1/messages') {
-          res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: 'Unauthorized' } });
+        if (isAnthropicMessagesPath(req.originalUrl || req.path)) {
+          rejectRequestAndClose(req, res, 401, {
+            type: 'error',
+            error: { type: 'authentication_error', message: 'Unauthorized' },
+          });
           return;
         }
-        res.status(401).json({ error: { message: 'Unauthorized' } });
+        rejectRequestAndClose(req, res, 401, { error: { message: 'Unauthorized' } });
         return;
       }
     }
     next();
   });
 
+  // body-parser's JSON parser intentionally skips unsupported media types. Do
+  // this check after auth but before parsing so unsupported payloads receive a
+  // protocol-shaped 415 instead of reaching routes as an empty body.
+  const jsonApiPostPaths = new Set([
+    '/v1/chat/completions',
+    '/v1/messages',
+    '/v1/responses',
+    '/v1beta/interactions',
+    '/v1/interactions',
+  ]);
+  const rejectUnsupportedContentType = (req: Request, res: Response): void => {
+    const classified = classifyHttpError({ type: 'media.type.unsupported' }, req.originalUrl || req.path);
+    rejectRequestAndClose(req, res, classified.status, classified.body);
+  };
+  app.use((req: Request, res: Response, next: NextFunction): void => {
+    const normalizedPath = req.path.replace(/\/+$/, '').toLowerCase() || '/';
+    if (req.method !== 'POST' || !jsonApiPostPaths.has(normalizedPath)) return next();
+
+    const rawContentType = req.headers['content-type'];
+    const contentType = Array.isArray(rawContentType) ? rawContentType.join(',') : rawContentType;
+    const mediaType = typeof contentType === 'string' ? contentType.split(';', 1)[0]?.trim().toLowerCase() : '';
+    if (mediaType) {
+      if (mediaType === 'application/json') return next();
+    } else {
+      const rawContentLength = req.headers['content-length'];
+      const contentLength = typeof rawContentLength === 'string' ? Number(rawContentLength) : 0;
+      if (Number.isFinite(contentLength) && contentLength > 0) {
+        // A declared non-empty body without a media type is unsupported.
+      } else if (req.headers['transfer-encoding'] != null) {
+        // Transfer-Encoding alone does not mean the chunked body contains data:
+        // an empty `0\r\n\r\n` request should reach normal route validation.
+        const cleanup = (): void => {
+          req.off('data', onData);
+          req.off('end', onEnd);
+          req.off('error', onError);
+        };
+        const onData = (): void => {
+          cleanup();
+          rejectUnsupportedContentType(req, res);
+        };
+        const onEnd = (): void => {
+          cleanup();
+          next();
+        };
+        const onError = (error: Error): void => {
+          cleanup();
+          next(error);
+        };
+        req.once('data', onData);
+        req.once('end', onEnd);
+        req.once('error', onError);
+        return;
+      } else {
+        return next();
+      }
+    }
+
+    rejectUnsupportedContentType(req, res);
+  });
+
+  app.use(bodyParser.json({ limit: '50mb' }));
+  app.use(bodyParser.urlencoded({ limit: '1mb', extended: false }));
+
+  // Request bodies and the authenticated key identity are now available. The
+  // ledger is per app instance and stores only hashed scope/key material.
+  const idempotencyRegistry = new IdempotencyRegistry();
+  app.use(createIdempotencyMiddleware({
+    registry: idempotencyRegistry,
+    configuredKeys: apiKeyVerifier.keys,
+    matchedKeyIndex: (req) => apiKeyVerifier.matchedIndex(
+      req as unknown as { headers: { authorization?: unknown; 'x-api-key'?: unknown } },
+    ),
+  }));
+
+  const PROVIDERS_CACHE_TTL_MS = 30_000;
+  let cachedProvidersList: ProviderInfo[] | null = null;
+  let cachedProvidersAt = 0;
+  let pendingProvidersPromise: Promise<ProviderInfo[]> | null = null;
+  let providersCacheEpoch = 0;
+
+  const invalidateProvidersCache = (): void => {
+    providersCacheEpoch += 1;
+    cachedProvidersList = null;
+    cachedProvidersAt = 0;
+    pendingProvidersPromise = null;
+  };
+
+  const unsubscribeReconnect = onBackendReconnect(invalidateProvidersCache);
+  let reconnectListenerDisposed = false;
+  let responseStateSweepTimer: ReturnType<typeof setInterval> | null = null;
+  let conversationCleanupTimeout: ReturnType<typeof setTimeout> | null = null;
+  let conversationCleanupTimer: ReturnType<typeof setInterval> | null = null;
+  const disposeAppResources = (): void => {
+    if (reconnectListenerDisposed) return;
+    reconnectListenerDisposed = true;
+    unsubscribeReconnect();
+    if (responseStateSweepTimer) {
+      clearInterval(responseStateSweepTimer);
+      responseStateSweepTimer = null;
+    }
+    if (conversationCleanupTimeout) {
+      clearTimeout(conversationCleanupTimeout);
+      conversationCleanupTimeout = null;
+    }
+    if (conversationCleanupTimer) {
+      clearInterval(conversationCleanupTimer);
+      conversationCleanupTimer = null;
+    }
+  };
+
   const getProvidersList = async (): Promise<ProviderInfo[]> => {
-    const providersRes = (await client.config.providers()) as unknown;
-    const providersRaw: unknown = asRecord(asRecord(providersRes)['data'])['providers'] ?? [];
-    if (Array.isArray(providersRaw)) return providersRaw as ProviderInfo[];
-    return Object.entries(asRecord(providersRaw)).map(([id, info]) => ({ ...(asRecord(info) as object), id }) as ProviderInfo);
+    const now = Date.now();
+    if (cachedProvidersList && now - cachedProvidersAt < PROVIDERS_CACHE_TTL_MS) {
+      return cachedProvidersList;
+    }
+    if (pendingProvidersPromise) {
+      return pendingProvidersPromise;
+    }
+    const epoch = providersCacheEpoch;
+    pendingProvidersPromise = (async () => {
+      try {
+        if (config.MANAGE_BACKEND) {
+          await ensureBackend(config);
+        }
+        const providersRes = (await client.config.providers()) as unknown;
+        const providersRaw: unknown = asRecord(asRecord(providersRes)['data'])['providers'] ?? [];
+        const list = Array.isArray(providersRaw)
+          ? (providersRaw as ProviderInfo[])
+          : Object.entries(asRecord(providersRaw)).map(([id, info]) => ({ ...(asRecord(info) as object), id }) as ProviderInfo);
+        if (providersCacheEpoch === epoch) {
+          cachedProvidersList = list;
+          cachedProvidersAt = Date.now();
+        }
+        return list;
+      } catch (err: unknown) {
+        if (providersCacheEpoch === epoch) {
+          invalidateProvidersCache();
+        }
+        throw err;
+      } finally {
+        if (providersCacheEpoch === epoch) {
+          pendingProvidersPromise = null;
+        }
+      }
+    })();
+    return pendingProvidersPromise;
   };
 
   const buildModelsList = (providersList: unknown): ModelInfo[] => {
@@ -242,7 +418,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
       code?: string;
       availableModels?: string[];
     };
-    error.statusCode = 400;
+    error.statusCode = 404;
     error.code = 'model_not_found';
     error.availableModels = models.map((m) => m.id);
     throw error;
@@ -255,6 +431,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   };
 
   const responseState = new Map<string, ResponseStateEntry>();
+  const pendingExpiredResponseSessionIds = new Set<string>();
   const RESPONSE_STATE_TTL_MS = 30 * 60 * 1000;
   const RESPONSE_STATE_SWEEP_INTERVAL_MS = 60 * 1000;
   const RESPONSE_TOOL_CALL_STATE_LIMIT = 128;
@@ -277,46 +454,68 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     });
     return calls.slice(-RESPONSE_TOOL_CALL_STATE_LIMIT);
   };
-  const getResponseState = (responseId: unknown): ResponseStateEntry | null => {
+  const getResponseState = (responseId: unknown, tenantId: string): ResponseStateEntry | null => {
     if (typeof responseId !== 'string') return null;
     const state = responseState.get(responseId);
     if (!state) return null;
+    // Pre-tenant entries are legacy state and are claimable only by unauthenticated callers.
+    if (state.tenantId === undefined ? tenantId !== 'anonymous' : state.tenantId !== tenantId) return null;
     if (state.expiresAt <= Date.now()) {
       responseState.delete(responseId);
+      pendingExpiredResponseSessionIds.add(state.sessionId);
       return null;
     }
     return state;
   };
-  const storeResponseState = (responseId: unknown, sessionId: unknown, model: unknown, toolCalls: unknown = []): void => {
-    if (!responseId || !sessionId || typeof responseId !== 'string' || typeof sessionId !== 'string') return;
+  const storeResponseState = (
+    responseId: unknown,
+    sessionId: unknown,
+    model: unknown,
+    toolCalls: unknown,
+    checkpointId: unknown,
+    tenantId: string,
+  ): boolean => {
+    if (
+      !responseId ||
+      !sessionId ||
+      typeof responseId !== 'string' ||
+      typeof sessionId !== 'string' ||
+      typeof checkpointId !== 'string' ||
+      !checkpointId.trim()
+    ) return false;
     responseState.set(responseId, {
       sessionId,
+      tenantId,
+      checkpointId,
       model: typeof model === 'string' ? model : String(model ?? ''),
       expiresAt: Date.now() + RESPONSE_STATE_TTL_MS,
       toolCalls: normalizeResponseToolCallState(toolCalls),
     });
+    return true;
   };
   const sweepResponseState = async (): Promise<void> => {
     const now = Date.now();
-    const expired: ResponseStateEntry[] = [];
     for (const [id, state] of responseState.entries()) {
       if (state.expiresAt <= now) {
-        expired.push(state);
         responseState.delete(id);
+        pendingExpiredResponseSessionIds.add(state.sessionId);
       }
     }
-    if (!expired.length) return;
-    const liveSessionIds = new Set([...responseState.values()].map((s) => s.sessionId));
-    for (const state of expired) {
-      if (liveSessionIds.has(state.sessionId)) continue;
+    for (const sessionId of pendingExpiredResponseSessionIds) {
+      const stillReferenced = [...responseState.values()].some(
+        (state) => state.sessionId === sessionId && state.expiresAt > Date.now(),
+      );
+      if (stillReferenced) continue;
+      if (idempotencyRegistry.hasUnresolvedChildSession(sessionId)) continue;
       try {
-        await client.session.delete({ path: { id: state.sessionId } });
+        await client.session.delete({ path: { id: sessionId } });
+        pendingExpiredResponseSessionIds.delete(sessionId);
       } catch (e: unknown) {
-        logDebug('Failed to delete expired response session', { sessionId: state.sessionId, error: toErrorMessage(e) });
+        logDebug('Failed to delete expired response session', { sessionId, error: toErrorMessage(e) });
       }
     }
   };
-  const responseStateSweepTimer = setInterval(() => {
+  responseStateSweepTimer = setInterval(() => {
     sweepResponseState().catch(() => {});
   }, RESPONSE_STATE_SWEEP_INTERVAL_MS);
   if (typeof responseStateSweepTimer.unref === 'function') responseStateSweepTimer.unref();
@@ -927,13 +1126,14 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   };
 
   if (AUTO_CLEANUP_CONVERSATIONS) {
-    setTimeout(() => {
+    conversationCleanupTimeout = setTimeout(() => {
+      conversationCleanupTimeout = null;
       cleanupConversationFiles().catch((e: unknown) => logDebug('Cleanup run failed', { error: toErrorMessage(e) }));
     }, 3000);
-    const cleanupTimer = setInterval(() => {
+    conversationCleanupTimer = setInterval(() => {
       cleanupConversationFiles().catch((e: unknown) => logDebug('Cleanup run failed', { error: toErrorMessage(e) }));
     }, Number(CLEANUP_INTERVAL_MS));
-    if (cleanupTimer.unref) cleanupTimer.unref();
+    if (conversationCleanupTimer.unref) conversationCleanupTimer.unref();
   }
 
   const createForcedToolCallRequester =
@@ -948,10 +1148,19 @@ export function createApp(config: ProxyConfig): CreateAppResult {
         toolOverrides,
         requestTimeoutMs,
         forbidThinkBlock = false,
+        signal,
+        requireTerminalCompletion = false,
       } = options;
       return async (): Promise<Record<string, unknown> | null> => {
         if (mode !== 'required') return null;
         if (!requiredTool) return null;
+        const assertNotAborted = (): void => {
+          if (signal?.aborted) {
+            const error = new Error('Request aborted');
+            error.name = 'AbortError';
+            throw error;
+          }
+        };
         const forcedPromptParams: { path: { id: string }; body: Record<string, unknown> } = {
           path: { id: sessionId },
           body: {
@@ -970,8 +1179,35 @@ export function createApp(config: ProxyConfig): CreateAppResult {
         if (forcedToolOverrides) {
           forcedPromptParams.body['tools'] = forcedToolOverrides;
         }
+        assertNotAborted();
+        options.assertCanPrompt?.();
+        const forcedMessageId = options.beforePrompt ? makeId('msg_') : null;
+        if (forcedMessageId) {
+          forcedPromptParams.body['messageID'] = forcedMessageId;
+          options.beforePrompt?.(sessionId, forcedMessageId);
+        }
+        assertNotAborted();
+        options.assertCanPrompt?.();
         await promptWithTimeout(forcedPromptParams, requestTimeoutMs);
-        return pollForAssistantResponse(sessionId, requestTimeoutMs) as Promise<Record<string, unknown>>;
+        assertNotAborted();
+        if (!forcedMessageId) {
+          return pollForAssistantResponse(
+            sessionId,
+            requestTimeoutMs,
+            undefined,
+            signal,
+            undefined,
+            requireTerminalCompletion,
+          ) as Promise<Record<string, unknown>>;
+        }
+        return pollForAssistantResponse(
+          sessionId,
+          requestTimeoutMs,
+          undefined,
+          signal,
+          forcedMessageId,
+          requireTerminalCompletion,
+        ) as Promise<Record<string, unknown>>;
       };
     };
 
@@ -1039,6 +1275,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     maxRetries,
     maxAttempts,
     getProvidersList,
+    invalidateProvidersCache,
     buildModelsList,
     normalizeModelID,
     resolveRequestedModel,
@@ -1096,17 +1333,19 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     getDiscoveryLastErrorAt: () => discoveryLastErrorAt,
     getDiscoveryLastError: () => discoveryLastError,
     translators: ensureTranslatorsRegistered(defaultTranslatorRegistry()),
+    dispose: disposeAppResources,
   };
 
-  // P3: register routes (404 last to preserve catch-all order).
+  // P3: register routes (404 last to preserve catch-all order, error handler after).
   registerSystemRoutes(app, ctx);
   registerChatRoutes(app, ctx);
   registerResponsesRoutes(app, ctx);
   registerMessagesRoutes(app, ctx);
   registerInteractionsRoutes(app, ctx);
   registerNotFoundRoute(app);
+  registerErrorHandler(app);
 
-  return { app, client };
+  return { app, client, ctx };
 }
 
 /**
@@ -1116,7 +1355,7 @@ export function startProxy(options: unknown = {}): StartProxyResult {
   // buildProxyConfig tolerates explicit null and preserves merge semantics verbatim.
   const config = buildProxyConfig((options ?? {}) as unknown);
 
-  const { app } = createApp(config);
+  const { app, ctx } = createApp(config);
 
   const server = app.listen(config.PORT, config.BIND_HOST, () => {
     void (async (): Promise<void> => {
@@ -1129,8 +1368,30 @@ export function startProxy(options: unknown = {}): StartProxyResult {
     })();
   });
 
+  let disposed = false;
+  let onServerError: (() => void) | null = null;
+  const dispose = (): void => {
+    if (disposed) return;
+    disposed = true;
+    ctx?.dispose?.();
+  };
+  onServerError = (): void => {
+    // A bind failure happens before `listening` and does not reliably produce
+    // the normal close lifecycle, so release the app-scoped listener here too.
+    if (!server.listening) {
+      dispose();
+      if (onServerError) server.off('error', onServerError);
+    }
+  };
+  server.on('error', onServerError);
+  server.once('close', () => {
+    dispose();
+    if (onServerError) server.off('error', onServerError);
+  });
+
   return {
     server,
+    dispose,
     killBackend: () => {
       const state = backendState.get(config.OPENCODE_SERVER_URL);
       if (state?.process) {

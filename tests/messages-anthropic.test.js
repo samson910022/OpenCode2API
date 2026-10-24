@@ -170,6 +170,9 @@ describe('POST /v1/messages', () => {
     let app;
     beforeEach(() => {
         jest.clearAllMocks();
+        sdkMocks.sessionMessages.mockReset().mockImplementation(async () => ([
+            { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'Hello!' }] }
+        ]));
         const config = { PORT: 10000, API_KEY: 'test-key', OPENCODE_SERVER_URL: 'http://127.0.0.1:10001', REQUEST_TIMEOUT_MS: 5000, DISABLE_TOOLS: true, DEBUG: false };
         app = createApp(config).app;
     });
@@ -574,7 +577,7 @@ describe('POST /v1/messages', () => {
         expect(flat.indexOf('toolu_p_a')).toBeLessThan(flat.indexOf('toolu_p_b'));
     });
     test('tool_choice any forces tool_use on non-stream when first turn is empty', async () => {
-        sdkMocks.sessionMessages.mockResolvedValueOnce([{ info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'hello no tool' }] }]);
+        sdkMocks.sessionMessages.mockResolvedValueOnce([{ info: { role: 'assistant', finish: 'stop' }, parts: [] }]);
         sdkMocks.sessionMessages.mockResolvedValueOnce([{ info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: '<function_calls>[{"id":"toolu_req_1","name":"external__read","arguments":{"path":"a.txt"}}]</function_calls>' }] }]);
         const res = await request(app).post('/v1/messages')
             .set('Authorization', 'Bearer test-key')
@@ -620,6 +623,16 @@ describe('POST /v1/messages', () => {
         expect(res.body.error.code).toBe('external_tool_choice_required');
         expect(String(res.body.error.message)).toContain('required external tool call');
     });
+    test('tool_choice required on non-stream still forces a call after an empty completed poll', async () => {
+        sdkMocks.sessionMessages.mockResolvedValue([{ info: { id: 'empty-assistant', role: 'assistant', finish: 'stop' }, parts: [] }]);
+        const res = await request(app).post('/v1/messages')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/muse-spark-1.3-contributor-free', max_tokens: 100, messages: [{ role: 'user', content: 'Read a.txt' }], tools: [{ name: 'read', description: 'Read', input_schema: { type: 'object' } }], tool_choice: { type: 'any' } });
+
+        expect(res.statusCode).toBe(502);
+        expect(res.body.error.code).toBe('external_tool_choice_required');
+        expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(2);
+    });
     test('tool_choice required without tool on stream returns explicit contract', async () => {
         sdkMocks.sessionMessages.mockResolvedValue([{ info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'hello no tool' }] }]);
         sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({ stream: (async function* () { yield { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'msg-session' }, delta: 'hello no tool' } }; yield { type: 'message.updated', properties: { info: { sessionID: 'msg-session', finish: 'stop' } } }; })() }));
@@ -636,5 +649,112 @@ describe('POST /v1/messages', () => {
         expect(messagesInputDeltas(frames)).toHaveLength(0);
         expect(res.text).not.toContain('[DONE]');
         expect(res.text).not.toContain('external__');
+    });
+    test('tool_choice required on stream still forces a call after an empty completed poll', async () => {
+        sdkMocks.sessionMessages.mockResolvedValue([{ info: { id: 'empty-assistant', role: 'assistant', finish: 'stop' }, parts: [] }]);
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({ stream: (async function* () {
+            yield { type: 'message.updated', properties: { info: { id: 'empty-assistant', role: 'assistant', sessionID: 'msg-session', finish: 'stop', parts: [] } } };
+        })() }));
+
+        const res = await request(app).post('/v1/messages')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/muse-spark-1.3-contributor-free', max_tokens: 100, stream: true, messages: [{ role: 'user', content: 'Read a.txt' }], tools: [{ name: 'read', description: 'Read', input_schema: { type: 'object' } }], tool_choice: { type: 'any' } });
+        const frames = parseMessagesSseFrames(res.text);
+
+        expect(res.statusCode).toBe(200);
+        expect(frames.find((frame) => frame.event === 'error')?.data.error.code).toBe('external_tool_choice_required');
+        expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(2);
+        expect(res.text).not.toContain('[DONE]');
+    });
+    test('stream: reasoning followed by text emits content_block_stop for thinking before content_block_start for text', async () => {
+        sdkMocks.sessionMessages.mockResolvedValue([{ info: { role: 'assistant', finish: 'stop' }, parts: [] }]);
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+            stream: (async function* () {
+                yield { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: 'msg-session' }, delta: 'Thinking about this' } };
+                yield { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'msg-session' }, delta: 'Here is the answer' } };
+                yield { type: 'message.updated', properties: { info: { sessionID: 'msg-session', finish: 'stop' } } };
+            })()
+        }));
+        const res = await request(app).post('/v1/messages')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/muse-spark-1.3-contributor-free', max_tokens: 100, stream: true, messages: [{ role: 'user', content: 'hello' }] });
+        expect(res.statusCode).toBe(200);
+        const frames = parseMessagesSseFrames(res.text);
+
+        const thinkStarts = messagesThinkingStarts(frames);
+        expect(thinkStarts).toHaveLength(1);
+        expect(thinkStarts[0].data.index).toBe(0);
+
+        const thinkDeltas = messagesThinkingDeltas(frames);
+        expect(thinkDeltas).toHaveLength(1);
+        expect(thinkDeltas[0].data.delta.thinking).toBe('Thinking about this');
+
+        const textDeltas = messagesTextDeltas(frames);
+        expect(textDeltas).toHaveLength(1);
+        expect(textDeltas[0].data.delta.text).toBe('Here is the answer');
+
+        const textStarts = frames.filter((f) => f.event === 'content_block_start' && f.data?.content_block?.type === 'text');
+        expect(textStarts).toHaveLength(1);
+        expect(textStarts[0].data.index).toBe(1);
+
+        const thinkStopIdx = frames.findIndex((f) => f.event === 'content_block_stop' && f.data.index === 0);
+        const textStartIdx = frames.findIndex((f) => f.event === 'content_block_start' && f.data.index === 1);
+        const textStopIdx = frames.findIndex((f) => f.event === 'content_block_stop' && f.data.index === 1);
+
+        expect(thinkStopIdx).toBeGreaterThan(-1);
+        expect(textStartIdx).toBeGreaterThan(-1);
+        expect(textStopIdx).toBeGreaterThan(-1);
+        expect(thinkStopIdx).toBeLessThan(textStartIdx);
+        expect(textStartIdx).toBeLessThan(textStopIdx);
+
+        const stopFrames = frames.filter((f) => f.event === 'content_block_stop');
+        expect(stopFrames).toHaveLength(2);
+    });
+    test('shouldBufferExternalStream: thinking block is started and stopped before text block is started and stopped', async () => {
+        sdkMocks.sessionMessages.mockResolvedValue([{ info: { role: 'assistant', finish: 'stop' }, parts: [] }]);
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+            stream: (async function* () {
+                yield { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: 'msg-session' }, delta: 'Plan: read file' } };
+                yield { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'msg-session' }, delta: 'Calling tool now ' } };
+                yield { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'msg-session' }, delta: '<function_calls>[{"id":"toolu_buf_1","name":"external__read","arguments":{"path":"file.txt"}}]</function_calls>' } };
+                yield { type: 'message.updated', properties: { info: { sessionID: 'msg-session', finish: 'stop' } } };
+            })()
+        }));
+        const res = await request(app).post('/v1/messages')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/muse-spark-1.3-contributor-free',
+                max_tokens: 100,
+                stream: true,
+                messages: [{ role: 'user', content: 'Read file.txt' }],
+                tools: [{ name: 'read', description: 'Read a file', input_schema: { type: 'object', properties: { path: { type: 'string' } } } }]
+            });
+        expect(res.statusCode).toBe(200);
+        const frames = parseMessagesSseFrames(res.text);
+
+        const thinkStartIdx = frames.findIndex((f) => f.event === 'content_block_start' && f.data?.content_block?.type === 'thinking');
+        const thinkDeltaIdx = frames.findIndex((f) => f.event === 'content_block_delta' && f.data?.delta?.type === 'thinking_delta');
+        const thinkStopIdx = frames.findIndex((f) => f.event === 'content_block_stop' && f.data?.index === 0);
+
+        const textStartIdx = frames.findIndex((f) => f.event === 'content_block_start' && f.data?.content_block?.type === 'text');
+        const textDeltaIdx = frames.findIndex((f) => f.event === 'content_block_delta' && f.data?.delta?.type === 'text_delta');
+        const textStopIdx = frames.findIndex((f) => f.event === 'content_block_stop' && f.data?.index === 1);
+
+        const toolStartIdx = frames.findIndex((f) => f.event === 'content_block_start' && f.data?.content_block?.type === 'tool_use');
+        const toolDeltaIdx = frames.findIndex((f) => f.event === 'content_block_delta' && f.data?.delta?.type === 'input_json_delta');
+        const toolStopIdx = frames.findIndex((f) => f.event === 'content_block_stop' && f.data?.index === 2);
+
+        expect(thinkStartIdx).toBeLessThan(thinkDeltaIdx);
+        expect(thinkDeltaIdx).toBeLessThan(thinkStopIdx);
+        expect(thinkStopIdx).toBeLessThan(textStartIdx);
+        expect(textStartIdx).toBeLessThan(textDeltaIdx);
+        expect(textDeltaIdx).toBeLessThan(textStopIdx);
+        expect(textStopIdx).toBeLessThan(toolStartIdx);
+        expect(toolStartIdx).toBeLessThan(toolDeltaIdx);
+        expect(toolDeltaIdx).toBeLessThan(toolStopIdx);
+
+        const stopFrames = frames.filter((f) => f.event === 'content_block_stop');
+        expect(stopFrames).toHaveLength(3);
+        expect(stopFrames.map((f) => f.data.index)).toEqual([0, 1, 2]);
     });
 });

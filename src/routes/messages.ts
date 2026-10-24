@@ -11,6 +11,7 @@ import {
   buildAnthropicMessage,
   sseEvent,
   estimateTokens,
+  toAnthropicErrorType,
 } from '../converters/anthropic.js';
 import { defaultTranslatorRegistry } from '../converters/registry.js';
 import { ensureTranslatorsRegistered } from '../converters/wire.js';
@@ -23,6 +24,10 @@ import {
   createToolCallFilter,
   createExternalToolCallStreamParser,
 } from '../tool-runtime/parser.js';
+import {
+  isMalformedExternalToolCallError,
+  resolveAuthoritativeStreamSource,
+} from '../tool-runtime/stream-source.js';
 import { isTransientUpstreamError, normalizeBackendError, transformUpstreamError } from '../errors/upstream.js';
 import { engageFallbackForFreeLimit } from '../upstream-proxy/fallback.js';
 import { detectHostedSearchTools } from '../search/grounding.js';
@@ -36,7 +41,18 @@ import { getImageDataUri } from '../stream/collector.js';
 import type { Application, Request, Response } from 'express';
 import type { AppContext } from '../types/context.js';
 import type { FinalToolCall } from '../tool-runtime/parser.js';
+import type { AuthoritativeStreamSource } from '../tool-runtime/stream-source.js';
 import { asRecord, toErrorMessage } from '../utils/guards.js';
+
+function readDataMessage(e: unknown): string {
+  const r = asRecord(e);
+  const data = asRecord(r['data']);
+  const dm: unknown = data['message'];
+  if (typeof dm === 'string') return dm;
+  const m: unknown = r['message'];
+  if (typeof m === 'string') return m;
+  return 'unknown';
+}
 
 export function registerMessagesRoutes(app: Application, ctx: AppContext): void {
   const {
@@ -71,12 +87,132 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
   const activeTranslators = translators ?? ensureTranslatorsRegistered(defaultTranslatorRegistry());
 
   app.post('/v1/messages', async (req: Request, res: Response): Promise<void> => {
+    let textBlockOpen = false;
+    let thinkingBlockOpen = false;
+    let textIndex: number | null = null;
+    let thinkingIndex: number | null = null;
+    const closeOpenBlocks = (): void => {
+      if (res.destroyed || res.writableEnded) return;
+      try {
+        if (thinkingBlockOpen && thinkingIndex !== null) {
+          res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: thinkingIndex }));
+          thinkingBlockOpen = false;
+        }
+        if (textBlockOpen && textIndex !== null) {
+          res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
+          textBlockOpen = false;
+        }
+      } catch {
+        // ignore
+      }
+    };
     try {
+      const rawBody: unknown = (req as unknown as { body: unknown }).body;
+      const validationError = validateMessagesRequest(rawBody);
+      if (validationError) {
+        res.status(validationError.statusCode).json(validationError.body);
+        return;
+      }
+      const body = asRecord(rawBody);
+      const model: unknown = body['model'];
+      const system: unknown = body['system'];
+      const messagesRaw: unknown = body['messages'];
+      const toolsRaw: unknown = body['tools'];
+      const tools: unknown[] = Array.isArray(toolsRaw) ? (toolsRaw as unknown[]) : [];
+      // Anthropic server-side web_search would be silently dropped by the
+      // function-tool bridge; fail loudly with a pointer instead. Uses the
+      // shared helper (covers versioned types like web_search_20260222)
+      // plus the bare `web_search` name for name-only defs.
+      const hasHostedSearch =
+        detectHostedSearchTools(tools).requested ||
+        tools.some((def: unknown) => {
+          const r = asRecord(def);
+          return typeof r['name'] === 'string' && String(r['name']) === 'web_search';
+        });
+      if (hasHostedSearch) {
+        res.status(400).json({
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message:
+              'web_search is not supported on /v1/messages; use POST /v1/responses with tools:[{type:"web_search"}] or POST /v1beta/interactions with tools:[{type:"google_search"}]',
+          },
+        });
+        return;
+      }
+      const tool_choice: unknown = body['tool_choice'];
+      const requestStream: unknown = body['stream'];
+      const temperature: unknown = body['temperature'];
+      const top_p: unknown = body['top_p'];
+      const top_k: unknown = body['top_k'];
+      const max_tokens: unknown = body['max_tokens'];
+      const stop_sequences: unknown = body['stop_sequences'];
+      const thinking: unknown = body['thinking'];
+      const stream = Boolean(requestStream);
+      const requestOpencodeConfig: unknown = body['opencode'];
+      const disableParallelRaw = body['disable_parallel_tool_use'];
+      const choiceDisableParallel = asRecord(tool_choice)['disable_parallel_tool_use'];
+      const parallelToolCalls: boolean = disableParallelRaw === true || choiceDisableParallel === true ? false : true;
+      // Phase 2 wiring: inbound claude.request -> chat.request via the wired
+      // N×N registry (thin wrapper over the same anthropic.ts pure layer,
+      // so shapes match). Direct registry call (not the Safe wrapper):
+      // requests are validated above and never error envelopes; an extra
+      // `type:'error'` field must not bypass conversion (mode confusion).
+      // Translated tools still flow through createRequestToolContext below
+      // (external__* bridge + server ∩ request), unchanged.
+      const translatedChatRequest = asRecord(
+        activeTranslators.translateRequest(
+          'claude',
+          'openai',
+          typeof model === 'string' ? model : '',
+          {
+            model,
+            system,
+            messages: messagesRaw,
+            tools,
+            tool_choice,
+            thinking,
+            max_tokens,
+            temperature,
+            top_p,
+            stop_sequences,
+          },
+          stream,
+        ),
+      );
+      const chatMessages = (
+        Array.isArray(translatedChatRequest['messages']) ? (translatedChatRequest['messages'] as unknown[]) : []
+      ) as unknown as Array<{ role?: unknown; content?: unknown }>;
+      const chatTools = Array.isArray(translatedChatRequest['tools']) ? (translatedChatRequest['tools'] as unknown[]) : [];
+      const chatToolChoice = translatedChatRequest['tool_choice'];
+      // Strict legacy parity via the testable gate (collapses the whole
+      // adaptive/auto family to the legacy fallback; translator itself
+      // stays Go-faithful).
+      const translatedEffort = translatedChatRequest['reasoning_effort'];
+      const reasoningLevel = resolveMessagesReasoningLevel(thinking, translatedEffort, normalizeReasoningEffort);
+
+      const requestParams: Record<string, unknown> = {
+        temperature: typeof temperature === 'number' ? temperature : 0.7,
+        max_tokens: typeof max_tokens === 'number' ? max_tokens : null,
+        top_p: typeof top_p === 'number' ? top_p : 1.0,
+        stop: Array.isArray(stop_sequences) ? stop_sequences : null,
+        reasoning_effort: reasoningLevel,
+      };
+      if (top_k !== undefined) logDebug('Ignoring top_k (no opencode equivalent)', { top_k });
+
+      const resolvedModel = (await withTimeout(resolveRequestedModel(model), REQUEST_TIMEOUT_MS, 'resolve model')) as unknown as {
+        providerID: string;
+        modelID: string;
+      };
+      const pID = String(asRecord(resolvedModel)['providerID']);
+      const mID = String(asRecord(resolvedModel)['modelID']);
+      const publicModel = `${pID}/${mID}`;
+
       await lock(async (): Promise<void> => {
-         let sessionId: string | null = null;
-         let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
-         const requestAbortController = new AbortController();
-         let disconnectedSessionCleaned = false;
+        let sessionId: string | null = null;
+        let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
+        const requestAbortController = new AbortController();
+        let disconnectedSessionCleaned = false;
 
         // P3 fallback bundle: direct by default; adopts the proxy bundle when
         // this request hits a free-limit error (or the pool is already engaged).
@@ -84,6 +220,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
         let activePromptWithTimeout = promptWithTimeout;
         let activePollForAssistantResponse = pollForAssistantResponse;
         let fallbackToProxy = false;
+        let fallbackServed = false;
         const switchToProxyBundle = (): boolean => {
           if (!proxyClient) return false;
           activeClient = proxyClient;
@@ -98,107 +235,6 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
         };
         if (proxyPool.isEngaged()) switchToProxyBundle();
         try {
-          const rawBody: unknown = (req as unknown as { body: unknown }).body;
-          const validationError = validateMessagesRequest(rawBody);
-          if (validationError) {
-            res.status(validationError.statusCode).json(validationError.body);
-            return;
-          }
-          const body = asRecord(rawBody);
-          const model: unknown = body['model'];
-          const system: unknown = body['system'];
-          const messagesRaw: unknown = body['messages'];
-          const toolsRaw: unknown = body['tools'];
-          const tools: unknown[] = Array.isArray(toolsRaw) ? (toolsRaw as unknown[]) : [];
-          // Anthropic server-side web_search would be silently dropped by the
-          // function-tool bridge; fail loudly with a pointer instead. Uses the
-          // shared helper (covers versioned types like web_search_20260222)
-          // plus the bare `web_search` name for name-only defs.
-          const hasHostedSearch =
-            detectHostedSearchTools(tools).requested ||
-            tools.some((def: unknown) => {
-              const r = asRecord(def);
-              return typeof r['name'] === 'string' && String(r['name']) === 'web_search';
-            });
-          if (hasHostedSearch) {
-            res.status(400).json({
-              type: 'error',
-              error: {
-                type: 'invalid_request_error',
-                message:
-                  'web_search is not supported on /v1/messages; use POST /v1/responses with tools:[{type:"web_search"}] or POST /v1beta/interactions with tools:[{type:"google_search"}]',
-              },
-            });
-            return;
-          }
-          const tool_choice: unknown = body['tool_choice'];
-          const requestStream: unknown = body['stream'];
-          const temperature: unknown = body['temperature'];
-          const top_p: unknown = body['top_p'];
-          const top_k: unknown = body['top_k'];
-          const max_tokens: unknown = body['max_tokens'];
-          const stop_sequences: unknown = body['stop_sequences'];
-          const thinking: unknown = body['thinking'];
-          const stream = Boolean(requestStream);
-          const requestOpencodeConfig: unknown = body['opencode'];
-          const disableParallelRaw = body['disable_parallel_tool_use'];
-          const choiceDisableParallel = asRecord(tool_choice)['disable_parallel_tool_use'];
-          const parallelToolCalls: boolean = disableParallelRaw === true || choiceDisableParallel === true ? false : true;
-          // Phase 2 wiring: inbound claude.request -> chat.request via the wired
-          // N×N registry (thin wrapper over the same anthropic.ts pure layer,
-          // so shapes match). Direct registry call (not the Safe wrapper):
-          // requests are validated above and never error envelopes; an extra
-          // `type:'error'` field must not bypass conversion (mode confusion).
-          // Translated tools still flow through createRequestToolContext below
-          // (external__* bridge + server ∩ request), unchanged.
-          const translatedChatRequest = asRecord(
-            activeTranslators.translateRequest(
-              'claude',
-              'openai',
-              typeof model === 'string' ? model : '',
-              {
-                model,
-                system,
-                messages: messagesRaw,
-                tools,
-                tool_choice,
-                thinking,
-                max_tokens,
-                temperature,
-                top_p,
-                stop_sequences,
-              },
-              stream,
-            ),
-          );
-          const chatMessages = (
-            Array.isArray(translatedChatRequest['messages']) ? (translatedChatRequest['messages'] as unknown[]) : []
-          ) as unknown as Array<{ role?: unknown; content?: unknown }>;
-          const chatTools = Array.isArray(translatedChatRequest['tools']) ? (translatedChatRequest['tools'] as unknown[]) : [];
-          const chatToolChoice = translatedChatRequest['tool_choice'];
-          // Strict legacy parity via the testable gate (collapses the whole
-          // adaptive/auto family to the legacy fallback; translator itself
-          // stays Go-faithful).
-          const translatedEffort = translatedChatRequest['reasoning_effort'];
-          const reasoningLevel = resolveMessagesReasoningLevel(thinking, translatedEffort, normalizeReasoningEffort);
-
-          const requestParams: Record<string, unknown> = {
-            temperature: typeof temperature === 'number' ? temperature : 0.7,
-            max_tokens: typeof max_tokens === 'number' ? max_tokens : null,
-            top_p: typeof top_p === 'number' ? top_p : 1.0,
-            stop: Array.isArray(stop_sequences) ? stop_sequences : null,
-            reasoning_effort: reasoningLevel,
-          };
-          if (top_k !== undefined) logDebug('Ignoring top_k (no opencode equivalent)', { top_k });
-
-          const resolvedModel = (await withTimeout(resolveRequestedModel(model), REQUEST_TIMEOUT_MS, 'resolve model')) as unknown as {
-            providerID: string;
-            modelID: string;
-          };
-          const pID = String(asRecord(resolvedModel)['providerID']);
-          const mID = String(asRecord(resolvedModel)['modelID']);
-          const publicModel = `${pID}/${mID}`;
-
           const requestToolContext = createRequestToolContext(chatTools, chatToolChoice, requestOpencodeConfig);
           const toolMode: string = requestToolContext.mode;
           const externalToolContext = requestToolContext.external;
@@ -418,6 +454,8 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                 return;
               }
               if (attempt > 1) {
+                if (fallbackToProxy) switchToProxyBundle();
+                await ensureActiveModel(activeClient, pID, mID).catch(() => {});
                 try {
                   await activeClient.session.delete({ path: { id: sessionId } });
                 } catch {
@@ -439,9 +477,18 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                    requestAbortController.signal,
                  );
 
-                content = collected.content || '';
-                reasoning = collected.reasoning || '';
-                error = collected.error || null;
+                 content = collected.content || '';
+                 reasoning = collected.reasoning || '';
+                 error =
+                   collected.error ||
+                   (collected.partial === true
+                     ? new Error('Polling returned incomplete response')
+                     : externalToolChoice.mode !== 'required' &&
+                         !content &&
+                         !reasoning &&
+                         !(Array.isArray(collected.toolParts) && collected.toolParts.length > 0)
+                       ? new Error('Polling returned empty response')
+                       : null);
               } catch (promptError: unknown) {
                 content = '';
                 reasoning = '';
@@ -454,10 +501,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
               // Fail-closed: any backend error fails even with partial content (see chat.ts).
                           if (error != null) {
               const t = transformUpstreamError(error);
+              const anthropicType = toAnthropicErrorType(t.statusCode, t.error.type);
               res.status(t.statusCode).json({
                 type: 'error',
                 error: {
-                  type: t.error.type || 'api_error',
+                  type: anthropicType,
                   message: t.error.message || 'Upstream error',
                   ...(t.error.code ? { code: t.error.code } : {}),
                 },
@@ -522,10 +570,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                       res.setHeader('Content-Type', 'text/event-stream');
            res.setHeader('Cache-Control', 'no-cache');
            res.setHeader('Connection', 'keep-alive');
+           res.setHeader('X-Accel-Buffering', 'no');
            const flushHeaders = (res as unknown as { flushHeaders?: unknown }).flushHeaders;
            if (typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
            keepaliveInterval = setInterval(() => {
-            if (!res.destroyed && !res.writableEnded) res.write(': keep-alive\n\n');
+            if (!res.destroyed && !res.writableEnded) res.write(': keep-alive\n');
           }, 15000);
            const resClosed = new Promise<boolean>((resolve) =>
              res.once('close', () => {
@@ -545,15 +594,15 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
            // markup is never emitted as incremental `content_block_delta` before it
            // can be classified. Pure-text turns with tools declared also batch.
            const shouldBufferExternalStream = externalToolRegistry.length > 0;
-           const filterContent = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
-           const filterReasoning = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
-           const parseContent = createExternalToolCallStreamParser(externalToolRegistry);
-           const parseReason = createExternalToolCallStreamParser(externalToolRegistry);
-          let textBlockOpen = false;
-          let thinkingBlockOpen = false;
-          let nextBlockIndex = 0;
-          let textIndex: number | null = null;
-          let thinkingIndex: number | null = null;
+           let filterContent = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
+           let filterReasoning = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
+           let parseContent = createExternalToolCallStreamParser(externalToolRegistry);
+           let parseReason = createExternalToolCallStreamParser(externalToolRegistry);
+           textBlockOpen = false;
+           thinkingBlockOpen = false;
+           let nextBlockIndex = 0;
+           textIndex = null;
+           thinkingIndex = null;
           const ensureTextIndex = (): number => {
             if (textIndex === null) textIndex = nextBlockIndex++;
             return textIndex;
@@ -570,6 +619,10 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           );
           const sendTextDelta = (delta: string): void => {
             if (!delta) return;
+            if (thinkingBlockOpen && thinkingIndex !== null) {
+              res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: thinkingIndex }));
+              thinkingBlockOpen = false;
+            }
             const idx = ensureTextIndex();
             if (!textBlockOpen) {
               res.write(sseEvent('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'text', text: '' } }));
@@ -580,6 +633,10 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           };
           const sendReasoningDelta = (delta: string): void => {
             if (!delta) return;
+            if (textBlockOpen && textIndex !== null) {
+              res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
+              textBlockOpen = false;
+            }
             const idx = ensureThinkingIndex();
             if (!thinkingBlockOpen) {
               res.write(sseEvent('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'thinking', thinking: '', signature: '' } }));
@@ -603,10 +660,16 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
              else sendTextDelta(filtered);
           };
            let collected: Record<string, unknown> | null = null;
-           let polledSnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
+           let polledSnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null = null;
            let snapshotPolled = false;
-           let snapshotPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> | null = null;
-           const pollSnapshot = async (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> => {
+           let snapshotPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> | null = null;
+           const hasRecoveryEvidence = (snapshot: { content: string; reasoning: string; toolParts?: unknown }): boolean =>
+             Boolean(
+               snapshot.content ||
+                 snapshot.reasoning ||
+                 (Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0),
+             );
+           const pollSnapshot = async (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> => {
              snapshotPolled = true;
              if (!snapshotPromise) {
                  snapshotPromise = activePollForAssistantResponse(
@@ -620,103 +683,202 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
              return snapshotPromise;
            };
           // Recovery snapshots repeat what the event stream already delivered, so only the
-          // suffix past the raw prefix may be replayed. A snapshot the raw prefix does not
-          // match is still sent in full rather than dropped.
+          // suffix past the raw prefix may be replayed. A divergent snapshot is not a safe
+          // replay (raw "AC" + snapshot "ABC" would render "ACABC"); tool calls still come
+          // from the snapshot while visible text keeps the raw stream.
            const unsentSuffix = (full: unknown, raw: string): string => {
              const text = typeof full === 'string' ? full : '';
              if (!text) return '';
              if (!raw) return text;
-             return text.startsWith(raw) ? text.slice(raw.length) : text;
-           };
-           const hasPartialOutput = (): boolean => {
-             const current = asRecord(collected);
-             return Boolean(rawContent || rawReasoning || streamedToolCalls.length > 0 || current['content'] || current['reasoning']);
+             return text.startsWith(raw) ? text.slice(raw.length) : '';
            };
            const recoverSnapshot = async (
              fallbackError: unknown = null,
-           ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown } | null> => {
+           ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null> => {
              if (res.destroyed || res.writableEnded) return null;
-             let snapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown };
+             let snapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean };
              try {
                snapshot = await pollSnapshot();
              } catch (error: unknown) {
                if (res.destroyed || res.writableEnded) return null;
-               if (hasPartialOutput()) {
-                 logDebug('Ignoring messages recovery poll failure after partial stream output', { error: toErrorMessage(error) });
-                 return null;
-               }
                if (fallbackError != null) throw normalizeBackendError(fallbackError);
                throw normalizeBackendError(error);
-             }
-             if (snapshot.error != null) throw normalizeBackendError(snapshot.error);
-             if (
-               fallbackError != null &&
-               !snapshot.content &&
-               !snapshot.reasoning &&
-               !(Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0)
-             ) throw normalizeBackendError(fallbackError);
-             return snapshot;
+              }
+              if (snapshot.error != null) throw snapshot.error;
+              if (snapshot.partial === true) throw new Error('Recovery poll returned incomplete response');
+              if (!hasRecoveryEvidence(snapshot)) {
+                if (fallbackError != null) throw normalizeBackendError(fallbackError);
+                return null;
+              }
+              return snapshot;
            };
 
-          if (fallbackToProxy) {
-            // SSE subscribe ignores custom fetch (SDK gap): prompt+poll
-            // through the proxy bundle instead of the event stream.
-            try {
-              await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-               const pres = await pollSnapshot();
-               polledSnapshot = pres;
-               if (pres.error != null) throw normalizeBackendError(pres.error);
-              if (res.destroyed || res.writableEnded) {
-                if (keepaliveInterval) clearInterval(keepaliveInterval);
-                return;
+          let lastStreamAttemptError: unknown = null;
+          let promptPromise: Promise<void> | null = null;
+          let promptError: unknown = null;
+          for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            collected = null;
+            promptPromise = null;
+            promptError = null;
+            if (attempt > 1) {
+              if (fallbackToProxy) switchToProxyBundle();
+              await ensureActiveModel(activeClient, pID, mID).catch(() => {});
+              try {
+                await activeClient.session.delete({ path: { id: sessionId } });
+              } catch (e: unknown) {
+                logDebug('Failed to delete retried messages session', { sessionId, error: toErrorMessage(e) });
               }
-              // Raw text: sendDelta parses tool calls and filters display markup.
-              const presContent = unsentSuffix(pres.content, rawContent);
-              const presReasoning = unsentSuffix(pres.reasoning, rawReasoning);
-              if (presContent) sendDelta(presContent, false);
-              if (presReasoning) sendDelta(presReasoning, true);
-              collected = { content: pres.content, reasoning: pres.reasoning };
-            } catch (e: unknown) {
-              throw normalizeBackendError(e);
+              const retrySessionRes = (await withTimeout(
+                activeClient.session.create(),
+                REQUEST_TIMEOUT_MS,
+                'create session',
+              )) as unknown;
+              sessionId = (asRecord(asRecord(retrySessionRes)['data'])['id'] as string | undefined) ?? null;
+              if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
+              promptParams.path.id = sessionId;
+              requestForcedMessagesToolCall = makeForcedMessagesToolCallRequester();
+              streamedText = '';
+              streamedReasoning = '';
+              rawContent = '';
+              rawReasoning = '';
+              streamedToolCalls.length = 0;
+              filterContent = createToolCallFilter({
+                disableTools: DISABLE_TOOLS,
+                forceStrip: shouldBufferExternalStream,
+                registry: externalToolRegistry,
+              });
+              filterReasoning = createToolCallFilter({
+                disableTools: DISABLE_TOOLS,
+                forceStrip: shouldBufferExternalStream,
+                registry: externalToolRegistry,
+              });
+              parseContent = createExternalToolCallStreamParser(externalToolRegistry);
+              parseReason = createExternalToolCallStreamParser(externalToolRegistry);
+              polledSnapshot = null;
+              snapshotPolled = false;
+              snapshotPromise = null;
+              textBlockOpen = false;
+              thinkingBlockOpen = false;
+              nextBlockIndex = 0;
+              textIndex = null;
+              thinkingIndex = null;
+              fallbackServed = false;
+              await sleep(computeRetryDelay(attempt - 1, lastStreamAttemptError));
             }
-          } else {
-            const collectPromise = collectFromEvents(
-              sessionId as string,
-              REQUEST_TIMEOUT_MS,
-              sendDelta,
-               DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-               DEFAULT_EVENT_IDLE_TIMEOUT_MS,
-               requestAbortController.signal,
-             ).catch((err: unknown) => ({ __error: err }));
+            try {
+              if (fallbackToProxy) {
+                // SSE subscribe ignores custom fetch (SDK gap): prompt+poll
+                // through the proxy bundle instead of the event stream.
+                await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                const pres = await pollSnapshot();
+                if (pres.error != null) throw normalizeBackendError(pres.error);
+                if (pres.partial === true) throw new Error('Recovery poll returned incomplete response');
+                if (!hasRecoveryEvidence(pres) && externalToolChoice.mode !== 'required') {
+                  throw new Error('Recovery poll returned empty response');
+                }
+                polledSnapshot = pres;
+                if (res.destroyed || res.writableEnded) {
+                  if (keepaliveInterval) clearInterval(keepaliveInterval);
+                  return;
+                }
+                // Raw text: sendDelta parses tool calls and filters display markup.
+                const presContent = unsentSuffix(pres.content, rawContent);
+                const presReasoning = unsentSuffix(pres.reasoning, rawReasoning);
+                if (presContent) sendDelta(presContent, false);
+                if (presReasoning) sendDelta(presReasoning, true);
+                if (pres.content || pres.reasoning) fallbackServed = true;
+                collected = { content: pres.content, reasoning: pres.reasoning, toolParts: pres.toolParts };
+              } else {
+                const collectPromise = collectFromEvents(
+                  sessionId as string,
+                  REQUEST_TIMEOUT_MS,
+                  sendDelta,
+                  DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
+                  DEFAULT_EVENT_IDLE_TIMEOUT_MS,
+                  requestAbortController.signal,
+                ).catch((err: unknown) => ({ __error: err }));
 
-            activeClient.session.prompt(promptParams).catch((err: unknown) => logDebug('Prompt error:', toErrorMessage(err)));
-            const raced = (await Promise.race([collectPromise, resClosed.then(() => ({ __cancelled: true }))])) as Record<string, unknown>;
-            collected = raced;
-             if (raced['__cancelled'] || requestAbortController.signal.aborted) {
-               if (keepaliveInterval) clearInterval(keepaliveInterval);
-               try {
-                 if (sessionId) {
-                   await activeClient.session.delete({ path: { id: sessionId } });
-                   disconnectedSessionCleaned = true;
-                 }
-               } catch (e: unknown) {
-                 logDebug('Failed to cleanup cancelled messages session', { error: toErrorMessage(e) });
-               }
-               try {
-                 if (!res.destroyed) res.end();
-               } catch {
-                 // ignore
-               }
-               return;
-             }
-             if (raced['error'] != null) throw normalizeBackendError(raced['error']);
-              const recoveryRecord = asRecord(collected);
-              const hasValidTerminal = Boolean(
+                promptPromise = activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS)
+                  .then(() => undefined)
+                  .catch((err: unknown) => {
+                    promptError = err;
+                    logDebug('Prompt error:', toErrorMessage(err));
+                  });
+                const raced = (await Promise.race([collectPromise, resClosed.then(() => ({ __cancelled: true }))])) as Record<string, unknown>;
+                collected = raced;
+                if (raced['__cancelled'] || requestAbortController.signal.aborted) {
+                  if (keepaliveInterval) clearInterval(keepaliveInterval);
+                  try {
+                    if (sessionId) {
+                      await activeClient.session.delete({ path: { id: sessionId } });
+                      disconnectedSessionCleaned = true;
+                    }
+                  } catch (e: unknown) {
+                    logDebug('Failed to cleanup cancelled messages session', { error: toErrorMessage(e) });
+                  }
+                  try {
+                    if (!res.destroyed) res.end();
+                  } catch {
+                    // ignore
+                  }
+                  return;
+                }
+              }
+            } catch (e: unknown) {
+              collected = { __error: e };
+            }
+
+            const collectedRecord = asRecord(collected);
+            const nothingStreamed = !rawContent && !rawReasoning && streamedToolCalls.length === 0;
+            if (promptPromise && nothingStreamed) await promptPromise;
+            let attemptError: unknown = promptError ?? collectedRecord['error'] ?? collectedRecord['__error'] ?? null;
+            if (!attemptError && (collectedRecord['noData'] || collectedRecord['cut'] || collectedRecord['idleTimeout'])) {
+              try {
+                const recovery = await pollSnapshot();
+                if (recovery.error != null) {
+                  attemptError = recovery.error;
+                } else if (recovery.partial === true) {
+                  attemptError = new Error('Recovery poll returned incomplete response');
+                } else if (!hasRecoveryEvidence(recovery)) {
+                  attemptError = new Error('Recovery poll returned empty response');
+                } else {
+                  polledSnapshot = recovery;
+                  const presContent = unsentSuffix(recovery.content, rawContent);
+                  const presReasoning = unsentSuffix(recovery.reasoning, rawReasoning);
+                  if (presContent) sendDelta(presContent, false);
+                  if (presReasoning) sendDelta(presReasoning, true);
+                  collected = { content: recovery.content, reasoning: recovery.reasoning, toolParts: recovery.toolParts };
+                }
+              } catch (pollErr: unknown) {
+                attemptError = pollErr;
+              }
+            }
+            if (attemptError && nothingStreamed && attempt < maxAttempts && engageProxyFallback(attemptError)) {
+              lastStreamAttemptError = attemptError;
+              continue;
+            }
+            if (attemptError && nothingStreamed && attempt < maxAttempts && isTransientUpstreamError(attemptError)) {
+              console.warn(
+                `[Proxy] Transient upstream error in messages stream (attempt ${attempt}/${maxAttempts}), retrying:`,
+                readDataMessage(attemptError),
+              );
+              lastStreamAttemptError = attemptError;
+              continue;
+            }
+            break;
+          }
+
+          const recoveryRecord = asRecord(collected);
+          if (recoveryRecord['error'] != null) throw normalizeBackendError(recoveryRecord['error']);
+          const hasValidTerminal = Boolean(
                 collected &&
                 !recoveryRecord['__error'] &&
                 !recoveryRecord['noData'] &&
                 !recoveryRecord['idleTimeout'] &&
+                !recoveryRecord['cut'] &&
                 !recoveryRecord['cancelled'] &&
+                recoveryRecord['finish'] !== 'tool' &&
+                recoveryRecord['finish'] !== 'tool-calls' &&
                 (rawContent || rawReasoning || streamedToolCalls.length > 0 || recoveryRecord['content'] || recoveryRecord['reasoning']),
               );
               if (recoveryRecord['__error']) {
@@ -730,7 +892,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                  if (remainingContent) sendDelta(remainingContent, false);
                  if (remainingReasoning) sendDelta(remainingReasoning, true);
                }
-              } else if (recoveryRecord['noData'] || recoveryRecord['idleTimeout']) {
+              } else if (recoveryRecord['noData'] || recoveryRecord['idleTimeout'] || recoveryRecord['cut'] || !hasValidTerminal) {
 
                const snapshot = await recoverSnapshot();
                if (snapshot) {
@@ -751,7 +913,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                  if (remainingContent) sendDelta(remainingContent, false);
                }
              }
-           }
+             if (!hasValidTerminal && !polledSnapshot && !fallbackServed) {
+               if (streamedToolCalls.length === 0 && externalToolChoice.mode !== 'required') {
+                 throw new Error('Stream ended without valid terminal');
+               }
+             }
            if (requestAbortController.signal.aborted || res.destroyed || res.writableEnded) {
              if (sessionId && !disconnectedSessionCleaned) {
                try {
@@ -768,59 +934,135 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
            const flushedContentCalls = parseContent.flush ? parseContent.flush() : [];
            const flushedReasoningText = filterReasoning.flush ? filterReasoning.flush() : '';
            const flushedContentText = filterContent.flush ? filterContent.flush() : '';
+           const collectedR = asRecord(collected);
+           if (collectedR['error'] != null) throw normalizeBackendError(collectedR['error']);
+           // One authoritative source group: snapshot when available, otherwise
+           // the raw delta text. Never validate both groups independently.
+           let authoritativeSource = resolveAuthoritativeStreamSource({
+             collected: collectedR,
+             polledSnapshot,
+             rawContent,
+             rawReasoning,
+           });
+           const streamSource = (): string[][] => [[authoritativeSource.reasoning, authoritativeSource.content]];
+
            if (shouldBufferExternalStream) {
              const visible = stripExternalToolCallMarkupFromJoinedText(
                externalToolRegistry,
-               rawReasoning,
-               rawContent,
+               authoritativeSource.reasoning,
+               authoritativeSource.content,
              );
              streamedReasoning = visible.reasoning;
              streamedText = visible.content;
            } else {
+             if (rawContent && authoritativeSource.content && !authoritativeSource.content.startsWith(rawContent)) {
+               throw new Error('Stream content diverged from authoritative snapshot');
+             }
+             if (rawReasoning && authoritativeSource.reasoning && !authoritativeSource.reasoning.startsWith(rawReasoning)) {
+               throw new Error('Stream reasoning diverged from authoritative snapshot');
+             }
              if (flushedReasoningText) sendReasoningDelta(flushedReasoningText);
              if (flushedContentText) sendTextDelta(flushedContentText);
+             if (!streamedText && !streamedReasoning) {
+               const collectedRemainingContent = unsentSuffix(authoritativeSource.content, rawContent);
+               const collectedRemainingReasoning = unsentSuffix(authoritativeSource.reasoning, rawReasoning);
+               if (collectedRemainingReasoning) sendReasoningDelta(collectedRemainingReasoning);
+               if (collectedRemainingContent) sendTextDelta(collectedRemainingContent);
+             }
            }
 
-           const collectedR = asRecord(collected);
-           if (collectedR['error'] != null) throw normalizeBackendError(collectedR['error']);
-           const snapshotReasoning = polledSnapshot?.reasoning ?? (typeof collectedR['reasoning'] === 'string' ? collectedR['reasoning'] as string : rawReasoning);
-           const snapshotContent = polledSnapshot?.content ?? (typeof collectedR['content'] === 'string' ? collectedR['content'] as string : rawContent);
            const parseJoined = (reasoningText: string, contentText: string): FinalToolCall[] =>
              externalToolRegistry.length > 0
                ? parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoningText, contentText)
                : [];
-           const streamSource = [
-             [snapshotReasoning, snapshotContent],
-             [rawReasoning, rawContent]
-           ];
-            let parsedToolCalls: FinalToolCall[] = externalToolRegistry.length > 0
-              ? mergeToolCallArtifacts(
-                  streamedToolCalls,
-                  flushedReasoningCalls,
-                  flushedContentCalls,
-                  parseJoined(snapshotReasoning, snapshotContent),
-                  parseJoined(rawReasoning, rawContent),
-                )
-              : [];
-            let finalValidated: FinalToolCall[];
-            try {
-              assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource);
-              if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
-                const forcedResponse = await requestForcedMessagesToolCall();
-                if (forcedResponse) {
-                  const forcedReasoning = typeof forcedResponse['reasoning'] === 'string' ? forcedResponse['reasoning'] as string : '';
-                  const forcedContent = typeof forcedResponse['content'] === 'string' ? forcedResponse['content'] as string : '';
-                  parsedToolCalls = mergeToolCallArtifacts(parsedToolCalls, parseJoined(forcedReasoning, forcedContent));
-                  assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [forcedReasoning, forcedContent]);
-                }
-              }
-              finalValidated = finalizeStreamToolCalls(
-                parsedToolCalls,
-                externalToolRegistry,
-                externalToolChoice,
-                streamSource,
-                parallelToolCalls,
-              ) as unknown as FinalToolCall[];
+           const callsFromText = (source: AuthoritativeStreamSource): FinalToolCall[] =>
+             externalToolRegistry.length > 0
+               ? parseJoined(source.reasoning, source.content)
+               : [];
+           const callsFromRaw = (source: AuthoritativeStreamSource): FinalToolCall[] =>
+             externalToolRegistry.length > 0
+               ? mergeToolCallArtifacts(
+                   streamedToolCalls,
+                   flushedReasoningCalls,
+                   flushedContentCalls,
+                   parseJoined(source.reasoning, source.content),
+                 )
+               : [];
+           let parsedToolCalls: FinalToolCall[] = authoritativeSource.fromSnapshot
+             ? callsFromText(authoritativeSource)
+             : callsFromRaw(authoritativeSource);
+           const repairFromSnapshot = async (): Promise<boolean> => {
+             if (externalToolRegistry.length === 0) return false;
+             let snapshot = polledSnapshot;
+             if (!snapshot) {
+               if (snapshotPolled) return false;
+               try {
+                 snapshot = await recoverSnapshot();
+               } catch {
+                 return false;
+               }
+             }
+             if (!snapshot || snapshot.error != null) return false;
+             const repairedSource: AuthoritativeStreamSource = {
+               content: String(snapshot.content ?? ''),
+               reasoning: String(snapshot.reasoning ?? ''),
+               kind: 'polled-snapshot',
+               fromSnapshot: true,
+             };
+             const snapshotCalls = parseJoined(repairedSource.reasoning, repairedSource.content);
+             if (snapshotCalls.length === 0) return false;
+             try {
+               assertToolCallArtifactIntegrity(snapshotCalls, externalToolRegistry, [
+                 [repairedSource.reasoning, repairedSource.content],
+               ]);
+             } catch {
+               return false;
+             }
+             polledSnapshot = snapshot;
+             authoritativeSource = repairedSource;
+             parsedToolCalls = snapshotCalls;
+             if (shouldBufferExternalStream) {
+               const visible = stripExternalToolCallMarkupFromJoinedText(
+                 externalToolRegistry,
+                 authoritativeSource.reasoning,
+                 authoritativeSource.content,
+               );
+               streamedReasoning = visible.reasoning;
+               streamedText = visible.content;
+             }
+             return true;
+           };
+           let finalValidated: FinalToolCall[];
+           try {
+             try {
+               assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource());
+             } catch (integrityError) {
+               if (!isMalformedExternalToolCallError(integrityError) || !(await repairFromSnapshot())) {
+                 throw integrityError;
+               }
+             }
+             if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+               const forcedResponse = await requestForcedMessagesToolCall();
+               if (forcedResponse) {
+                 const forcedReasoning = typeof forcedResponse['reasoning'] === 'string' ? forcedResponse['reasoning'] as string : '';
+                 const forcedContent = typeof forcedResponse['content'] === 'string' ? forcedResponse['content'] as string : '';
+                 parsedToolCalls = mergeToolCallArtifacts(parsedToolCalls, parseJoined(forcedReasoning, forcedContent));
+                 authoritativeSource = {
+                   content: `${authoritativeSource.content}${forcedContent}`,
+                   reasoning: `${authoritativeSource.reasoning}${forcedReasoning}`,
+                   kind: authoritativeSource.kind,
+                   fromSnapshot: authoritativeSource.fromSnapshot,
+                 };
+                 assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource());
+               }
+             }
+             finalValidated = finalizeStreamToolCalls(
+               parsedToolCalls,
+               externalToolRegistry,
+               externalToolChoice,
+               streamSource(),
+               parallelToolCalls,
+             ) as unknown as FinalToolCall[];
             } catch (toolError) {
               const toolCode = (toolError as Error & { code?: string }).code;
               const failClosedCodes = [
@@ -847,6 +1089,7 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                     error: { type: 'api_error', message: toolMessage, code: toolCode },
                   });
                 } else if (!res.destroyed) {
+                  closeOpenBlocks();
                   try {
                     res.write(
                       sseEvent('error', {
@@ -874,6 +1117,8 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                  thinkingBlockOpen = true;
                }
                res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'thinking_delta', thinking: streamedReasoning } }));
+               res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: idx }));
+               thinkingBlockOpen = false;
              }
              if (streamedText) {
                const idx = ensureTextIndex();
@@ -882,10 +1127,11 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                  textBlockOpen = true;
                }
                res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: streamedText } }));
+               res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: idx }));
+               textBlockOpen = false;
              }
            }
-           if (textBlockOpen) res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
-           if (thinkingBlockOpen) res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: thinkingIndex }));
+           closeOpenBlocks();
            let toolBlockIndex = nextBlockIndex;
            for (const tc of toPublicToolCalls(finalValidated)) {
              const tcr = tc as unknown as Record<string, unknown>;
@@ -946,22 +1192,25 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           }
           if (!res.headersSent) {
             const t = transformUpstreamError(error);
+            const anthropicType = toAnthropicErrorType(t.statusCode, t.error.type);
             res.status(t.statusCode).json({
               type: 'error',
               error: {
-                type: t.error.type || 'api_error',
+                type: anthropicType,
                 message: t.error.message || toErrorMessage(error) || 'Upstream error',
                 ...(t.error.code ? { code: t.error.code } : {}),
               },
             });
             return;
           }
+          closeOpenBlocks();
           try {
             const t = transformUpstreamError(error);
+            const anthropicType = toAnthropicErrorType(t.statusCode, t.error.type);
             res.write(
               sseEvent('error', {
                 type: 'error',
-                error: { type: t.error.type || 'api_error', message: t.error.message, ...(t.error.code ? { code: t.error.code } : {}) },
+                error: { type: anthropicType, message: t.error.message, ...(t.error.code ? { code: t.error.code } : {}) },
               }),
             );
           } catch {
@@ -972,8 +1221,33 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
         }
       }, REQUEST_TIMEOUT_MS + 20000);
     } catch (error: unknown) {
-      if (!res.headersSent)
-        res.status(500).json({ type: 'error', error: { type: 'api_error', message: toErrorMessage(error) } });
+      if (!res.headersSent) {
+        const t = transformUpstreamError(error);
+        const anthropicType = toAnthropicErrorType(t.statusCode, t.error.type);
+        res.status(t.statusCode).json({
+          type: 'error',
+          error: {
+            type: anthropicType,
+            message: t.error.message || toErrorMessage(error) || 'Upstream error',
+            ...(t.error.code ? { code: t.error.code } : {}),
+          },
+        });
+      } else if (!res.writableEnded && !res.destroyed) {
+        closeOpenBlocks();
+        try {
+          const t = transformUpstreamError(error);
+          const anthropicType = toAnthropicErrorType(t.statusCode, t.error.type);
+          res.write(
+            sseEvent('error', {
+              type: 'error',
+              error: { type: anthropicType, message: t.error.message, ...(t.error.code ? { code: t.error.code } : {}) },
+            }),
+          );
+        } catch {
+          // ignore
+        }
+        res.end();
+      }
     }
   });
 }

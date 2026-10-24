@@ -53,4 +53,15 @@ describe('Dockerfile OpenCode backend pin', () => {
     test('does not persist the pin as a runtime ENV', () => {
         expect(dockerfile).not.toMatch(/^\s*ENV\s+OPENCODE_VERSION=/m);
     });
+
+    test('workflow files match PINNED_VERSION', () => {
+        const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+        const workflows = ['ai-fix.yml', 'ai-review.yml', 'ai-scan.yml'];
+        for (const file of workflows) {
+            const content = readFileSync(resolve(rootDir, '.github', 'workflows', file), 'utf8');
+            const match = content.match(/npm\s+i\s+-g\s+opencode-ai@([\w.-]+)/);
+            expect(match).not.toBeNull();
+            expect(match[1]).toBe(PINNED_VERSION);
+        }
+    });
 });

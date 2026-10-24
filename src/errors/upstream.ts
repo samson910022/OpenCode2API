@@ -8,6 +8,7 @@ function readStringField(record: Record<string, unknown>, key: string): string |
 }
 
 function collectMessageParts(error: unknown): string {
+  if (typeof error === 'string') return error;
   const record = asRecord(error);
   const data = asRecord(record['data']);
   const parts: string[] = [];
@@ -27,7 +28,7 @@ function readStatusCode(error: unknown): number | null {
     const n = Number(direct.trim());
     if (Number.isFinite(n) && n > 0) return n;
   }
-  const candidates: unknown[] = [record['message'], data['message']];
+  const candidates: unknown[] = [typeof error === 'string' ? error : null, record['message'], data['message']];
   for (const candidate of candidates) {
     if (typeof candidate !== 'string') continue;
     const m = candidate.match(/^\s*(\d{3})\s*:/);
@@ -149,11 +150,10 @@ export function isFreeUsageLimitError(error: unknown): boolean {
 export function isTransientUpstreamError(error: unknown): boolean {
   if (!error) return false;
   const message = collectMessageParts(error);
-  if (!message) return false;
 
   // Upstream opencode never retries context overflow (retry.ts); neither do we.
   // A 500 carrying a context message must surface immediately, not burn retries.
-  if (/context.?length|context.?overflow|context_length_exceeded/i.test(message)) return false;
+  if (message && /context.?length|context.?overflow|context_length_exceeded/i.test(message)) return false;
 
   // First-party gate is permanent: retrying (or proxy-fallbacking) can never
   // succeed, and a Python Traceback body might otherwise trip a generic
@@ -161,20 +161,27 @@ export function isTransientUpstreamError(error: unknown): boolean {
   // "from within") so incidental phrasing like "originated from within the
   // model context" never matches; FreeTierError is the structured class seen
   // live in Zen response bodies (collectMessageParts covers name/code/type).
-  if (/from within opencode|used from within|freetiererror/i.test(message)) return false;
+  if (message && /from within opencode|used from within|freetiererror/i.test(message)) return false;
 
-  const record = asRecord(error);
-  const data = asRecord(record['data']);
-  // Provider-marked retryable (SDK ApiError.data.isRetryable) is transient,
-  // whatever the status code. Explicit false defers to the checks below.
-  if (record['isRetryable'] === true || data['isRetryable'] === true) return true;
+  const status = readStatusCode(error);
+  if (typeof status === 'number' && status >= 400 && status < 500) {
+    if (status !== 401 && status !== 402 && status !== 408 && status !== 429) {
+      return false;
+    }
+  }
 
   // Genuine auth failures must surface immediately: a misconfigured key
   // should not burn the full backoff. The issue-#5 mislabeled billing case
   // ("Insufficient balance"/CreditsError) never carries these strings, so
-  // it still retries. Placed after isRetryable so a provider-explicit
-  // retryable flag keeps winning (upstream-faithful).
-  if (/invalid[_\s]?api[_\s]?key|unauthorized|authentication (failed|error)|api key (expired|invalid|incorrect)/i.test(message)) return false;
+  // it still retries.
+  if (message && /invalid[_\s]?api[_\s]?key|unauthorized|authentication (failed|error)|api key (expired|invalid|incorrect)/i.test(message)) return false;
+
+  const record = asRecord(error);
+  const data = asRecord(record['data']);
+  // Provider-marked retryable (SDK ApiError.data.isRetryable) is transient,
+  // whatever the status code (unless filtered out by 4xx / auth check above).
+  // Explicit false defers to the checks below.
+  if (record['isRetryable'] === true || data['isRetryable'] === true) return true;
 
   const transientSignatures: RegExp[] = [
     /insufficient balance/i,
@@ -206,31 +213,18 @@ export function isTransientUpstreamError(error: unknown): boolean {
     /retry your request/i,
     /resource exhausted/i,
     /(?:currently|temporarily) at capacity/i,
+    /^\s*endpoint is unavailable\.?\s*$/i,
   ];
-  if (transientSignatures.some((re) => re.test(message))) return true;
 
-  // Upstream errors arrive as "<status>: {json}" strings; SDK errors may also
-  // carry a numeric status on the object itself. Only accept a leading
-  // "<status>:" prefix — a loose \b(\d{3}): match misfires on embedded
-  // numbers like "retry after 300: ...".
-  const recordStatus: unknown = record['statusCode'] ?? data['status'];
-  let status: number | null = typeof recordStatus === 'number' ? recordStatus : null;
-  if (typeof status !== 'number') {
-    const statusCandidates: string[] = [];
-    const msg: unknown = record['message'];
-    const dataMsg: unknown = data['message'];
-    if (typeof msg === 'string') statusCandidates.push(msg);
-    if (typeof dataMsg === 'string') statusCandidates.push(dataMsg);
-    for (const candidate of statusCandidates) {
-      const prefixMatch = candidate.match(/^\s*(\d{3})\s*:/);
-      if (prefixMatch?.[1]) {
-        status = Number(prefixMatch[1]);
-        break;
-      }
-    }
-  }
+  const msgParts: string[] = [];
+  if (message) msgParts.push(message);
+  if (typeof record['message'] === 'string' && record['message'] !== message) msgParts.push(record['message']);
+  if (typeof data['message'] === 'string' && data['message'] !== message) msgParts.push(data['message']);
+
+  if (msgParts.some((text) => transientSignatures.some((re) => re.test(text)))) return true;
+
   if (typeof status === 'number') {
-    if (status === 401 || status === 402 || status === 429) return true;
+    if (status === 401 || status === 402 || status === 408 || status === 429) return true;
     if (status >= 500) return true;
   }
   return false;

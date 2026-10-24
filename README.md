@@ -25,6 +25,7 @@ Turn a local [OpenCode](https://opencode.ai) runtime into an OpenAI-, Anthropic-
 | 🔑 **Multi-key auth** | `API_KEY` + `OPENCODE_API_KEYS` merge; `Bearer` or `x-api-key`; empty skips auth |
 | 🔀 **Fallback proxy** | free-limit 429-only `OPENCODE_UPSTREAM_PROXIES` rotation |
 | 📡 **Streaming** | SSE for Chat, Responses, Messages, Interactions |
+| 🔄 **Continuation idempotency** | Scoped `Idempotency-Key` replay for `/v1/responses` and `/v1/interactions` |
 | 🧠 **Reasoning control** | `reasoning_effort` / `reasoning: {"effort": "high"}` |
 | 🐳 **Docker deploy** | One-command with auto backend |
 | 🛡️ **Tool safety** | Disabled by default |
@@ -141,13 +142,13 @@ Use each client's native endpoint; cross-protocol conversion is best-effort — 
 
 ### Model name formats
 
-Formats: `opencode/big-pickle`, `gpt5-nano` (auto-resolved) and `opencode/gpt5-nano` — see [API Reference](./docs/api-reference.md).
+Formats: `opencode/big-pickle`, `gpt5-nano` (auto-resolved) and `opencode/gpt5-nano` — see [API Reference](./docs/api-reference.md). When a requested model is not found on the upstream provider, the proxy fails fast with HTTP 404 (`model_not_found`) and returns `available_models` without waiting on downstream request queues.
 
 ---
 
 ## 🔧 Troubleshooting
 
-Hangs: try `OPENCODE_USE_ISOLATED_HOME=false`. Missing model: check `/v1/models`. No reasoning: use Responses API with `stream: true` + `reasoning.effort`.
+Hangs: try `OPENCODE_USE_ISOLATED_HOME=false`. Missing model: check `/v1/models` (requests for unknown models fail fast with HTTP 404 `model_not_found`). No reasoning: use Responses API with `stream: true` + `reasoning.effort`.
 
 > 📖 Full guide: [Troubleshooting](./docs/troubleshooting.md)
 
