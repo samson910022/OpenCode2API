@@ -102,10 +102,11 @@ describe('Pure HTTP Error Classifier (classifyHttpError)', () => {
 
         const anthropicRes = classifyHttpError({ type: 'entity.too.large', status: 413 }, '/v1/messages');
         expect(anthropicRes.status).toBe(413);
+        expect(anthropicRes.body.error.type).toBe('request_too_large');
         expect(anthropicRes.body).toEqual({
             type: 'error',
             error: {
-                type: 'invalid_request_error',
+                type: 'request_too_large',
                 message: 'Request body exceeds the maximum permitted size',
                 code: 'entity_too_large'
             }
@@ -569,10 +570,11 @@ describe('Terminal Express Error Handler with Supertest', () => {
             .post('/v1/messages')
             .send({});
         expect(messagesRes.status).toBe(413);
+        expect(messagesRes.body.error.type).toBe('request_too_large');
         expect(messagesRes.body).toEqual({
             type: 'error',
             error: {
-                type: 'invalid_request_error',
+                type: 'request_too_large',
                 message: 'Request body exceeds the maximum permitted size',
                 code: 'entity_too_large'
             }

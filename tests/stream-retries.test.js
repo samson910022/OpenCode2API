@@ -150,6 +150,15 @@ describe('isTransientUpstreamError', () => {
         expect(isTransientUpstreamError(new Error('Endpoint is unavailable.'))).toBe(true);
         expect(isTransientUpstreamError({ message: 'Some other error: Endpoint is unavailable. Check endpoint' })).toBe(false);
     });
+
+    test('enforces status code and auth filters before isRetryable flag', () => {
+        expect(isTransientUpstreamError({ statusCode: 400, isRetryable: true })).toBe(false);
+        expect(isTransientUpstreamError({ statusCode: 404, isRetryable: true })).toBe(false);
+        expect(isTransientUpstreamError({ statusCode: 401, message: 'Invalid API key', isRetryable: true })).toBe(false);
+        expect(isTransientUpstreamError({ statusCode: 408, isRetryable: true })).toBe(true);
+        expect(isTransientUpstreamError({ statusCode: 429, isRetryable: true })).toBe(true);
+        expect(isTransientUpstreamError({ statusCode: 503 })).toBe(true);
+    });
 });
 
 describe('Streaming Retries on 503 Transient Error', () => {

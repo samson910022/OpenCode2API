@@ -163,12 +163,6 @@ export function isTransientUpstreamError(error: unknown): boolean {
   // live in Zen response bodies (collectMessageParts covers name/code/type).
   if (message && /from within opencode|used from within|freetiererror/i.test(message)) return false;
 
-  const record = asRecord(error);
-  const data = asRecord(record['data']);
-  // Provider-marked retryable (SDK ApiError.data.isRetryable) is transient,
-  // whatever the status code. Explicit false defers to the checks below.
-  if (record['isRetryable'] === true || data['isRetryable'] === true) return true;
-
   const status = readStatusCode(error);
   if (typeof status === 'number' && status >= 400 && status < 500) {
     if (status !== 401 && status !== 402 && status !== 408 && status !== 429) {
@@ -179,9 +173,15 @@ export function isTransientUpstreamError(error: unknown): boolean {
   // Genuine auth failures must surface immediately: a misconfigured key
   // should not burn the full backoff. The issue-#5 mislabeled billing case
   // ("Insufficient balance"/CreditsError) never carries these strings, so
-  // it still retries. Placed after isRetryable so a provider-explicit
-  // retryable flag keeps winning (upstream-faithful).
+  // it still retries.
   if (message && /invalid[_\s]?api[_\s]?key|unauthorized|authentication (failed|error)|api key (expired|invalid|incorrect)/i.test(message)) return false;
+
+  const record = asRecord(error);
+  const data = asRecord(record['data']);
+  // Provider-marked retryable (SDK ApiError.data.isRetryable) is transient,
+  // whatever the status code (unless filtered out by 4xx / auth check above).
+  // Explicit false defers to the checks below.
+  if (record['isRetryable'] === true || data['isRetryable'] === true) return true;
 
   const transientSignatures: RegExp[] = [
     /insufficient balance/i,

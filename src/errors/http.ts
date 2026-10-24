@@ -4,7 +4,7 @@ import { asRecord } from '../utils/guards.js';
 export interface AnthropicHttpErrorBody {
   type: 'error';
   error: {
-    type: 'invalid_request_error' | 'api_error';
+    type: 'invalid_request_error' | 'api_error' | 'request_too_large';
     message: string;
     code?: string;
   };
@@ -79,9 +79,9 @@ export function classifyHttpError(err: unknown, path?: string): ClassifiedHttpEr
   }
 
   const isAnthropic = isAnthropicMessagesPath(path);
-  const errorType = status >= 500
-    ? (isAnthropic ? 'api_error' : 'server_error')
-    : 'invalid_request_error';
+  const errorType = isAnthropic
+    ? (status === 413 ? 'request_too_large' : status >= 500 ? 'api_error' : 'invalid_request_error')
+    : (status >= 500 ? 'server_error' : 'invalid_request_error');
   const body: AnthropicHttpErrorBody | OpenAiHttpErrorBody = isAnthropic
     ? {
         type: 'error',
