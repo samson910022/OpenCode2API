@@ -47,6 +47,9 @@ import { buildEffectiveApiKeys, createApiKeyVerifier } from './auth/keys.js';
 import { defaultTranslatorRegistry } from './converters/registry.js';
 import { ensureTranslatorsRegistered } from './converters/wire.js';
 import { isAnthropicMessagesPath } from './errors/http.js';
+import { createIdempotencyMiddleware } from './idempotency/middleware.js';
+import { IdempotencyRegistry } from './idempotency/registry.js';
+import { makeId } from './converters/json.js';
 
 // P4: thin re-exports to preserve original import paths
 // (tests/env-alias.test.js, stream-hardening.test.js import these from '../src/proxy.js').
@@ -130,7 +133,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     cors({
       origin: '*',
       methods: ['GET', 'POST', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'anthropic-version'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'anthropic-version', 'Idempotency-Key'],
     }),
   );
 
@@ -177,6 +180,17 @@ export function createApp(config: ProxyConfig): CreateAppResult {
 
   app.use(bodyParser.json({ limit: '50mb' }));
   app.use(bodyParser.urlencoded({ limit: '1mb', extended: false }));
+
+  // Request bodies and the authenticated key identity are now available. The
+  // ledger is per app instance and stores only hashed scope/key material.
+  const idempotencyRegistry = new IdempotencyRegistry();
+  app.use(createIdempotencyMiddleware({
+    registry: idempotencyRegistry,
+    configuredKeys: apiKeyVerifier.keys,
+    matchedKeyIndex: (req) => apiKeyVerifier.matchedIndex(
+      req as unknown as { headers: { authorization?: unknown; 'x-api-key'?: unknown } },
+    ),
+  }));
 
   const PROVIDERS_CACHE_TTL_MS = 30_000;
   let cachedProvidersList: ProviderInfo[] | null = null;
@@ -336,10 +350,12 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     });
     return calls.slice(-RESPONSE_TOOL_CALL_STATE_LIMIT);
   };
-  const getResponseState = (responseId: unknown): ResponseStateEntry | null => {
+  const getResponseState = (responseId: unknown, tenantId: string): ResponseStateEntry | null => {
     if (typeof responseId !== 'string') return null;
     const state = responseState.get(responseId);
     if (!state) return null;
+    // Pre-tenant entries are legacy state and are claimable only by unauthenticated callers.
+    if (state.tenantId === undefined ? tenantId !== 'anonymous' : state.tenantId !== tenantId) return null;
     if (state.expiresAt <= Date.now()) {
       responseState.delete(responseId);
       pendingExpiredResponseSessionIds.add(state.sessionId);
@@ -351,8 +367,9 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     responseId: unknown,
     sessionId: unknown,
     model: unknown,
-    toolCalls: unknown = [],
-    checkpointId: unknown = undefined,
+    toolCalls: unknown,
+    checkpointId: unknown,
+    tenantId: string,
   ): boolean => {
     if (
       !responseId ||
@@ -364,6 +381,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     ) return false;
     responseState.set(responseId, {
       sessionId,
+      tenantId,
       checkpointId,
       model: typeof model === 'string' ? model : String(model ?? ''),
       expiresAt: Date.now() + RESPONSE_STATE_TTL_MS,
@@ -1024,10 +1042,19 @@ export function createApp(config: ProxyConfig): CreateAppResult {
         toolOverrides,
         requestTimeoutMs,
         forbidThinkBlock = false,
+        signal,
+        requireTerminalCompletion = false,
       } = options;
       return async (): Promise<Record<string, unknown> | null> => {
         if (mode !== 'required') return null;
         if (!requiredTool) return null;
+        const assertNotAborted = (): void => {
+          if (signal?.aborted) {
+            const error = new Error('Request aborted');
+            error.name = 'AbortError';
+            throw error;
+          }
+        };
         const forcedPromptParams: { path: { id: string }; body: Record<string, unknown> } = {
           path: { id: sessionId },
           body: {
@@ -1046,8 +1073,35 @@ export function createApp(config: ProxyConfig): CreateAppResult {
         if (forcedToolOverrides) {
           forcedPromptParams.body['tools'] = forcedToolOverrides;
         }
+        assertNotAborted();
+        options.assertCanPrompt?.();
+        const forcedMessageId = options.beforePrompt ? makeId('msg_') : null;
+        if (forcedMessageId) {
+          forcedPromptParams.body['messageID'] = forcedMessageId;
+          options.beforePrompt?.(sessionId, forcedMessageId);
+        }
+        assertNotAborted();
+        options.assertCanPrompt?.();
         await promptWithTimeout(forcedPromptParams, requestTimeoutMs);
-        return pollForAssistantResponse(sessionId, requestTimeoutMs) as Promise<Record<string, unknown>>;
+        assertNotAborted();
+        if (!forcedMessageId) {
+          return pollForAssistantResponse(
+            sessionId,
+            requestTimeoutMs,
+            undefined,
+            signal,
+            undefined,
+            requireTerminalCompletion,
+          ) as Promise<Record<string, unknown>>;
+        }
+        return pollForAssistantResponse(
+          sessionId,
+          requestTimeoutMs,
+          undefined,
+          signal,
+          forcedMessageId,
+          requireTerminalCompletion,
+        ) as Promise<Record<string, unknown>>;
       };
     };
 

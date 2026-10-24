@@ -233,10 +233,10 @@ describe('POST /v1/responses backend plain-object error', () => {
                 responseHeaders: { 'retry-after-ms': '10' }
             }
         };
-        const buildApp = (retries) => createApp({
+        const buildApp = (retries, requestTimeoutMs = 5000) => createApp({
             PORT: 10000, API_KEY: 'test-key',
             OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
-            REQUEST_TIMEOUT_MS: 5000, DISABLE_TOOLS: true, DEBUG: false,
+            REQUEST_TIMEOUT_MS: requestTimeoutMs, DISABLE_TOOLS: true, DEBUG: false,
             RETRY_MAX_RETRIES: retries
         }).app;
 
@@ -265,6 +265,27 @@ describe('POST /v1/responses backend plain-object error', () => {
                 .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
             expect(res.statusCode).toBe(502);
             expect(sdkMocks.sessionCreate.mock.calls.length).toBe(1);
+        });
+
+        test('chat retries a transient assistant error without finish immediately when no key is supplied', async () => {
+            sdkMocks.sessionMessages
+                .mockResolvedValueOnce([
+                    { info: { role: 'assistant', error: fastTransientError }, parts: [] }
+                ])
+                .mockResolvedValue([
+                    { info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'recovered without waiting' }] }
+                ]);
+            const chatApp = buildApp(1, 500);
+            const startedAt = Date.now();
+            const res = await request(chatApp).post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'opencode/kimi-k2.5', messages: [{ role: 'user', content: 'hi' }] });
+
+            expect(res.statusCode).toBe(200);
+            expect(JSON.stringify(res.body)).toContain('recovered without waiting');
+            expect(sdkMocks.sessionMessages).toHaveBeenCalledTimes(2);
+            expect(sdkMocks.sessionCreate.mock.calls.length).toBe(2);
+            expect(Date.now() - startedAt).toBeLessThan(400);
         });
 
         test('RETRY_MAX_RETRIES clamps to upstream ceiling of 5', async () => {

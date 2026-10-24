@@ -91,14 +91,16 @@ jest.unstable_mockModule('https', () => ({
 
 const { createApp } = await import('../src/proxy.js');
 
-function createTestApp() {
+function createTestApp(overrides = {}) {
     return createApp({
         PORT: 10000,
         API_KEY: '',
+        API_KEYS: [],
         OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
         REQUEST_TIMEOUT_MS: 1000,
         DISABLE_TOOLS: true,
         DEBUG: false,
+        ...overrides,
     });
 }
 
@@ -239,7 +241,7 @@ describe('checkpoint-based continuation forks', () => {
         });
         sdkMocks.sessionDelete.mockRejectedValueOnce(new Error('temporary delete failure'));
 
-        expect(ctx.getResponseState('expired-lookup')).toBeNull();
+        expect(ctx.getResponseState('expired-lookup', 'anonymous')).toBeNull();
         expect(ctx.responseState.has('expired-lookup')).toBe(false);
         await ctx.sweepResponseState();
         expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
@@ -251,6 +253,45 @@ describe('checkpoint-based continuation forks', () => {
         await ctx.sweepResponseState();
         expect(sdkMocks.sessionDelete).toHaveBeenCalledTimes(2);
         expect(sdkMocks.sessionDelete).toHaveBeenNthCalledWith(2, { path: { id: 'shared-expired-session' } });
+    });
+
+    test.each([
+        ['/v1/responses', 'previous_response_id', { model: 'opencode/kimi-k2.5', input: 'tenant turn' }, 'invalid_previous_response_id'],
+        ['/v1beta/interactions', 'previous_interaction_id', { model: 'opencode/kimi-k2.5', input: 'tenant turn' }, 'invalid_previous_interaction_id'],
+    ])('%s continuation state is tenant-owned, while the owning tenant can continue it', async (path, previousKey, basePayload, invalidCode) => {
+        const { app, ctx } = createTestApp({ API_KEYS: ['tenant-a-secret', 'tenant-b-secret'] });
+        const call = (tenant, body) => request(app).post(path)
+            .set('Authorization', `Bearer ${tenant}`)
+            .send(body);
+        const seeded = await call('tenant-a-secret', basePayload);
+        expect(seeded.statusCode).toBe(200);
+        const state = ctx.responseState.get(seeded.body.id);
+        expect(state.tenantId).toMatch(/^key:[a-f0-9]{64}$/);
+        expect(state.tenantId).not.toContain('tenant-a-secret');
+
+        const continueBody = { input: 'same-tenant follow-up', [previousKey]: seeded.body.id };
+        if (path === '/v1beta/interactions') continueBody.model = 'opencode/kimi-k2.5';
+        const crossTenant = await call('tenant-b-secret', continueBody);
+        expect(crossTenant.statusCode).toBe(400);
+        expect(crossTenant.body.error.code).toBe(invalidCode);
+        expect(sdkMocks.sessionFork).not.toHaveBeenCalled();
+
+        const sameTenant = await call('tenant-a-secret', continueBody);
+        expect(sameTenant.statusCode).toBe(200);
+        expect(sdkMocks.sessionFork).toHaveBeenCalledTimes(1);
+    });
+
+    test('legacy continuation state without tenant belongs only to anonymous callers', () => {
+        const { ctx } = createTestApp();
+        const legacyState = {
+            sessionId: 'legacy-session',
+            model: 'opencode/kimi-k2.5',
+            expiresAt: Date.now() + 60_000,
+        };
+        ctx.responseState.set('legacy-state', legacyState);
+
+        expect(ctx.getResponseState('legacy-state', 'anonymous')).toBe(legacyState);
+        expect(ctx.getResponseState('legacy-state', 'key:authenticated-digest')).toBeNull();
     });
 
     test('retries deleting a continuation child after its first cleanup attempt fails', async () => {

@@ -2573,13 +2573,14 @@ describe('Proxy OpenAI API', () => {
     });
 
     test('non-streaming retries once on transient upstream CreditsError and recovers', async () => {
-        // Same mislabeled billing failure, polling path: first snapshot reports the
-        // CreditsError with no usable content, the retry succeeds.
+        // Same mislabeled billing failure, polling path: the first snapshot is
+        // explicitly terminal despite having no usable content, then the retry succeeds.
         sdkMocks.sessionMessages.mockReset();
         sdkMocks.sessionMessages
             .mockResolvedValueOnce([{
                 info: {
                     role: 'assistant',
+                    finish: 'stop',
                     error: { name: 'CreditsError', data: { message: '401: Insufficient balance', responseHeaders: { 'retry-after-ms': '10' } } }
                 },
                 parts: []

@@ -15,6 +15,8 @@ export interface ResponseToolCallState {
 /** Stateful Responses continuation entry (previous_response_id). */
 export interface SessionInfo {
   sessionId: string;
+  /** Hashed API-key tenant owner; absent only on legacy in-memory entries. */
+  tenantId?: string;
   /** Completed assistant message ID used as the fork checkpoint for continuations. */
   checkpointId?: string;
   model: string;

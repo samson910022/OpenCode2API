@@ -48,6 +48,12 @@ export interface ForcedToolCallRequesterOptions {
   toolOverrides: Record<string, boolean> | null;
   requestTimeoutMs: number;
   forbidThinkBlock?: boolean;
+  signal?: AbortSignal;
+  requireTerminalCompletion?: boolean;
+  /** Checked immediately before the forced prompt is submitted. */
+  assertCanPrompt?: () => void;
+  /** Called immediately before the forced prompt can reach the backend. */
+  beforePrompt?: (sessionId: string, userMessageId: string) => void;
 }
 
 export interface CollectorHandle {
@@ -59,7 +65,17 @@ export interface CollectorHandle {
     intervalMs?: number,
     signal?: AbortSignal,
     expectedCurrentUserMessageId?: string,
-  ) => Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[]; assistantMessageId?: string; partial?: boolean; complete?: boolean }>;
+    requireTerminalCompletion?: boolean,
+  ) => Promise<{
+    content: string;
+    reasoning: string;
+    error: unknown;
+    toolParts: unknown[];
+    assistantMessageId?: string;
+    userMessageId?: string;
+    partial?: boolean;
+    complete?: boolean;
+  }>;
   collectFromEvents: (
     sessionId: string,
     timeoutMs: number,
@@ -114,8 +130,8 @@ export interface AppContext {
   resolveRequestedModel: (requestedModel: unknown) => Promise<ResolvedModel>;
   logDebug: (...args: unknown[]) => void;
   responseState: Map<string, ResponseStateEntry>;
-  getResponseState: (responseId: unknown) => ResponseStateEntry | null;
-  storeResponseState: (responseId: unknown, sessionId: unknown, model: unknown, toolCalls?: unknown, checkpointId?: unknown) => boolean;
+  getResponseState: (responseId: unknown, tenantId: string) => ResponseStateEntry | null;
+  storeResponseState: (responseId: unknown, sessionId: unknown, model: unknown, toolCalls: unknown, checkpointId: unknown, tenantId: string) => boolean;
   sweepResponseState: () => Promise<void>;
   TOOL_MODE: ToolModeSet;
   TOOL_GUARD_MESSAGE: string;

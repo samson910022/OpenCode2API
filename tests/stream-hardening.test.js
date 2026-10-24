@@ -1794,7 +1794,7 @@ describe('collector continuation turn correlation', () => {
 });
 
 describe('collector polling finish classification', () => {
-    const run = (snapshots, timeoutMs = 1000, expectedCurrentUserMessageId) => {
+    const run = (snapshots, timeoutMs = 1000, expectedCurrentUserMessageId, requireTerminalCompletion = false) => {
         let call = 0;
         const client = {
             session: {
@@ -1806,7 +1806,7 @@ describe('collector polling finish classification', () => {
             }
         };
         return createCollector({ client, logDebug: () => {} }).pollForAssistantResponse(
-            'collector-session', timeoutMs, 1, undefined, expectedCurrentUserMessageId,
+            'collector-session', timeoutMs, 1, undefined, expectedCurrentUserMessageId, requireTerminalCompletion,
         );
     };
     const assistant = (info, text) => [{ info: { role: 'assistant', ...info }, parts: [{ type: 'text', text }] }];
@@ -1831,6 +1831,42 @@ describe('collector polling finish classification', () => {
         const result = await run([assistant({ time: { completed: 1 } }, 'Answer without a finish reason.')]);
         expect(result.content).toBe('Answer without a finish reason.');
         expect(result.complete).toBe(true);
+    });
+
+    test('legacy polling returns an assistant error immediately without a finish reason', async () => {
+        let calls = 0;
+        const client = {
+            session: {
+                messages: async () => {
+                    calls += 1;
+                    return assistant({ error: { name: 'CreditsError', data: { message: '429: retry' } } }, '');
+                },
+            },
+        };
+        const result = await createCollector({ client, logDebug: () => {} })
+            .pollForAssistantResponse('collector-session', 1000, 1);
+
+        expect(result.error).toMatchObject({ name: 'CreditsError' });
+        expect(result.complete).toBe(true);
+        expect(calls).toBe(1);
+    });
+
+    test('strict polling keeps an exact-turn assistant error incomplete without a finish reason', async () => {
+        const result = await run([
+            assistant({
+                id: 'assistant-incomplete-error',
+                parentID: 'msg-current-turn',
+                error: { name: 'ProviderError', message: 'still running' },
+            }, 'partial answer'),
+        ], 30, 'msg-current-turn', true);
+
+        expect(result).toMatchObject({
+            assistantMessageId: 'assistant-incomplete-error',
+            userMessageId: 'msg-current-turn',
+            error: { name: 'ProviderError' },
+            partial: true,
+        });
+        expect(result.complete).toBeUndefined();
     });
 
     test('returns a timeout partial with partial: true', async () => {

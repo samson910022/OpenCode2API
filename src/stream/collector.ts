@@ -222,7 +222,17 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     intervalMs: number = DEFAULT_POLL_INTERVAL_MS,
     signal?: AbortSignal,
     expectedCurrentUserMessageId?: string,
-  ): Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[]; assistantMessageId?: string; partial?: boolean; complete?: boolean }> {
+    requireTerminalCompletion: boolean = false,
+  ): Promise<{
+    content: string;
+    reasoning: string;
+    error: unknown;
+    toolParts: unknown[];
+    assistantMessageId?: string;
+    userMessageId?: string;
+    partial?: boolean;
+    complete?: boolean;
+  }> {
     // Drift signal only: backend-minted ses_* IDs should match the canonical
     // shape (see src/session/ids.ts). Never block on mismatch — the schema
     // itself accepts any startsWith("ses") value.
@@ -234,7 +244,14 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
     // the text part only afterwards, so returning on the first non-empty snapshot
     // truncates the answer to the reasoning alone. Keep the partial around purely as
     // a timeout fallback and otherwise wait for the message to actually finish.
-    let lastPartial: { content: string; reasoning: string; error: null; toolParts: unknown[] } | null = null;
+    let lastPartial: {
+      content: string;
+      reasoning: string;
+      error: unknown;
+      toolParts: unknown[];
+      assistantMessageId?: string;
+      userMessageId?: string;
+    } | null = null;
     while (Date.now() - startedAt < timeoutMs) {
       if (signal?.aborted) throw createAbortError();
       const remainingMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
@@ -262,7 +279,11 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
            const activeToolParts = toolParts.filter((part) => isActiveToolPart(part));
            const awaitingTool = finish === 'tool' || finish === 'tool-calls' || activeToolParts.length > 0;
            const finished = info['finish'] != null && !awaitingTool;
-           const done = Boolean(finished || (!awaitingTool && time['completed']) || error);
+            const done = Boolean(
+              finished ||
+                (!awaitingTool && time['completed']) ||
+                (!requireTerminalCompletion && error),
+            );
 
           if (toolParts.length > 0) {
             logDebug('Polling found tool parts', {
@@ -295,17 +316,28 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
               error: error ? (asRecord(error)['name'] as unknown) : null,
             });
             const assistantMessageId = readInfoMessageId(info);
+            const userMessageId = typeof info['parentID'] === 'string' ? info['parentID'] : undefined;
             return {
               content,
               reasoning,
               error,
               toolParts,
               ...(assistantMessageId ? { assistantMessageId } : {}),
+              ...(userMessageId ? { userMessageId } : {}),
               complete: true,
             };
           }
-          if (content || reasoning || toolParts.length > 0) {
-            lastPartial = { content, reasoning, error: null, toolParts };
+          if (content || reasoning || toolParts.length > 0 || error != null) {
+            const assistantMessageId = readInfoMessageId(info);
+            const userMessageId = typeof info['parentID'] === 'string' ? info['parentID'] : undefined;
+            lastPartial = {
+              content,
+              reasoning,
+              error,
+              toolParts,
+              ...(assistantMessageId ? { assistantMessageId } : {}),
+              ...(userMessageId ? { userMessageId } : {}),
+            };
           }
           break;
         }
@@ -1097,6 +1129,9 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
           content: finalContent,
           reasoning: finalReasoning,
           ...(assistantMessageId ? { assistantMessageId } : {}),
+          ...(assistantMessageId && expectedCurrentUserMessageId !== undefined
+            ? { userMessageId: expectedCurrentUserMessageId }
+            : {}),
           ...extra,
         };
         // `authoritative` means reconciliation repaired/replaced live deltas, or

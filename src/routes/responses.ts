@@ -48,6 +48,7 @@ import type { ResponseToolCallState } from '../types/backend.js';
 import type { FinalToolCall } from '../tool-runtime/parser.js';
 import type { AuthoritativeStreamSource } from '../tool-runtime/stream-source.js';
 import { asRecord, toErrorMessage } from '../utils/guards.js';
+import { getContinuationTenantId, getIdempotencyControl } from '../idempotency/middleware.js';
 
 function readDataMessage(e: unknown): string {
   const r = asRecord(e);
@@ -220,9 +221,22 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
   } = ctx;
 
   app.post('/v1/responses', async (req: Request, res: Response): Promise<void> => {
+     const idempotency = getIdempotencyControl(req);
      let responsesKeepalive: ReturnType<typeof setInterval> | null = null;
      let responsesResClosed: Promise<boolean> | null = null;
      const responsesAbortController = new AbortController();
+     responsesResClosed = new Promise<boolean>((resolve) =>
+       res.once('close', () => {
+         const disconnected = !(res as unknown as { writableFinished?: boolean }).writableFinished;
+         if (disconnected) responsesAbortController.abort();
+         resolve(disconnected);
+       }),
+     );
+     const assertResponsesCanPrompt = (): void => {
+       if (responsesAbortController.signal.aborted || res.destroyed || res.writableEnded) {
+         throw new Error('Client disconnected');
+       }
+     };
 
     const stopResponsesKeepalive = (): void => {
       if (responsesKeepalive) {
@@ -239,8 +253,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
     let fallbackToProxy = false;
     let fallbackServed = false;
     let ownedResponsesSessionId: string | null = null;
+    let responsesCleanupScheduled = false;
     let responsesStreamState: ResponsesStreamState | null = null;
-    const cleanupOwnedResponsesSession = async (): Promise<void> => {
+    const cleanupOwnedResponsesSessionNow = async (): Promise<void> => {
       const ownedSessionId = ownedResponsesSessionId;
       if (!ownedSessionId) return;
       try {
@@ -249,6 +264,19 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       } catch (error: unknown) {
         logDebug('Failed to cleanup owned responses session', { sessionId: ownedSessionId, error: toErrorMessage(error) });
       }
+    };
+    const cleanupOwnedResponsesSession = async (): Promise<void> => {
+      if (!ownedResponsesSessionId) return;
+      if (idempotency?.submitted) {
+        // Keep a possibly submitted child available for unknown-outcome
+        // reconciliation. Delete only after the full wire response is cached.
+        if (!responsesCleanupScheduled) {
+          responsesCleanupScheduled = true;
+          idempotency.onCompleted(() => cleanupOwnedResponsesSessionNow());
+        }
+        return;
+      }
+      await cleanupOwnedResponsesSessionNow();
     };
     const switchToProxyBundle = (): boolean => {
       if (!proxyClient) return false;
@@ -275,7 +303,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             ? previousModel
             : 'unknown';
       const state: ResponsesStreamState = {
-        id: `resp_${crypto.randomUUID()}`,
+        id: idempotency?.publicId ?? `resp_${crypto.randomUUID()}`,
         createdAt: Math.floor(Date.now() / 1000),
         model: initialModel,
         tools: requestTools,
@@ -312,27 +340,22 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       };
       state.adoptResolvedModel = (resolvedModel: string) => {
         state.model = resolvedModel;
-        state.emitCreated();
+        if (!idempotency?.reconciling) state.emitCreated();
       };
+      idempotency?.setPublicId(state.id);
       responsesStreamState = state;
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       res.setHeader('X-Accel-Buffering', 'no');
       const flushHeaders = (res as unknown as { flushHeaders?: unknown }).flushHeaders;
-      if (typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
-      responsesKeepalive = setInterval(() => {
-        if (!res.destroyed && !res.writableEnded) res.write(': heartbeat\n');
-      }, 15000);
-      responsesResClosed = new Promise<boolean>((resolve) =>
-        res.once('close', () => {
-          if (!res.writableEnded) {
-            responsesAbortController.abort();
-            resolve(true);
-          }
-        }),
-      );
-      return state;
+      if (!idempotency?.reconciling && typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
+      if (!idempotency?.reconciling) {
+        responsesKeepalive = setInterval(() => {
+          if (!res.destroyed && !res.writableEnded) res.write(': heartbeat\n');
+        }, 15000);
+      }
+       return state;
     };
     const getResponsesResClosed = (): Promise<boolean> | null => responsesResClosed;
     if (proxyPool.isEngaged()) switchToProxyBundle();
@@ -362,10 +385,12 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       const previousResponseId: unknown = body['previous_response_id'];
       const requestOpencodeConfig: unknown = body['opencode'];
 
+      const tenantId = getContinuationTenantId(req);
+      const store = body['store'] !== false;
       const previousState =
-        typeof previousResponseId === 'string' && previousResponseId ? getResponseState(previousResponseId) : null;
+        typeof previousResponseId === 'string' && previousResponseId ? getResponseState(previousResponseId, tenantId) : null;
       if (stream) responsesStreamState = initializeResponsesStream(model, previousState?.model, tools, parallelToolCalls);
-      if (previousResponseId && (!previousState || !previousState.checkpointId)) {
+      if (!idempotency?.reconciling && previousResponseId && (!previousState || !previousState.checkpointId)) {
         rejectInvalidRequest('Invalid or expired previous_response_id', 'invalid_previous_response_id');
         return;
       }
@@ -641,12 +666,13 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       }
 
       const resolvedModel = (await withTimeout(
-        resolveRequestedModel(model ?? previousState?.model),
+        resolveRequestedModel(model ?? idempotency?.model ?? previousState?.model),
         REQUEST_TIMEOUT_MS,
         'resolve model',
       )) as unknown as { providerID: string; modelID: string };
       const pID = String(asRecord(resolvedModel)['providerID']);
       const mID = String(asRecord(resolvedModel)['modelID']);
+      idempotency?.setModel(`${pID}/${mID}`);
       if (responsesStreamState) responsesStreamState.adoptResolvedModel(`${pID}/${mID}`);
 
       await ensureBackend(config);
@@ -658,8 +684,14 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         // ignore
       }
 
-      let sessionId: string | null = null;
-      if (previousState) {
+      let sessionId: string | null = idempotency?.reconciling ? idempotency.childSessionId : null;
+      if (idempotency?.reconciling) {
+        // Unknown retries reuse the exact recorded child and never fork again.
+        if (!sessionId) throw new Error('Idempotency reconciliation is missing its child session');
+        // This is a request-owned child, not the parent continuation session.
+        // Keep it until the wire result is captured unless it becomes stored state.
+        ownedResponsesSessionId = sessionId;
+      } else if (previousState) {
         const forkRes = (await withTimeout(
           activeClient.session.fork({
             path: { id: previousState.sessionId },
@@ -774,8 +806,42 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           toolOverrides,
           requestTimeoutMs: REQUEST_TIMEOUT_MS,
           forbidThinkBlock: false,
+          signal: responsesAbortController.signal,
+          requireTerminalCompletion: Boolean(idempotency),
+          assertCanPrompt: assertResponsesCanPrompt,
+          ...(idempotency
+            ? {
+                beforePrompt: (forcedSessionId: string, userMessageId: string): void => {
+                  idempotency.markSubmitted(forcedSessionId, userMessageId, `${pID}/${mID}`);
+                },
+              }
+            : {}),
         });
       let requestForcedResponsesToolCall = makeForcedResponsesToolCallRequester();
+      const confirmForcedResponsesToolCall = (forcedResponse: Record<string, unknown>): void => {
+        if (!idempotency) return;
+        const assistantMessageId = forcedResponse['assistantMessageId'];
+        const userMessageId = forcedResponse['userMessageId'];
+        const hasActiveToolState = Array.isArray(forcedResponse['toolParts']) &&
+          (forcedResponse['toolParts'] as unknown[]).some((part) => {
+            const partRecord = asRecord(part);
+            const state = asRecord(partRecord['state']);
+            const status = state['status'] ?? partRecord['status'];
+            return partRecord['type'] === 'tool' && (status === 'pending' || status === 'running');
+          });
+        if (
+          forcedResponse['complete'] !== true ||
+          typeof assistantMessageId !== 'string' ||
+          !assistantMessageId ||
+          typeof idempotency.userMessageId !== 'string' ||
+          !idempotency.userMessageId ||
+          userMessageId !== idempotency.userMessageId ||
+          hasActiveToolState
+        ) {
+          throw new Error('Idempotency forced tool result is incomplete or does not identify the exact assistant turn');
+        }
+        idempotency.confirmResult(idempotency.userMessageId, assistantMessageId);
+      };
 
       const promptParams: { path: { id: string }; body: Record<string, unknown> } = {
         path: { id: sessionId as string },
@@ -788,7 +854,39 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           ...(top_p !== undefined ? { top_p } : {}),
         },
       };
-      promptParams.body.messageID = makeId('msg_');
+      promptParams.body.messageID = idempotency?.reconciling
+        ? idempotency.userMessageId
+        : makeId('msg_');
+      if (typeof promptParams.body.messageID !== 'string' || !promptParams.body.messageID) {
+        throw new Error('Idempotency reconciliation is missing its user message ID');
+      }
+      const hasConfirmedIdempotencyResult = (): boolean => Boolean(
+        idempotency?.resultConfirmed &&
+        typeof idempotency.confirmedAssistantMessageId === 'string' &&
+        idempotency.confirmedAssistantMessageId.trim(),
+      );
+      const assertIdempotencyResultConfirmed = (): void => {
+        if (idempotency?.submitted && !hasConfirmedIdempotencyResult()) {
+          throw new Error('Idempotency result is not confirmed for the exact assistant turn');
+        }
+      };
+      const isExactTerminalPoll = (result: unknown): boolean => {
+        const poll = asRecord(result);
+        return poll['complete'] === true &&
+          poll['partial'] !== true &&
+          typeof poll['assistantMessageId'] === 'string' &&
+          poll['assistantMessageId'].trim().length > 0 &&
+          typeof idempotency?.userMessageId === 'string' &&
+          poll['userMessageId'] === idempotency.userMessageId;
+      };
+      const confirmExactTerminalPoll = (result: unknown): void => {
+        if (!idempotency?.submitted) return;
+        if (!isExactTerminalPoll(result)) {
+          throw new Error('Idempotency result is incomplete or does not identify the exact assistant turn');
+        }
+        const poll = asRecord(result);
+        idempotency.confirmResult(idempotency.userMessageId as string, poll['assistantMessageId'] as string);
+      };
       // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
       const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
       if (promptToolOverrides) {
@@ -1031,7 +1129,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         // Intentional: buffer while any external tool contract is declared so tool
         // markup is never streamed before classification. Pure-text turns also batch.
         const shouldBufferExternalStream = externalToolRegistry.length > 0;
-        const deferVisibleOutput = shouldBufferExternalStream || hostedSearch.requested;
+        const deferVisibleOutput = shouldBufferExternalStream || hostedSearch.requested || Boolean(idempotency);
         let filterContentDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
         let filterReasoningDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
         let parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
@@ -1182,8 +1280,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             streamSearchToolParts = polled.toolParts;
           }
         };
-        let recoverySnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; partial?: boolean } | null = null;
-        let recoveryPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; partial?: boolean }> | null = null;
+        let recoverySnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; userMessageId?: string; partial?: boolean; complete?: boolean } | null = null;
+        let recoveryPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; userMessageId?: string; partial?: boolean; complete?: boolean }> | null = null;
         let currentAssistantMessageId: string | null = null;
         const isContinuation = Boolean(previousState?.sessionId);
         const hasRecoveryEvidence = (snapshot: { content: string; reasoning: string; toolParts?: unknown }): boolean =>
@@ -1192,14 +1290,17 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               snapshot.reasoning ||
               (Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0),
           );
-        const pollRecoverySnapshot = (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; partial?: boolean }> => {
+        const pollRecoverySnapshot = (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; userMessageId?: string; partial?: boolean; complete?: boolean }> => {
           if (!recoveryPromise) {
             recoveryPromise = activePollForAssistantResponse(
               sessionId as string,
               REQUEST_TIMEOUT_MS,
               undefined,
               responsesAbortController.signal,
-              isContinuation ? String(promptParams.body['messageID']) : undefined,
+              idempotency?.submitted
+                ? (idempotency.userMessageId ?? undefined)
+                : isContinuation ? String(promptParams.body['messageID']) : undefined,
+              Boolean(idempotency),
             );
           }
           return recoveryPromise;
@@ -1216,7 +1317,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             if (fallbackToProxy) switchToProxyBundle();
             await ensureActiveModel(activeClient, pID, mID).catch(() => {});
             const retriedSessionId = sessionId;
-            if (!isContinuation) {
+            if (!isContinuation && !idempotency?.submitted) {
               promptSubmitted = false;
               if (retriedSessionId && ownedResponsesSessionId === retriedSessionId) {
                 await cleanupOwnedResponsesSession();
@@ -1262,20 +1363,66 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             await sleep(computeRetryDelay(attempt - 1, lastStreamAttemptError));
           }
           try {
-            if (fallbackToProxy) {
+            if (idempotency?.reconciling) {
+              const reconciled = await activePollForAssistantResponse(
+                sessionId as string,
+                REQUEST_TIMEOUT_MS,
+                undefined,
+              responsesAbortController.signal,
+              idempotency.userMessageId ?? undefined,
+              true,
+            );
+              if (reconciled.error != null) {
+                if (isExactTerminalPoll(reconciled)) {
+                  confirmExactTerminalPoll(reconciled);
+                  throw normalizeBackendError(reconciled.error);
+                }
+                throw new Error('Idempotency reconciliation has no confirmed assistant result');
+              }
+              if (
+                !isExactTerminalPoll(reconciled)
+              ) {
+                throw new Error('Idempotency reconciliation has no confirmed assistant result');
+              }
+              confirmExactTerminalPoll(reconciled);
+              recoverySnapshot = reconciled;
+              currentAssistantMessageId = reconciled.assistantMessageId ?? null;
+              keepStreamToolParts(reconciled);
+              responsesStreamState?.emitCreated();
+              replaySnapshotText(reconciled.content, reconciled.reasoning);
+              collected = {
+                content: reconciled.content,
+                reasoning: reconciled.reasoning,
+                toolParts: reconciled.toolParts,
+                assistantMessageId: reconciled.assistantMessageId,
+                userMessageId: reconciled.userMessageId,
+                complete: reconciled.complete,
+                finish: 'stop',
+              };
+            } else if (fallbackToProxy) {
               // SSE subscribe ignores custom fetch (SDK gap): prompt through the
               // proxy bundle; the poll below fills content/reasoning.
-              if (!(isContinuation && promptSubmitted)) {
+              if (!((isContinuation || idempotency?.submitted) && promptSubmitted)) {
                 if (isContinuation) {
                   promptSubmitted = true;
                 }
+                if (idempotency) {
+                  idempotency.markSubmitted(
+                    sessionId as string,
+                    String(promptParams.body['messageID']),
+                    `${pID}/${mID}`,
+                  );
+                }
+                promptSubmitted = true;
+                assertResponsesCanPrompt();
                 const promptResult = await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
                 const promptInfo = asRecord(asRecord(asRecord(promptResult)['data'])['info']);
                 const promptMessageId = promptInfo['id'] ?? promptInfo['messageID'] ?? promptInfo['messageId'];
-                if (typeof promptMessageId === 'string' && promptMessageId) currentAssistantMessageId = promptMessageId;
+          if (typeof promptMessageId === 'string' && promptMessageId) currentAssistantMessageId = promptMessageId;
                 promptSubmitted = true;
               }
               const pres = await pollRecoverySnapshot();
+              if (idempotency?.submitted) confirmExactTerminalPoll(pres);
               if (pres.error != null) {
                 collected = { error: pres.error };
               } else if (pres.partial === true) {
@@ -1295,6 +1442,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
                   reasoning: pres.reasoning,
                   toolParts: pres.toolParts,
                   assistantMessageId: pres.assistantMessageId,
+                  userMessageId: pres.userMessageId,
+                  complete: pres.complete,
                 };
               }
             } else {
@@ -1305,21 +1454,31 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
                 DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
                 DEFAULT_EVENT_IDLE_TIMEOUT_MS,
                 responsesAbortController.signal,
-                isContinuation ? String(promptParams.body['messageID']) : undefined,
+                idempotency?.submitted
+                  ? (idempotency.userMessageId ?? undefined)
+                  : isContinuation ? String(promptParams.body['messageID']) : undefined,
               );
 
               const safeCollect = collectPromise.catch((err: unknown) => ({ __error: err }));
-              if (isContinuation && promptSubmitted) {
+              if ((isContinuation || idempotency?.submitted) && promptSubmitted) {
                 // Do NOT prompt again!
               } else {
-                if (isContinuation) {
+                if (isContinuation || idempotency) {
                   promptSubmitted = true;
                 }
+                if (idempotency) {
+                  idempotency.markSubmitted(
+                    sessionId as string,
+                    String(promptParams.body['messageID']),
+                    `${pID}/${mID}`,
+                  );
+                }
+                assertResponsesCanPrompt();
                 promptPromise = activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS)
                   .then((promptResult: unknown) => {
                     const promptInfo = asRecord(asRecord(asRecord(promptResult)['data'])['info']);
                     const promptMessageId = promptInfo['id'] ?? promptInfo['messageID'] ?? promptInfo['messageId'];
-                    if (typeof promptMessageId === 'string' && promptMessageId) currentAssistantMessageId = promptMessageId;
+                if (typeof promptMessageId === 'string' && promptMessageId) currentAssistantMessageId = promptMessageId;
                     promptSubmitted = true;
                   })
                   .catch((err: unknown) => {
@@ -1380,7 +1539,16 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             }
           }
           const nothingStreamed = !rawContent && !rawReasoning && streamedToolCalls.length === 0;
-          if (isContinuation && attemptError) {
+          if (idempotency?.submitted && attemptError) {
+            const recovered = await pollRecoverySnapshot();
+            confirmExactTerminalPoll(recovered);
+            if (recovered.error != null) throw normalizeBackendError(recovered.error);
+            recoverySnapshot = recovered;
+            currentAssistantMessageId = recovered.assistantMessageId ?? currentAssistantMessageId;
+            keepStreamToolParts(recovered);
+            collected = recovered;
+            attemptError = null;
+          } else if (isContinuation && attemptError) {
             throw normalizeBackendError(attemptError);
           }
           if (attemptError && nothingStreamed && attempt < maxAttempts && engageProxyFallback(attemptError)) {
@@ -1406,9 +1574,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         if (collectedR['error'] != null) {
           throw normalizeBackendError(collectedR['error']);
         }
-         const hasValidTerminal = Boolean(
-           collected &&
-           !collectedR['__error'] &&
+          const hasValidEventTerminal = Boolean(
+            collected &&
+            !collectedR['__error'] &&
            !collectedR['noData'] &&
            !collectedR['idleTimeout'] &&
            !collectedR['cut'] &&
@@ -1420,14 +1588,32 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
              streamedToolCalls.length > 0 ||
              content ||
              reasoning ||
-             collectedR['content'] ||
-             collectedR['reasoning']),
-         );
-         const recoverSnapshot = async (
-           fallbackError: unknown = null,
-         ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; partial?: boolean } | null> => {
+              collectedR['content'] ||
+              collectedR['reasoning']),
+          );
+          const hasValidConfirmedEventTerminal = Boolean(
+            hasValidEventTerminal &&
+            collectedR['finish'] === 'stop' &&
+            typeof collectedR['assistantMessageId'] === 'string' &&
+            collectedR['assistantMessageId'].trim().length > 0 &&
+            collectedR['userMessageId'] === idempotency?.userMessageId,
+          );
+          const hasValidTerminal = idempotency?.submitted
+            ? hasValidConfirmedEventTerminal || isExactTerminalPoll(collectedR)
+            : hasValidEventTerminal;
+          if (idempotency?.submitted && hasValidConfirmedEventTerminal) {
+            idempotency.confirmResult(
+              idempotency.userMessageId as string,
+              collectedR['assistantMessageId'] as string,
+            );
+          } else if (idempotency?.submitted && isExactTerminalPoll(collectedR)) {
+            confirmExactTerminalPoll(collectedR);
+          }
+          const recoverSnapshot = async (
+            fallbackError: unknown = null,
+          ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; userMessageId?: string; partial?: boolean; complete?: boolean } | null> => {
            if (responsesAbortController.signal.aborted) return null;
-           let polled: { content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; partial?: boolean };
+            let polled: { content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; userMessageId?: string; partial?: boolean; complete?: boolean };
            try {
              polled = await pollRecoverySnapshot();
            } catch (error: unknown) {
@@ -1435,13 +1621,16 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
              if (fallbackError != null) throw normalizeBackendError(fallbackError);
              throw normalizeBackendError(error);
            }
-           if (polled.error != null) throw polled.error;
+             if (idempotency?.submitted) confirmExactTerminalPoll(polled);
+             if (polled.error != null) {
+               throw polled.error;
+             }
            if (polled.partial === true) throw new Error('Recovery poll returned incomplete response');
-           if (!hasRecoveryEvidence(polled)) {
+            if (!hasRecoveryEvidence(polled)) {
              if (fallbackError != null) throw normalizeBackendError(fallbackError);
-             return null;
-           }
-           recoverySnapshot = polled;
+              return null;
+            }
+            recoverySnapshot = polled;
            currentAssistantMessageId = polled.assistantMessageId ?? currentAssistantMessageId;
            return polled;
          };
@@ -1466,8 +1655,11 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               Math.min(15000, REQUEST_TIMEOUT_MS),
               undefined,
               responsesAbortController.signal,
-              isContinuation ? String(promptParams.body['messageID']) : undefined,
-            );
+               idempotency?.submitted
+                 ? (idempotency.userMessageId ?? undefined)
+                 : isContinuation ? String(promptParams.body['messageID']) : undefined,
+               Boolean(idempotency),
+             );
              if (Array.isArray(evPoll.toolParts)) streamSearchToolParts = evPoll.toolParts;
            } catch {
            }
@@ -1486,11 +1678,11 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
            }
          }
 
-          if (!hasValidTerminal && !recoverySnapshot && !fallbackServed) {
-            if (streamedToolCalls.length === 0 && externalToolChoice.mode !== 'required') {
-              throw new Error('Stream ended without valid terminal');
-            }
-          }
+           if (!hasValidTerminal && !recoverySnapshot && !fallbackServed) {
+             if (streamedToolCalls.length === 0 && externalToolChoice.mode !== 'required') {
+               throw new Error('Stream ended without valid terminal');
+             }
+           }
 
 
          const flushedReasoningCalls = parseReasoningToolCalls.flush ? parseReasoningToolCalls.flush() : [];
@@ -1604,17 +1796,19 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
              if (!isMalformedExternalToolCallError(integrityError) || !(await repairFromSnapshot())) {
                throw integrityError;
              }
-           }
-           if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
-              const forcedResponse = await requestForcedResponsesToolCall();
-              if (forcedResponse) {
-                currentAssistantMessageId =
-                  typeof forcedResponse['assistantMessageId'] === 'string'
-                    ? (forcedResponse['assistantMessageId'] as string)
-                    : currentAssistantMessageId;
+            }
+            if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required' && !idempotency?.reconciling) {
+               const forcedResponse = await requestForcedResponsesToolCall();
+               if (forcedResponse) {
+                 confirmForcedResponsesToolCall(forcedResponse);
+                 currentAssistantMessageId =
+                   typeof forcedResponse['assistantMessageId'] === 'string'
+                     ? (forcedResponse['assistantMessageId'] as string)
+                     : currentAssistantMessageId;
+                 if (forcedResponse['error'] != null) throw normalizeBackendError(forcedResponse['error']);
                 const forcedReasoning = typeof forcedResponse['reasoning'] === 'string' ? forcedResponse['reasoning'] as string : '';
-               const forcedContent = typeof forcedResponse['content'] === 'string' ? forcedResponse['content'] as string : '';
-               parsedToolCalls = mergeToolCallArtifacts(parsedToolCalls, parseJoined(forcedReasoning, forcedContent));
+                const forcedContent = typeof forcedResponse['content'] === 'string' ? forcedResponse['content'] as string : '';
+                parsedToolCalls = mergeToolCallArtifacts(parsedToolCalls, parseJoined(forcedReasoning, forcedContent));
                authoritativeSource = {
                  content: `${authoritativeSource.content}${forcedContent}`,
                  reasoning: `${authoritativeSource.reasoning}${forcedReasoning}`,
@@ -1692,10 +1886,11 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
          );
          const safeContent = joinedSafe.content;
          const safeReasoning = joinedSafe.reasoning;
-          if (!safeContent.trim() && !safeReasoning.trim() && validatedStreamedToolCalls.length === 0) {
-            throw new Error('Upstream returned no assistant data');
-          }
-          const streamEvidence = hostedSearch.requested
+           if (!safeContent.trim() && !safeReasoning.trim() && validatedStreamedToolCalls.length === 0) {
+             throw new Error('Upstream returned no assistant data');
+           }
+           assertIdempotencyResultConfirmed();
+           const streamEvidence = hostedSearch.requested
             ? extractSearchEvidence(streamSearchToolParts)
             : { queries: [] as string[], sources: [] as { url: string; title: string }[] };
           const streamSearchCallItems = buildWebSearchCallItems(streamEvidence);
@@ -1731,6 +1926,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           streamSearchCallItems.forEach((item) => emitWebSearchCallItem(item));
 
           if (deferVisibleOutput) {
+            assertIdempotencyResultConfirmed();
             writeVisibleDelta(safeReasoning, true);
             writeVisibleDelta(safeContent, false);
           }
@@ -1771,21 +1967,23 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
              output_tokens_details: { reasoning_tokens: reasoningTokens },
            },
          };
-          const stateStored = currentAssistantMessageId
-            ? storeResponseState(
-                responseId,
-                sessionId,
-                `${pID}/${mID}`,
-                buildStoredResponseToolCalls(validatedStreamedToolCalls),
-                currentAssistantMessageId,
-              )
+           const stateStored = store && currentAssistantMessageId
+             ? storeResponseState(
+                 responseId,
+                 sessionId,
+                 `${pID}/${mID}`,
+                 buildStoredResponseToolCalls(validatedStreamedToolCalls),
+                 currentAssistantMessageId,
+                 tenantId,
+               )
             : false;
           if (stateStored) {
             if (ownedResponsesSessionId === sessionId) ownedResponsesSessionId = null;
           } else {
             await cleanupOwnedResponsesSession();
           }
-          emit({ type: 'response.completed', sequence_number: nextSeq(), response });
+           assertIdempotencyResultConfirmed();
+           emit({ type: 'response.completed', sequence_number: nextSeq(), response });
           res.write('data: [DONE]\n\n');
          stopResponsesKeepalive();
          res.end();
@@ -1804,14 +2002,14 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       let promptSubmitted = false;
       let currentAssistantMessageId: string | null = null;
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-        if (res.writableEnded || res.destroyed) {
+        if (responsesAbortController.signal.aborted || res.writableEnded || res.destroyed) {
           logDebug('Client gone, stop retrying', { sessionId, attempt });
           return;
         }
         if (attempt > 1) {
           if (fallbackToProxy) switchToProxyBundle();
           await ensureActiveModel(activeClient, pID, mID).catch(() => {});
-          if (!isNonStreamContinuation) {
+          if (!isNonStreamContinuation && !idempotency?.submitted) {
             promptSubmitted = false;
             const retriedSessionId = sessionId;
             if (retriedSessionId && ownedResponsesSessionId === retriedSessionId) {
@@ -1829,23 +2027,58 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           requestForcedResponsesToolCall = makeForcedResponsesToolCallRequester();
           await sleep(computeRetryDelay(attempt - 1, lastResponsesAttemptError));
         }
-        let polledResponse: { content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; partial?: boolean } | null = null;
+        let polledResponse: { content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; userMessageId?: string; partial?: boolean; complete?: boolean } | null = null;
         try {
-          if (isNonStreamContinuation && promptSubmitted) {
+          if (idempotency?.reconciling) {
             polledResponse = await activePollForAssistantResponse(
               sessionId as string,
               REQUEST_TIMEOUT_MS,
               undefined,
               responsesAbortController.signal,
-              isNonStreamContinuation ? String(promptParams.body['messageID']) : undefined,
+              idempotency.userMessageId ?? undefined,
+              true,
+            );
+            if (polledResponse.error != null) {
+              if (isExactTerminalPoll(polledResponse)) {
+                confirmExactTerminalPoll(polledResponse);
+                throw normalizeBackendError(polledResponse.error);
+              }
+              throw new Error('Idempotency reconciliation has no confirmed assistant result');
+            }
+            if (
+              !isExactTerminalPoll(polledResponse)
+            ) {
+              throw new Error('Idempotency reconciliation has no confirmed assistant result');
+            }
+            confirmExactTerminalPoll(polledResponse);
+            currentAssistantMessageId = polledResponse.assistantMessageId ?? null;
+          } else if ((isNonStreamContinuation || idempotency?.submitted) && promptSubmitted) {
+            polledResponse = await activePollForAssistantResponse(
+              sessionId as string,
+              REQUEST_TIMEOUT_MS,
+              undefined,
+              responsesAbortController.signal,
+              idempotency?.submitted
+                ? (idempotency.userMessageId ?? undefined)
+                : isNonStreamContinuation ? String(promptParams.body['messageID']) : undefined,
+              Boolean(idempotency),
             );
             currentAssistantMessageId = polledResponse.assistantMessageId ?? currentAssistantMessageId;
           } else {
-            if (isNonStreamContinuation) {
+            if (isNonStreamContinuation || idempotency) {
               promptSubmitted = true;
             }
+            if (idempotency) {
+              idempotency.markSubmitted(
+                sessionId as string,
+                String(promptParams.body['messageID']),
+                `${pID}/${mID}`,
+              );
+            }
+            assertResponsesCanPrompt();
             responseRes = await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
             promptSubmitted = true;
+            if (idempotency) assertResponsesCanPrompt();
             const promptData = asRecord(asRecord(responseRes)['data']);
             const promptInfo = asRecord(promptData['info']);
             const promptMessageId = promptInfo['id'] ?? promptInfo['messageID'] ?? promptInfo['messageId'];
@@ -1864,18 +2097,65 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               externalToolRegistry.length > 0
                 ? parseExternalToolCallsFromJoinedText(externalToolRegistry, promptReasoning, promptContent)
                 : [];
-            if (promptContent || promptReasoning) break;
-            polledResponse = await activePollForAssistantResponse(
-              sessionId as string,
-              REQUEST_TIMEOUT_MS,
-              undefined,
-              responsesAbortController.signal,
-              isNonStreamContinuation ? String(promptParams.body['messageID']) : undefined,
+            if (idempotency) {
+              const promptTime = asRecord(promptInfo['time']);
+              const promptFinish = promptInfo['finish'];
+              const hasActiveToolPart = responseParts.some((part) => {
+                const partRecord = asRecord(part);
+                const state = asRecord(partRecord['state']);
+                const status = state['status'] ?? partRecord['status'];
+                return partRecord['type'] === 'tool' && (status === 'pending' || status === 'running');
+              });
+              const finishIsIntermediate = promptFinish === 'tool' || promptFinish === 'tool-calls';
+              const explicitTerminal = !finishIsIntermediate &&
+                ((promptFinish != null) || Boolean(promptTime['completed']));
+              const exactTurn =
+                promptInfo['role'] === 'assistant' &&
+                promptInfo['parentID'] === idempotency.userMessageId &&
+                typeof promptMessageId === 'string' &&
+                promptMessageId.length > 0;
+              if (promptInfo['error'] != null || !explicitTerminal || !exactTurn || hasActiveToolPart) {
+                // Prompt return values may contain a still-growing snapshot.
+                // Reconcile only the exact submitted user turn before
+                // returning text when the snapshot is incomplete or errored.
+                responseParts = [];
+                promptContent = '';
+                promptReasoning = '';
+                promptParsedToolCalls = [];
+                polledResponse = await activePollForAssistantResponse(
+                  sessionId as string,
+                  REQUEST_TIMEOUT_MS,
+                  undefined,
+                  responsesAbortController.signal,
+                  idempotency.userMessageId ?? undefined,
+                  true,
+                );
+                currentAssistantMessageId = polledResponse.assistantMessageId ?? currentAssistantMessageId;
+              }
+            }
+            const needsRequiredToolFollowup = Boolean(
+              idempotency?.submitted &&
+              externalToolChoice.mode === 'required' &&
+              promptParsedToolCalls.length === 0 &&
+              (promptContent || promptReasoning),
             );
-            currentAssistantMessageId = polledResponse.assistantMessageId ?? currentAssistantMessageId;
+            if ((promptContent || promptReasoning) && (!idempotency?.submitted || needsRequiredToolFollowup)) break;
+            if (!polledResponse) {
+              polledResponse = await activePollForAssistantResponse(
+                sessionId as string,
+                REQUEST_TIMEOUT_MS,
+                undefined,
+                responsesAbortController.signal,
+                  idempotency?.submitted
+                    ? (idempotency.userMessageId ?? undefined)
+                    : isNonStreamContinuation ? String(promptParams.body['messageID']) : undefined,
+                  Boolean(idempotency),
+                );
+              currentAssistantMessageId = polledResponse.assistantMessageId ?? currentAssistantMessageId;
+            }
           }
         } catch (loopError: unknown) {
-          if (isNonStreamContinuation) {
+          if (isNonStreamContinuation || idempotency?.submitted) {
             throw normalizeBackendError(loopError);
           }
           if (attempt < maxAttempts && engageProxyFallback(loopError)) {
@@ -1892,6 +2172,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           }
           throw normalizeBackendError(loopError);
         }
+        if (idempotency?.submitted && polledResponse) confirmExactTerminalPoll(polledResponse);
         const polledEmpty = Boolean(
           polledResponse &&
             !polledResponse.content &&
@@ -1906,8 +2187,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               ? new Error('Polling returned empty response')
               : null);
         if (polledResponse && polledError != null) {
-          if (isNonStreamContinuation) {
-            throw normalizeBackendError(polledError);
+            if (isNonStreamContinuation || idempotency?.submitted) {
+              throw normalizeBackendError(polledError);
           }
           if (attempt < maxAttempts && engageProxyFallback(polledError)) {
             lastResponsesAttemptError = polledError;
@@ -1944,9 +2225,12 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
              sessionId as string,
              Math.min(15000, REQUEST_TIMEOUT_MS),
              undefined,
-             responsesAbortController.signal,
-             isNonStreamContinuation ? String(promptParams.body['messageID']) : undefined,
-           );
+              responsesAbortController.signal,
+              idempotency?.submitted
+                ? (idempotency.userMessageId ?? undefined)
+                : isNonStreamContinuation ? String(promptParams.body['messageID']) : undefined,
+              Boolean(idempotency),
+            );
 
           if (Array.isArray(evPoll.toolParts) && evPoll.toolParts.length > 0) {
             searchToolParts = evPoll.toolParts;
@@ -1984,29 +2268,31 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
            : externalToolRegistry.length > 0
              ? parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content)
              : [];
-       let validatedToolCalls: FinalToolCall[] = [];
-       try {
-         assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
-          if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
-            const forcedResponse = await requestForcedResponsesToolCall();
-            if (forcedResponse) {
-              currentAssistantMessageId =
-                typeof forcedResponse['assistantMessageId'] === 'string'
-                  ? (forcedResponse['assistantMessageId'] as string)
-                  : currentAssistantMessageId;
-              content = String(forcedResponse['content'] ?? content);
-             reasoning = String(forcedResponse['reasoning'] ?? reasoning);
-             parsedToolCalls = parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content);
-             assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
-           }
-         }
-         validatedToolCalls = finalizeStreamToolCalls(
-           parsedToolCalls,
-           externalToolRegistry,
-           externalToolChoice,
-           [reasoning, content],
-           parallelToolCalls,
-         ) as unknown as FinalToolCall[];
+        let validatedToolCalls: FinalToolCall[] = [];
+        try {
+          assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
+          if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required' && !idempotency?.reconciling) {
+             const forcedResponse = await requestForcedResponsesToolCall();
+             if (forcedResponse) {
+               confirmForcedResponsesToolCall(forcedResponse);
+               currentAssistantMessageId =
+                 typeof forcedResponse['assistantMessageId'] === 'string'
+                   ? (forcedResponse['assistantMessageId'] as string)
+                   : currentAssistantMessageId;
+               if (forcedResponse['error'] != null) throw normalizeBackendError(forcedResponse['error']);
+               content = String(forcedResponse['content'] ?? content);
+              reasoning = String(forcedResponse['reasoning'] ?? reasoning);
+              parsedToolCalls = parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content);
+              assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
+            }
+          }
+          validatedToolCalls = finalizeStreamToolCalls(
+            parsedToolCalls,
+            externalToolRegistry,
+            externalToolChoice,
+            [reasoning, content],
+            parallelToolCalls,
+          ) as unknown as FinalToolCall[];
        } catch (toolError) {
          const toolCode = (toolError as Error & { code?: string }).code;
          const failClosedCodes = [
@@ -2075,7 +2361,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       });
       const orderedOutput = orderResponsesOutputItems(output);
 
-      const responseId = `resp_${crypto.randomUUID()}`;
+      const responseId = idempotency?.publicId ?? `resp_${crypto.randomUUID()}`;
+      idempotency?.setPublicId(responseId);
       const createdAt = Math.floor(Date.now() / 1000);
       const response = {
         ...buildResponsesResponseEnvelope({
@@ -2099,14 +2386,15 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         },
       };
 
-      const stateStored = currentAssistantMessageId
-        ? storeResponseState(
-            responseId,
-            sessionId,
-            `${pID}/${mID}`,
-            buildStoredResponseToolCalls(validatedToolCalls),
-            currentAssistantMessageId,
-          )
+       const stateStored = store && currentAssistantMessageId
+         ? storeResponseState(
+             responseId,
+             sessionId,
+             `${pID}/${mID}`,
+             buildStoredResponseToolCalls(validatedToolCalls),
+             currentAssistantMessageId,
+             tenantId,
+           )
         : false;
       if (stateStored) {
         if (ownedResponsesSessionId === sessionId) ownedResponsesSessionId = null;
@@ -2114,11 +2402,33 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         await cleanupOwnedResponsesSession();
       }
 
-      res.json(response);
+       assertIdempotencyResultConfirmed();
+       res.json(response);
       return;
     } catch (error: unknown) {
       stopResponsesKeepalive();
       console.error('[Proxy] Responses API Error:', toErrorMessage(error));
+      const isUnconfirmedStreamingReconciliation =
+        idempotency?.reconciling && Boolean(asRecord((req as unknown as { body: unknown }).body)['stream']);
+      if (
+        idempotency?.submitted &&
+        !idempotency.resultConfirmed &&
+        !responsesAbortController.signal.aborted &&
+        !res.headersSent &&
+        !res.destroyed &&
+        !isUnconfirmedStreamingReconciliation
+      ) {
+        res.removeHeader('Content-Type');
+        res.status(503).json({
+          error: {
+            type: 'idempotency_error',
+            code: 'idempotency_reconciliation_pending',
+            message: 'The previous outcome is still uncertain; retry the same request to reconcile it',
+            retryable: true,
+          },
+        });
+        return;
+      }
       if (!fallbackToProxy) engageProxyFallback(error);
       const transformed = transformUpstreamError(error);
       if (responsesStreamState) {

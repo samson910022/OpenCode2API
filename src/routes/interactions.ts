@@ -31,6 +31,7 @@ import { ensureBackend, sleep } from '../backend/manager.js';
 import type { Application, Request, Response } from 'express';
 import type { AppContext } from '../types/context.js';
 import { asRecord, toErrorMessage } from '../utils/guards.js';
+import { getContinuationTenantId, getIdempotencyControl } from '../idempotency/middleware.js';
 
 function textOfContent(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -134,8 +135,37 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
   } = ctx;
 
    const handle = async (req: Request, res: Response): Promise<void> => {
+     const idempotency = getIdempotencyControl(req);
+     const hasConfirmedIdempotencyResult = (): boolean => Boolean(
+       idempotency?.resultConfirmed &&
+       typeof idempotency.confirmedAssistantMessageId === 'string' &&
+       idempotency.confirmedAssistantMessageId.trim(),
+     );
+     const assertIdempotencyResultConfirmed = (): void => {
+       if (idempotency?.submitted && !hasConfirmedIdempotencyResult()) {
+         throw new Error('Idempotency result is not confirmed for the exact assistant turn');
+       }
+     };
+     const isExactTerminalPoll = (result: unknown): boolean => {
+       const poll = asRecord(result);
+       return poll['complete'] === true &&
+         poll['partial'] !== true &&
+         typeof poll['assistantMessageId'] === 'string' &&
+         poll['assistantMessageId'].trim().length > 0 &&
+         typeof idempotency?.userMessageId === 'string' &&
+         poll['userMessageId'] === idempotency.userMessageId;
+     };
+     const confirmExactTerminalPoll = (result: unknown): void => {
+       if (!idempotency?.submitted) return;
+       if (!isExactTerminalPoll(result)) {
+         throw new Error('Idempotency result is incomplete or does not identify the exact assistant turn');
+       }
+       const poll = asRecord(result);
+       idempotency.confirmResult(idempotency.userMessageId as string, poll['assistantMessageId'] as string);
+     };
      const requestAbortController = new AbortController();
      let clientGone = false;
+     let interactionCreated = false;
       const ownedSessionIds = new Set<string>();
      // P3 bundle (direct unless the pool is already engaged).
 
@@ -169,10 +199,23 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           }
         }
       };
-     const cleanupOwnedSessions = async (exceptId?: string): Promise<void> => {
+     const cleanupOwnedSessionsNow = async (exceptId?: string): Promise<void> => {
        for (const id of [...ownedSessionIds]) {
          if (id !== exceptId) await deleteOwnedSession(id);
        }
+     };
+     const cleanupOwnedSessions = async (exceptId?: string): Promise<void> => {
+       if (!idempotency?.submitted) {
+         await cleanupOwnedSessionsNow(exceptId);
+         return;
+       }
+       // Keep a possibly submitted child available for unknown-outcome
+       // reconciliation. Delete it only after a complete response is cached.
+       const retainedChild = idempotency.childSessionId;
+       for (const id of [...ownedSessionIds]) {
+         if (id !== exceptId && id !== retainedChild) await deleteOwnedSession(id);
+       }
+       idempotency.onCompleted(() => cleanupOwnedSessionsNow(exceptId));
      };
     const engageProxyFallback = (err: unknown): boolean => {
       if (!engageFallbackForFreeLimit(err, proxyPool)) return false;
@@ -230,22 +273,24 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         }),
       );
 
-      const previousState =
+       const tenantId = getContinuationTenantId(req);
+       const previousState =
         typeof previousInteractionId === 'string' && previousInteractionId
-          ? getResponseState(previousInteractionId)
+          ? getResponseState(previousInteractionId, tenantId)
           : null;
-      if (previousInteractionId && (!previousState || !previousState.checkpointId)) {
-        res.status(400).json({ error: { message: 'Invalid or expired previous_interaction_id', type: 'invalid_request_error' } });
+       if (!idempotency?.reconciling && previousInteractionId && (!previousState || !previousState.checkpointId)) {
+         res.status(400).json({ error: { message: 'Invalid or expired previous_interaction_id', type: 'invalid_request_error', code: 'invalid_previous_interaction_id' } });
         return;
       }
 
       const resolvedModel = (await withTimeout(
-        resolveRequestedModel(typeof model === 'string' && model ? model : (previousState?.model ?? '')),
+         resolveRequestedModel(typeof model === 'string' && model ? model : (idempotency?.model ?? previousState?.model ?? '')),
         REQUEST_TIMEOUT_MS,
         'resolve model',
       )) as unknown as { providerID: string; modelID: string };
       const pID = String(asRecord(resolvedModel)['providerID']);
       const mID = String(asRecord(resolvedModel)['modelID']);
+      idempotency?.setModel(`${pID}/${mID}`);
 
       await ensureBackend(config);
 
@@ -307,10 +352,14 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         return;
       }
 
-      let sessionId: string | null = null;
+       let sessionId: string | null = idempotency?.reconciling ? idempotency.childSessionId : null;
       // Both new sessions and continuation forks belong to this request until
       // response state storage succeeds; the stored parent is never mutated.
-      if (previousState) {
+        if (idempotency?.reconciling) {
+          // Unknown retries reuse the exact recorded child and never fork again.
+          if (!sessionId) throw new Error('Idempotency reconciliation is missing its child session');
+          ownedSessionIds.add(sessionId);
+       } else if (previousState) {
         const forkRes = (await withTimeout(
           activeClient.session.fork({
             path: { id: previousState.sessionId },
@@ -359,7 +408,12 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           parts,
         },
       };
-      promptParams.body.messageID = makeId('msg_');
+       promptParams.body.messageID = idempotency?.reconciling
+         ? idempotency.userMessageId
+         : makeId('msg_');
+       if (typeof promptParams.body.messageID !== 'string' || !promptParams.body.messageID) {
+         throw new Error('Idempotency reconciliation is missing its user message ID');
+       }
       // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
       const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
       if (promptToolOverrides) {
@@ -374,18 +428,36 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       const promptAndPoll = async (): Promise<{
         content: string;
         reasoning: string;
-        error: unknown;
-        toolParts?: unknown;
-        assistantMessageId?: string;
-        partial?: boolean;
-      }> => {
+         error: unknown;
+         toolParts?: unknown;
+          assistantMessageId?: string;
+          userMessageId?: string;
+          partial?: boolean;
+         complete?: boolean;
+       }> => {
+         if (idempotency?.reconciling) {
+           const polled = await activePollForAssistantResponse(
+             sessionId as string,
+             REQUEST_TIMEOUT_MS,
+             undefined,
+               requestAbortController.signal,
+               idempotency.userMessageId ?? undefined,
+               true,
+             );
+             confirmExactTerminalPoll(polled);
+             if (polled.error != null) throw normalizeBackendError(polled.error);
+            return polled;
+         }
         let lastErr: unknown = null;
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-          if (res.destroyed || res.writableEnded) throw new Error('Client disconnected');
+          let confirmedTerminalAssistantError = false;
+          if (requestAbortController.signal.aborted || res.destroyed || res.writableEnded) {
+            throw new Error('Client disconnected');
+          }
           if (attempt > 1) {
             if (fallbackToProxy) switchToProxyBundle();
             await ensureActiveModel(activeClient, pID, mID).catch(() => {});
-            if (!parentSessionId) {
+             if (!parentSessionId && !idempotency?.submitted) {
               promptSubmitted = false;
               const currentId = sessionId as string;
               if (currentId) await deleteOwnedSession(currentId);
@@ -399,11 +471,19 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
             await awaitWithAbort(sleep(computeRetryDelay(attempt - 1, lastErr)), requestAbortController.signal);
           }
           try {
-            if (!(parentSessionId && promptSubmitted)) {
-              if (parentSessionId) {
-                promptSubmitted = true;
-              }
-              await awaitWithAbort(activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS), requestAbortController.signal);
+             if (!((parentSessionId || idempotency?.submitted) && promptSubmitted)) {
+               if (parentSessionId) {
+                 promptSubmitted = true;
+               }
+                if (idempotency) {
+                  idempotency.markSubmitted(
+                    sessionId as string,
+                   String(promptParams.body['messageID']),
+                   `${pID}/${mID}`,
+                 );
+               }
+               promptSubmitted = true;
+               await awaitWithAbort(activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS), requestAbortController.signal);
               promptSubmitted = true;
             }
             const polled = await activePollForAssistantResponse(
@@ -411,10 +491,17 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
               REQUEST_TIMEOUT_MS,
               undefined,
               requestAbortController.signal,
-              parentSessionId ? String(promptParams.body['messageID']) : undefined,
-            );
+                idempotency?.submitted
+                  ? (idempotency.userMessageId ?? undefined)
+                  : parentSessionId ? String(promptParams.body['messageID']) : undefined,
+                Boolean(idempotency),
+             );
 
-            if (polled.error != null) throw normalizeBackendError(polled.error);
+              if (idempotency?.submitted) confirmExactTerminalPoll(polled);
+              if (polled.error != null) {
+                if (idempotency?.submitted) confirmedTerminalAssistantError = true;
+                throw normalizeBackendError(polled.error);
+              }
             if (polled.partial === true) throw new Error('Polling returned incomplete response');
             if (
               !polled.content &&
@@ -423,9 +510,10 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
             ) {
               throw new Error('Polling returned empty response');
             }
-            return polled;
+             return polled;
           } catch (e: unknown) {
             lastErr = e;
+            if (confirmedTerminalAssistantError) throw normalizeBackendError(e);
             if (parentSessionId) {
               throw normalizeBackendError(e);
             }
@@ -443,7 +531,8 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         throw normalizeBackendError(lastErr ?? new Error('Upstream provider error'));
       };
 
-      const interactionId = `intr_${crypto.randomUUID()}`;
+       const interactionId = idempotency?.publicId ?? `intr_${crypto.randomUUID()}`;
+       idempotency?.setPublicId(interactionId);
        const deleteEphemeralSession = async (force: boolean = false): Promise<void> => {
          // Only sessions created by this request may be deleted; a reused
          // parent session stays alive for its stored continuation chain.
@@ -454,14 +543,14 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
-        res.setHeader('X-Accel-Buffering', 'no');
-        const flushHeaders = (res as unknown as { flushHeaders?: unknown }).flushHeaders;
-        if (typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
+         res.setHeader('X-Accel-Buffering', 'no');
+         const flushHeaders = (res as unknown as { flushHeaders?: unknown }).flushHeaders;
+         if (!idempotency?.reconciling && typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
         // Stream contract: interaction.created → step.delta* → interaction.completed
         // (no [DONE]; errors arrive as {type:'error'} like /v1/messages).
          const heartbeat = setInterval(() => {
 
-          if (!res.destroyed && !res.writableEnded) res.write(': heartbeat\n');
+           if (!idempotency?.reconciling && !res.destroyed && !res.writableEnded) res.write(': heartbeat\n');
         }, 15000);
         if (typeof heartbeat.unref === 'function') heartbeat.unref();
         const emit = (payload: unknown): void => {
@@ -469,8 +558,16 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           res.write(`data: ${JSON.stringify(payload)}\n\n`);
         };
         try {
-        emit({ type: 'interaction.created', interaction: { id: interactionId, status: 'in_progress', model: `${pID}/${mID}` } });
-        const polled = await promptAndPoll();
+          if (!idempotency?.reconciling) {
+            emit({ type: 'interaction.created', interaction: { id: interactionId, status: 'in_progress', model: `${pID}/${mID}` } });
+            interactionCreated = true;
+          }
+           const polled = await promptAndPoll();
+           assertIdempotencyResultConfirmed();
+          if (idempotency?.reconciling) {
+            emit({ type: 'interaction.created', interaction: { id: interactionId, status: 'in_progress', model: `${pID}/${mID}` } });
+            interactionCreated = true;
+          }
          if (clientGone) {
            await deleteEphemeralSession(true);
            return;
@@ -503,12 +600,13 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
           steps.push({ type: 'model_output', text, annotations });
           if (store) {
             const stateStored = polled.assistantMessageId
-              ? storeResponseState(interactionId, sessionId as string, `${pID}/${mID}`, [], polled.assistantMessageId)
+               ? storeResponseState(interactionId, sessionId as string, `${pID}/${mID}`, [], polled.assistantMessageId, tenantId)
               : false;
             if (stateStored) ownedSessionIds.delete(sessionId as string);
             await cleanupOwnedSessions();
           }
-          emit({ type: 'interaction.completed', interaction: { id: interactionId, status: 'completed', output_text: text, steps } });
+           assertIdempotencyResultConfirmed();
+           emit({ type: 'interaction.completed', interaction: { id: interactionId, status: 'completed', output_text: text, steps } });
           await deleteEphemeralSession();
 
         } finally {
@@ -518,7 +616,8 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         return;
       }
 
-      const polled = await promptAndPoll();
+       const polled = await promptAndPoll();
+       assertIdempotencyResultConfirmed();
       // Same parity strip as the stream path above.
       const text = stripFunctionCalls(polled.content || '');
       if (!text.trim()) throw new Error('Interactions response contained no visible text');
@@ -540,14 +639,15 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
       const groundingCount = searchCalls.length;
       if (store) {
         const stateStored = polled.assistantMessageId
-          ? storeResponseState(interactionId, sessionId as string, `${pID}/${mID}`, [], polled.assistantMessageId)
+           ? storeResponseState(interactionId, sessionId as string, `${pID}/${mID}`, [], polled.assistantMessageId, tenantId)
           : false;
         if (stateStored) ownedSessionIds.delete(sessionId as string);
         await cleanupOwnedSessions();
       }
       await deleteEphemeralSession();
 
-      res.json({
+       assertIdempotencyResultConfirmed();
+       res.json({
         id: interactionId,
         status: 'completed',
         model: `${pID}/${mID}`,
@@ -561,7 +661,75 @@ export function registerInteractionsRoutes(app: Application, ctx: AppContext): v
         if (clientGone) {
           return;
         }
-       if (!fallbackToProxy) engageProxyFallback(error);
+        const isUnconfirmedStreamingReconciliation =
+          idempotency?.reconciling && asRecord((req as unknown as { body: unknown }).body)['stream'] === true;
+        if (
+          idempotency?.submitted &&
+          !hasConfirmedIdempotencyResult() &&
+          !res.headersSent &&
+          !isUnconfirmedStreamingReconciliation
+        ) {
+          res.removeHeader('Content-Type');
+          res.status(503).json({
+           error: {
+             type: 'idempotency_error',
+             code: 'idempotency_reconciliation_pending',
+             message: 'The previous outcome is still uncertain; retry the same request to reconcile it',
+             retryable: true,
+           },
+          });
+          return;
+        }
+        if (isUnconfirmedStreamingReconciliation && !res.destroyed && !res.writableEnded) {
+          const transformed = transformUpstreamError(error);
+          console.error('[Proxy] Interactions API Error:', toErrorMessage(error));
+          if (!res.headersSent) {
+            res.status(200);
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+          }
+          if (!interactionCreated) {
+            res.write(`data: ${JSON.stringify({
+              type: 'interaction.created',
+              interaction: {
+                id: idempotency?.publicId ?? `intr_${crypto.randomUUID()}`,
+                status: 'in_progress',
+                model: idempotency?.model ?? 'unknown',
+              },
+            })}\n\n`);
+            interactionCreated = true;
+          }
+          res.write(`data: ${JSON.stringify({ type: 'error', error: transformed.error })}\n\n`);
+          res.end();
+          return;
+        }
+        if (
+          asRecord((req as unknown as { body: unknown }).body)['stream'] === true &&
+          idempotency?.reconciling &&
+          idempotency.resultConfirmed &&
+          !res.destroyed &&
+          !res.writableEnded
+        ) {
+          const transformed = transformUpstreamError(error);
+          console.error('[Proxy] Interactions API Error:', toErrorMessage(error));
+          if (!interactionCreated) {
+            res.write(`data: ${JSON.stringify({
+              type: 'interaction.created',
+              interaction: {
+                id: idempotency.publicId ?? `intr_${crypto.randomUUID()}`,
+                status: 'in_progress',
+                model: idempotency.model ?? 'unknown',
+              },
+            })}\n\n`);
+            interactionCreated = true;
+          }
+          res.write(`data: ${JSON.stringify({ type: 'error', error: transformed.error })}\n\n`);
+          res.end();
+          return;
+        }
+        if (!fallbackToProxy) engageProxyFallback(error);
 
       console.error('[Proxy] Interactions API Error:', toErrorMessage(error));
       const transformed = transformUpstreamError(error);
