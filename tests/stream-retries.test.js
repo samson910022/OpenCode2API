@@ -1,5 +1,6 @@
 import request from 'supertest';
 import { jest } from '@jest/globals';
+import net from 'node:net';
 
 const sdkMocks = {
     configProviders: jest.fn(async () => ({
@@ -84,8 +85,13 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
 }));
 
 const { isTransientUpstreamError } = await import('../src/errors/upstream.js');
-const { createApp } = await import('../src/proxy.js');
-const { lock, notifyBackendReconnect, clearBackendReconnectListeners } = await import('../src/backend/manager.js');
+const { createApp, startProxy } = await import('../src/proxy.js');
+const {
+    lock,
+    notifyBackendReconnect,
+    clearBackendReconnectListeners,
+    getBackendReconnectListenerCount,
+} = await import('../src/backend/manager.js');
 
 function freeUsageError() {
     return {
@@ -1863,5 +1869,88 @@ describe('Backend Lifecycle & Active Model Retries', () => {
         notifyBackendReconnect();
         await ctx2.getProvidersList();
         expect(sdkMocks.configProviders).toHaveBeenCalledTimes(1);
+    });
+
+    test('startProxy unregisters its app reconnect listener on close and disposal is idempotent', async () => {
+        const getFreePort = async () => {
+            const probe = net.createServer();
+            await new Promise((resolve, reject) => {
+                probe.once('error', reject);
+                probe.listen(0, '127.0.0.1', resolve);
+            });
+            const address = probe.address();
+            if (!address || typeof address === 'string') throw new Error('Failed to allocate a local test port');
+            const port = address.port;
+            await new Promise((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()));
+            return port;
+        };
+        const close = (server) => new Promise((resolve, reject) => {
+            server.close((error) => error ? reject(error) : resolve());
+        });
+        const start = async () => {
+            const proxy = startProxy({
+                PORT: await getFreePort(),
+                BIND_HOST: '127.0.0.1',
+                API_KEY: '',
+                OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+                MANAGE_BACKEND: false,
+            });
+            if (!proxy.server.listening) {
+                await new Promise((resolve, reject) => {
+                    proxy.server.once('listening', resolve);
+                    proxy.server.once('error', reject);
+                });
+            }
+            return proxy;
+        };
+
+        const baseline = getBackendReconnectListenerCount();
+        const closedByServer = await start();
+        expect(getBackendReconnectListenerCount()).toBe(baseline + 1);
+        await close(closedByServer.server);
+        expect(getBackendReconnectListenerCount()).toBe(baseline);
+        expect(() => closedByServer.dispose()).not.toThrow();
+
+        const manuallyDisposed = await start();
+        expect(getBackendReconnectListenerCount()).toBe(baseline + 1);
+        expect(() => manuallyDisposed.dispose()).not.toThrow();
+        expect(getBackendReconnectListenerCount()).toBe(baseline);
+        expect(manuallyDisposed.server.listenerCount('error')).toBeGreaterThan(0);
+        const openServerErrorListeners = manuallyDisposed.server.listenerCount('error');
+        await close(manuallyDisposed.server);
+        expect(getBackendReconnectListenerCount()).toBe(baseline);
+        expect(manuallyDisposed.server.listenerCount('error')).toBe(openServerErrorListeners - 1);
+    });
+
+    test('startProxy unregisters its app reconnect listener when bind fails', async () => {
+        const blocker = net.createServer();
+        await new Promise((resolve, reject) => {
+            blocker.once('error', reject);
+            blocker.listen(0, '127.0.0.1', resolve);
+        });
+        const address = blocker.address();
+        if (!address || typeof address === 'string') throw new Error('Failed to reserve a local test port');
+
+        const baseline = getBackendReconnectListenerCount();
+        try {
+            const proxy = startProxy({
+                PORT: address.port,
+                BIND_HOST: '127.0.0.1',
+                API_KEY: '',
+                OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+                MANAGE_BACKEND: false,
+            });
+            expect(getBackendReconnectListenerCount()).toBe(baseline + 1);
+            await new Promise((resolve, reject) => {
+                proxy.server.once('listening', () => reject(new Error('Expected bind collision')));
+                proxy.server.once('error', resolve);
+            });
+            expect(proxy.server.listening).toBe(false);
+            expect(getBackendReconnectListenerCount()).toBe(baseline);
+            expect(proxy.server.listenerCount('error')).toBe(0);
+            expect(() => proxy.dispose()).not.toThrow();
+        } finally {
+            await new Promise((resolve, reject) => blocker.close((error) => error ? reject(error) : resolve()));
+        }
     });
 });

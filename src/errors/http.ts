@@ -4,7 +4,7 @@ import { asRecord } from '../utils/guards.js';
 export interface AnthropicHttpErrorBody {
   type: 'error';
   error: {
-    type: 'invalid_request_error';
+    type: 'invalid_request_error' | 'api_error';
     message: string;
     code?: string;
   };
@@ -13,7 +13,7 @@ export interface AnthropicHttpErrorBody {
 export interface OpenAiHttpErrorBody {
   error: {
     message: string;
-    type: 'invalid_request_error';
+    type: 'invalid_request_error' | 'server_error';
     code?: string;
   };
 }
@@ -60,6 +60,10 @@ export function classifyHttpError(err: unknown, path?: string): ClassifiedHttpEr
     status = 413;
     message = 'Request body exceeds the maximum permitted size';
     code = 'entity_too_large';
+  } else if (errType === 'media.type.unsupported') {
+    status = 415;
+    message = 'Unsupported or missing Content-Type; expected a JSON media type';
+    code = 'unsupported_media_type';
   } else if (errType === 'charset.unsupported' || errType === 'encoding.unsupported' || statusNum === 415) {
     status = 415;
     message = 'Unsupported body encoding or charset';
@@ -75,11 +79,14 @@ export function classifyHttpError(err: unknown, path?: string): ClassifiedHttpEr
   }
 
   const isAnthropic = isAnthropicMessagesPath(path);
+  const errorType = status >= 500
+    ? (isAnthropic ? 'api_error' : 'server_error')
+    : 'invalid_request_error';
   const body: AnthropicHttpErrorBody | OpenAiHttpErrorBody = isAnthropic
     ? {
         type: 'error',
         error: {
-          type: 'invalid_request_error',
+          type: errorType as AnthropicHttpErrorBody['error']['type'],
           message,
           ...(code ? { code } : {}),
         },
@@ -87,7 +94,7 @@ export function classifyHttpError(err: unknown, path?: string): ClassifiedHttpEr
     : {
         error: {
           message,
-          type: 'invalid_request_error',
+          type: errorType as OpenAiHttpErrorBody['error']['type'],
           ...(code ? { code } : {}),
         },
       };

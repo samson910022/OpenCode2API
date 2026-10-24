@@ -203,4 +203,6 @@ export interface CreateAppResult {
 export interface StartProxyResult {
   server: import('node:http').Server;
   killBackend: () => void;
+  /** Idempotently dispose app-owned listeners; also called when server closes. */
+  dispose: () => void;
 }

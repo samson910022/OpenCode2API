@@ -364,6 +364,11 @@ export function onBackendReconnect(listener: BackendReconnectListener): () => vo
   };
 }
 
+/** Exposed for narrow lifecycle assertions; listeners remain owned by their app instances. */
+export function getBackendReconnectListenerCount(): number {
+  return backendReconnectListeners.size;
+}
+
 export function notifyBackendReconnect(): void {
   for (const listener of backendReconnectListeners) {
     try {

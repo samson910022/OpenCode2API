@@ -1,6 +1,7 @@
 import { jest } from '@jest/globals';
 import request from 'supertest';
 import express from 'express';
+import net from 'node:net';
 
 const sdkMocks = {
     configProviders: jest.fn(async () => ({
@@ -165,7 +166,7 @@ describe('Pure HTTP Error Classifier (classifyHttpError)', () => {
         expect(openAiRes.body).toEqual({
             error: {
                 message: 'Internal server error',
-                type: 'invalid_request_error'
+                type: 'server_error'
             }
         });
         const serializedOpenAi = JSON.stringify(openAiRes);
@@ -179,7 +180,7 @@ describe('Pure HTTP Error Classifier (classifyHttpError)', () => {
         expect(anthropicRes.body).toEqual({
             type: 'error',
             error: {
-                type: 'invalid_request_error',
+                type: 'api_error',
                 message: 'Internal server error'
             }
         });
@@ -291,6 +292,157 @@ describe('Terminal Express Error Handler with Supertest', () => {
         expect(res.text).not.toContain('{bad json');
     });
 
+    test.each([
+        ['/v1/chat/completions', 'Authorization', 'Bearer test-key'],
+        ['/v1/messages', 'x-api-key', 'test-key'],
+        ['/v1/responses', 'Authorization', 'Bearer test-key'],
+        ['/v1beta/interactions', 'Authorization', 'Bearer test-key'],
+        ['/v1/interactions', 'Authorization', 'Bearer test-key'],
+    ])('unsupported Content-Type on %s returns a protocol-shaped 415 before route validation', async (path, authHeader, authValue) => {
+        const call = request(app).post(path).set(authHeader, authValue)
+            .set('Content-Type', 'text/plain').send('not JSON');
+        const res = await call;
+
+        expect(res.status).toBe(415);
+        if (path === '/v1/messages') {
+            expect(res.body).toEqual({
+                type: 'error',
+                error: {
+                    type: 'invalid_request_error',
+                    message: 'Unsupported or missing Content-Type; expected a JSON media type',
+                    code: 'unsupported_media_type'
+                }
+            });
+        } else {
+            expect(res.body).toEqual({
+                error: {
+                    message: 'Unsupported or missing Content-Type; expected a JSON media type',
+                    type: 'invalid_request_error',
+                    code: 'unsupported_media_type'
+                }
+            });
+        }
+    });
+
+    test('nonempty body without Content-Type returns 415, but an empty body can reach normal validation', async () => {
+        const missingType = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .set('Content-Type', '')
+            .send('not JSON');
+        expect(missingType.status).toBe(415);
+        expect(missingType.body.error.code).toBe('unsupported_media_type');
+
+        const missingBody = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .set('Content-Type', '');
+        expect(missingBody.status).toBe(400);
+        expect(missingBody.body.error.type).toBe('invalid_request_error');
+    });
+
+    test('empty chunked body without Content-Type reaches normal validation', async () => {
+        const server = app.listen(0, '127.0.0.1');
+        try {
+            await new Promise((resolve) => server.once('listening', resolve));
+            const address = server.address();
+            const port = typeof address === 'object' && address ? address.port : 0;
+            const rawResponse = await new Promise((resolve, reject) => {
+                const socket = net.createConnection({ host: '127.0.0.1', port });
+                let response = '';
+                socket.on('connect', () => {
+                    socket.write([
+                        'POST /v1/responses HTTP/1.1',
+                        'Host: 127.0.0.1',
+                        'Authorization: Bearer test-key',
+                        'Transfer-Encoding: chunked',
+                        'Connection: close',
+                        '',
+                        '0',
+                        '',
+                        '',
+                    ].join('\r\n'));
+                });
+                socket.on('data', (chunk) => { response += chunk.toString('utf8'); });
+                socket.on('error', reject);
+                socket.on('end', () => resolve(response));
+            });
+            expect(rawResponse).toMatch(/^HTTP\/1\.1 400\b/);
+            expect(rawResponse).toContain('"type":"invalid_request_error"');
+            expect(rawResponse).not.toContain('"code":"unsupported_media_type"');
+        } finally {
+            await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+        }
+    });
+
+    test('nonempty chunked body without Content-Type returns 415', async () => {
+        const server = app.listen(0, '127.0.0.1');
+        try {
+            await new Promise((resolve) => server.once('listening', resolve));
+            const address = server.address();
+            const port = typeof address === 'object' && address ? address.port : 0;
+            const rawResponse = await new Promise((resolve, reject) => {
+                const socket = net.createConnection({ host: '127.0.0.1', port });
+                let response = '';
+                socket.on('connect', () => {
+                    socket.write([
+                        'POST /v1/responses HTTP/1.1',
+                        'Host: 127.0.0.1',
+                        'Authorization: Bearer test-key',
+                        'Transfer-Encoding: chunked',
+                        'Connection: close',
+                        '',
+                        '4',
+                        'nope',
+                        '0',
+                        '',
+                        '',
+                    ].join('\r\n'));
+                });
+                socket.on('data', (chunk) => { response += chunk.toString('utf8'); });
+                socket.on('error', reject);
+                socket.on('end', () => resolve(response));
+            });
+            expect(rawResponse).toMatch(/^HTTP\/1\.1 415\b/);
+            expect(rawResponse).toContain('"code":"unsupported_media_type"');
+        } finally {
+            await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+        }
+    });
+
+    test('unsupported incomplete body is rejected and the connection is closed', async () => {
+        const server = app.listen(0, '127.0.0.1');
+        try {
+            await new Promise((resolve) => server.once('listening', resolve));
+            const address = server.address();
+            const port = typeof address === 'object' && address ? address.port : 0;
+            const rawResponse = await new Promise((resolve, reject) => {
+                const socket = net.createConnection({ host: '127.0.0.1', port });
+                let response = '';
+                socket.setTimeout(3000, () => socket.destroy(new Error('server did not close rejected request')));
+                socket.on('connect', () => {
+                    socket.write([
+                        'POST /v1/responses HTTP/1.1',
+                        'Host: 127.0.0.1',
+                        'Authorization: Bearer test-key',
+                        'Content-Type: text/plain',
+                        'Content-Length: 1048576',
+                        'Connection: keep-alive',
+                        '',
+                        'x'.repeat(64 * 1024),
+                    ].join('\r\n'));
+                });
+                socket.on('data', (chunk) => { response += chunk.toString('utf8'); });
+                socket.on('error', reject);
+                socket.on('end', () => resolve(response));
+            });
+            expect(rawResponse).toMatch(/^HTTP\/1\.1 415\b/);
+            expect(rawResponse).toMatch(/Connection: close/i);
+        } finally {
+            await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+        }
+    });
+
     test('unauthenticated malformed JSON returns 401 (auth before parsing)', async () => {
         const chatRes = await request(app)
             .post('/v1/chat/completions')
@@ -314,6 +466,25 @@ describe('Terminal Express Error Handler with Supertest', () => {
                 type: 'authentication_error',
                 message: 'Unauthorized'
             }
+        });
+    });
+
+    test('unauthenticated unsupported media type still returns 401 before media validation', async () => {
+        const chatRes = await request(app)
+            .post('/v1/chat/completions')
+            .set('Content-Type', 'text/plain')
+            .send('not JSON');
+        expect(chatRes.status).toBe(401);
+        expect(chatRes.body).toEqual({ error: { message: 'Unauthorized' } });
+
+        const messagesRes = await request(app)
+            .post('/v1/messages')
+            .set('Content-Type', 'text/plain')
+            .send('not JSON');
+        expect(messagesRes.status).toBe(401);
+        expect(messagesRes.body).toEqual({
+            type: 'error',
+            error: { type: 'authentication_error', message: 'Unauthorized' }
         });
     });
 
@@ -470,6 +641,26 @@ describe('Terminal Express Error Handler with Supertest', () => {
         await request(testApp).get('/stream');
         expect(nextCalledWith).toBeInstanceOf(Error);
         expect(nextCalledWith.message).toBe('stream broke mid-flight');
+    });
+
+    test('unexpected route errors use server_error and api_error in actual HTTP responses', async () => {
+        const testApp = express();
+        testApp.post('/v1/responses', (_req, _res, next) => next(new Error('secret internal detail')));
+        testApp.post('/v1/messages', (_req, _res, next) => next(new Error('secret internal detail')));
+        registerErrorHandler(testApp);
+
+        const openAiRes = await request(testApp).post('/v1/responses').send({});
+        expect(openAiRes.status).toBe(500);
+        expect(openAiRes.body).toEqual({ error: { message: 'Internal server error', type: 'server_error' } });
+        expect(openAiRes.text).not.toContain('secret internal detail');
+
+        const anthropicRes = await request(testApp).post('/v1/messages').send({});
+        expect(anthropicRes.status).toBe(500);
+        expect(anthropicRes.body).toEqual({
+            type: 'error',
+            error: { type: 'api_error', message: 'Internal server error' }
+        });
+        expect(anthropicRes.text).not.toContain('secret internal detail');
     });
 
     test('trailing slashes on bypass endpoints (/health/, /health/details/, /metrics/) bypass auth without 401 when API_KEY is configured', async () => {
