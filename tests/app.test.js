@@ -39,6 +39,7 @@ const sdkMockDefaults = {
     sessionCreate: async () => ({
         data: { id: 'test-session-id' }
     }),
+    sessionFork: async () => ({ data: { id: `test-fork-session-${++forkSequence}` } }),
     sessionPrompt: async (args) => {
         const promptText = args.body.prompt || args.body.parts?.map(part => part.text || '').join(' ') || '';
         const parts = [{ type: 'text', text: 'Mock response' }];
@@ -47,41 +48,60 @@ const sdkMockDefaults = {
             parts.unshift({ type: 'reasoning', text: 'Thinking process...' });
         }
 
-        return { data: { parts } };
+        return {
+            data: {
+                info: {
+                    id: `assistant-${args.path.id}`,
+                    role: 'assistant',
+                    parentID: args.body.messageID,
+                    finish: 'stop'
+                },
+                parts
+            }
+        };
     },
-    sessionMessages: async () => ([
+    sessionMessages: async (args) => ([
         {
-            info: { role: 'assistant', finish: 'stop' },
+            info: {
+                id: `assistant-${args?.path?.id || 'test-session-id'}`,
+                role: 'assistant',
+                parentID: sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0]?.body?.messageID,
+                finish: 'stop'
+            },
             parts: [
                 { type: 'text', text: 'Mock response' }
             ]
         }
     ]),
     sessionDelete: async () => ({}),
-    eventSubscribe: async () => {
-        const sessionId = 'test-session-id';
-        const mockEvents = [
-            { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: 'Thinking...' } },
-            { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: 'Mock' } },
-            { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: ' response' } },
-            { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
-        ];
-
-        return {
-            stream: (async function* () {
-                for (const event of mockEvents) {
-                    yield event;
-                }
-            })()
-        };
-    }
+    eventSubscribe: async () => ({
+        stream: (async function* () {
+            const prompt = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+            const sessionId = prompt?.path?.id || 'test-session-id';
+            const mockEvents = [
+                { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: 'Thinking...' } },
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: 'Mock' } },
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: ' response' } },
+                { type: 'message.updated', properties: { info: {
+                    id: `assistant-${sessionId}`,
+                    role: 'assistant',
+                    parentID: prompt?.body?.messageID,
+                    sessionID: sessionId,
+                    finish: 'stop'
+                } } }
+            ];
+            for (const event of mockEvents) yield event;
+        })()
+    })
 };
 
+let forkSequence = 0;
 const sdkMocks = {
     configProviders: jest.fn(sdkMockDefaults.configProviders),
     configUpdate: jest.fn(sdkMockDefaults.configUpdate),
     toolIds: jest.fn(sdkMockDefaults.toolIds),
     sessionCreate: jest.fn(sdkMockDefaults.sessionCreate),
+    sessionFork: jest.fn(sdkMockDefaults.sessionFork),
     sessionPrompt: jest.fn(sdkMockDefaults.sessionPrompt),
     sessionMessages: jest.fn(sdkMockDefaults.sessionMessages),
     sessionDelete: jest.fn(sdkMockDefaults.sessionDelete),
@@ -139,6 +159,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
         },
         session: {
             create: sdkMocks.sessionCreate,
+            fork: sdkMocks.sessionFork,
             prompt: sdkMocks.sessionPrompt,
             messages: sdkMocks.sessionMessages,
             delete: sdkMocks.sessionDelete
@@ -219,6 +240,17 @@ describe('Phase 1A tool policy and exact tool choice', () => {
         expect(preflightExternalToolChoice('required', [])).toEqual({ ok: true, normalized: { mode: 'auto', requiredTool: null } });
         expect(preflightExternalToolChoice('required', [registry[1]])).toEqual({ ok: true, normalized: { mode: 'auto', requiredTool: null } });
         expect(preflightExternalToolChoice({ type: 'any' }, [])).toEqual({ ok: true, normalized: { mode: 'auto', requiredTool: null } });
+    });
+
+    test('external tool reminder shows a valid JSON example', () => {
+        const registry = buildExternalToolRegistry([{ type: 'function', name: 'read' }]);
+        const { reminder } = buildToolExposure(registry);
+
+        expect(reminder).not.toContain('{...}');
+        const match = reminder.match(/<function_calls>(\{[\s\S]*?\})<\/function_calls>/);
+        expect(match).not.toBeNull();
+        const example = JSON.parse(match[1]);
+        expect(example).toEqual({ name: 'external__read', arguments: {} });
     });
 });
 
@@ -1203,7 +1235,7 @@ describe('Proxy OpenAI API', () => {
             const mockEvents = [
                 {
                     type: 'message.part.updated',
-                    properties: { part: { type: 'text', sessionID: sessionId }, delta: 'I need to search. ' }
+                    properties: { part: { id: 'p1', type: 'text', sessionID: sessionId }, delta: 'I need to search. ' }
                 },
                 {
                     type: 'message.updated',
@@ -1212,15 +1244,15 @@ describe('Proxy OpenAI API', () => {
                             sessionID: sessionId,
                             finish: 'stop',
                             parts: [
-                                { type: 'text', text: 'I need to search. ' },
-                                { type: 'tool', id: 'call_internal_1', tool: 'web_fetch', state: { status: 'pending', input: { url: 'https://example.com/weather' } } }
+                                { id: 'p1', type: 'text', text: 'I need to search. ' },
+                                { id: 'call_internal_1', type: 'tool', tool: 'web_fetch', state: { status: 'pending', input: { url: 'https://example.com/weather' } } }
                             ]
                         }
                     }
                 },
                 {
                     type: 'message.part.updated',
-                    properties: { part: { type: 'text', sessionID: sessionId }, delta: 'The weather is 14C.' }
+                    properties: { part: { id: 'p2', type: 'text', sessionID: sessionId }, delta: 'The weather is 14C.' }
                 },
                 {
                     type: 'message.updated',
@@ -1229,8 +1261,8 @@ describe('Proxy OpenAI API', () => {
                             sessionID: sessionId,
                             finish: 'stop',
                             parts: [
-                                { type: 'tool', id: 'call_internal_1', tool: 'web_fetch', state: { status: 'completed', input: { url: 'https://example.com/weather' }, output: '14C' } },
-                                { type: 'text', text: 'The weather is 14C.' }
+                                { id: 'call_internal_1', type: 'tool', tool: 'web_fetch', state: { status: 'completed', input: { url: 'https://example.com/weather' }, output: '14C' } },
+                                { id: 'p2', type: 'text', text: 'The weather is 14C.' }
                             ]
                         }
                     }
@@ -1357,9 +1389,9 @@ describe('Proxy OpenAI API', () => {
         expect(streamed).toContain('Done: 42.');
     });
 
-    test('polling fallback returns the last partial snapshot when the timeout is reached', async () => {
-        // If the message never reports completion, the partial text still beats throwing a
-        // timeout error and losing everything the model produced.
+    test('polling fallback fails closed when timeout is reached with partial response', async () => {
+        // When the message never reports completion and poll reaches timeout, recovery poll
+        // returns partial: true and must fail closed rather than emitting success.
         sdkMocks.sessionMessages.mockImplementation(async () => ([{
             info: { role: 'assistant' },
             parts: [{ type: 'text', text: 'Partial answer that never completes' }]
@@ -1387,7 +1419,9 @@ describe('Proxy OpenAI API', () => {
             });
 
         expect(res.statusCode).toEqual(200);
-        expect(res.text).toContain('Partial answer that never completes');
+        expect(res.text).toContain('Recovery poll returned incomplete response');
+        expect(res.text).not.toContain('data: [DONE]');
+        expect(res.text).not.toContain('"finish_reason":"stop"');
     });
 
     test('streaming surfaces an upstream message error without waiting out the first-delta window', async () => {
@@ -1525,6 +1559,15 @@ describe('Proxy OpenAI API', () => {
     });
 
     test('POST /v1/chat/completions emits tool_calls finish_reason in streaming for external tools', async () => {
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    { type: 'reasoning', text: 'Thinking...' },
+                    { type: 'text', text: '<function_calls>[{"id":"call_weather_stream_1","name":"external__weather_lookup","arguments":{"city":"Tokyo","unit":"celsius"}}]</function_calls>' }
+                ]
+            }
+        ]);
         sdkMocks.eventSubscribe.mockResolvedValueOnce({
             stream: (async function* () {
                 const sessionId = 'test-session-id';
@@ -2530,13 +2573,14 @@ describe('Proxy OpenAI API', () => {
     });
 
     test('non-streaming retries once on transient upstream CreditsError and recovers', async () => {
-        // Same mislabeled billing failure, polling path: first snapshot reports the
-        // CreditsError with no usable content, the retry succeeds.
+        // Same mislabeled billing failure, polling path: the first snapshot is
+        // explicitly terminal despite having no usable content, then the retry succeeds.
         sdkMocks.sessionMessages.mockReset();
         sdkMocks.sessionMessages
             .mockResolvedValueOnce([{
                 info: {
                     role: 'assistant',
+                    finish: 'stop',
                     error: { name: 'CreditsError', data: { message: '401: Insufficient balance', responseHeaders: { 'retry-after-ms': '10' } } }
                 },
                 parts: []
@@ -2600,6 +2644,38 @@ describe('Proxy Responses API previous_response_id', () => {
             return readSseData(text)
                 .flatMap((event) => event.choices || [])
                 .flatMap((choice) => (choice.delta?.content ? [choice.delta.content] : []));
+        };
+        const toolCallsFor = (path, text) => {
+            const frames = readSseData(text);
+            if (path === '/v1/responses') {
+                const argumentText = frames
+                    .filter((event) => event.type === 'response.function_call_arguments.delta')
+                    .map((event) => event.delta)
+                    .join('');
+                return frames
+                    .filter((event) => event.type === 'response.output_item.added' && event.item?.type === 'function_call')
+                    .map((event) => ({
+                        ...event.item,
+                        arguments: argumentText || event.item.arguments,
+                    }));
+            }
+            if (path === '/v1/messages') {
+                const inputJson = frames
+                    .filter((event) => event.type === 'content_block_delta' && event.delta?.type === 'input_json_delta')
+                    .map((event) => event.delta.partial_json)
+                    .join('');
+                return frames
+                    .filter((event) => event.type === 'content_block_start' && event.content_block?.type === 'tool_use')
+                    .map((event) => ({ ...event.content_block, arguments: inputJson }));
+            }
+            return frames
+                .flatMap((event) => event.choices || [])
+                .flatMap((choice) => choice.delta?.tool_calls || [])
+                .map((call) => ({
+                    id: call.id,
+                    name: call.function?.name,
+                    arguments: call.function?.arguments,
+                }));
         };
 
         test('non-stream parsing joins reasoning and content before extraction', async () => {
@@ -2940,7 +3016,89 @@ describe('Proxy Responses API previous_response_id', () => {
             ['chat', '/v1/chat/completions', { ...chatStreamPayload, tools: [readTool] }],
             ['messages', '/v1/messages', { ...messagesStreamPayload, tools: [{ name: 'read', description: 'Read a file', input_schema: readTool.function.parameters }] }],
             ['responses', '/v1/responses', { model: 'opencode/kimi-k2.5', input: 'Read a file', stream: true, tools: [{ type: 'function', name: 'read', parameters: readTool.function.parameters }] }]
-        ])('%s preserves partial output when recovery polling fails', async (_label, path, payload) => {
+        ])('%s repairs a partial raw delta from the final part snapshot', async (label, path, payload) => {
+            const callId = `call_partial_${label}`;
+            const complete = `<function_calls>{"id":"${callId}","name":"read","arguments":{"path":"a.txt"}}</function_calls>`;
+            sdkMocks.eventSubscribe.mockImplementationOnce(eventStream([
+                {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { id: 'part-text', type: 'text', sessionID: 'test-session-id' },
+                        delta: complete.slice(0, 25)
+                    }
+                },
+                {
+                    type: 'message.part.updated',
+                    properties: {
+                        part: { id: 'part-text', type: 'text', text: complete, sessionID: 'test-session-id' }
+                    }
+                },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
+            ]));
+            sdkMocks.sessionMessages.mockRejectedValue(new Error('poll must not run'));
+            const res = await request(app)
+                .post(path)
+                .set('Authorization', 'Bearer test-key')
+                .set('anthropic-version', '2023-06-01')
+                .send(payload);
+            expect(res.statusCode).toBe(200);
+            expect(res.text).toContain(callId);
+            expect(visibleTextFor(path, res.text).join('')).toBe('');
+            expect(sdkMocks.sessionMessages).not.toHaveBeenCalled();
+        });
+
+        test.each([
+            ['chat', '/v1/chat/completions', { ...chatStreamPayload, tools: [readTool] }],
+            ['messages', '/v1/messages', { ...messagesStreamPayload, tools: [{ name: 'read', description: 'Read a file', input_schema: readTool.function.parameters }] }],
+            ['responses', '/v1/responses', { model: 'opencode/kimi-k2.5', input: 'Read a file', stream: true, tools: [{ type: 'function', name: 'read', parameters: readTool.function.parameters }] }]
+        ])('%s repairs malformed raw markup from a recovery snapshot', async (label, path, payload) => {
+            const callId = `call_snapshot_${label}`;
+            const malformed = 'prefix <function_calls>{"name":"read" arguments</function_calls> suffix';
+            const valid = `<function_calls>{"id":"${callId}","name":"read","arguments":{"path":"a.txt"}}</function_calls>`;
+            sdkMocks.eventSubscribe.mockImplementationOnce(eventStream([
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: malformed } },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
+            ]));
+            sdkMocks.sessionMessages.mockResolvedValueOnce([{
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: valid }]
+            }]);
+            const res = await request(app)
+                .post(path)
+                .set('Authorization', 'Bearer test-key')
+                .set('anthropic-version', '2023-06-01')
+                .send(payload);
+            expect(res.statusCode).toBe(200);
+            expect(res.text).toContain(callId);
+            expect(sdkMocks.sessionMessages).toHaveBeenCalledTimes(1);
+        });
+
+        test.each([
+            ['chat', '/v1/chat/completions', { ...chatStreamPayload, tools: [readTool] }],
+            ['messages', '/v1/messages', { ...messagesStreamPayload, tools: [{ name: 'read', description: 'Read a file', input_schema: readTool.function.parameters }] }],
+            ['responses', '/v1/responses', { model: 'opencode/kimi-k2.5', input: 'Read a file', stream: true, tools: [{ type: 'function', name: 'read', parameters: readTool.function.parameters }] }]
+        ])('%s fails closed when malformed raw markup cannot be repaired', async (_label, path, payload) => {
+            const malformed = 'prefix <function_calls>{"name":"read" arguments</function_calls> suffix';
+            sdkMocks.eventSubscribe.mockImplementationOnce(eventStream([
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: malformed } },
+                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
+            ]));
+            sdkMocks.sessionMessages.mockRejectedValue(new Error('snapshot poll failed'));
+            const res = await request(app)
+                .post(path)
+                .set('Authorization', 'Bearer test-key')
+                .set('anthropic-version', '2023-06-01')
+                .send(payload);
+            expect(res.statusCode).toBe(200);
+            expect(res.text).toContain('malformed_external_tool_call');
+            expect(sdkMocks.sessionMessages).toHaveBeenCalledTimes(1);
+        });
+
+        test.each([
+            ['chat', '/v1/chat/completions', { ...chatStreamPayload, tools: [readTool] }],
+            ['messages', '/v1/messages', { ...messagesStreamPayload, tools: [{ name: 'read', description: 'Read a file', input_schema: readTool.function.parameters }] }],
+            ['responses', '/v1/responses', { model: 'opencode/kimi-k2.5', input: 'Read a file', stream: true, tools: [{ type: 'function', name: 'read', parameters: readTool.function.parameters }] }]
+        ])('%s fails closed when recovery polling fails', async (label, path, payload) => {
             sdkMocks.eventSubscribe.mockImplementationOnce(eventStreamThenThrow([
                 { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: 'partial answer' } }
             ]));
@@ -2951,8 +3109,103 @@ describe('Proxy Responses API previous_response_id', () => {
                 .set('anthropic-version', '2023-06-01')
                 .send(payload);
             expect(res.statusCode).toBe(200);
-            expect(visibleTextFor(path, res.text).join('')).toBe('partial answer');
-            expect(res.text).not.toContain('poll failed');
+            expect(res.text).toMatch(/event stream cut|poll failed/);
+            if (label === 'chat') {
+                expect(res.text).not.toContain('data: [DONE]');
+                expect(res.text).not.toContain('finish_reason');
+            } else if (label === 'messages') {
+                expect(res.text).not.toContain('message_stop');
+                expect(res.text).not.toContain('message_delta');
+            } else if (label === 'responses') {
+                expect(res.text).not.toContain('response.completed');
+            }
+        });
+
+        test.each([
+            ['chat', '/v1/chat/completions', { ...chatStreamPayload, tools: [readTool] }],
+            ['messages', '/v1/messages', { ...messagesStreamPayload, tools: [{ name: 'read', description: 'Read a file', input_schema: readTool.function.parameters }] }],
+            ['responses', '/v1/responses', { model: 'opencode/kimi-k2.5', input: 'Read a file', stream: true, tools: [{ type: 'function', name: 'read', parameters: readTool.function.parameters }] }]
+        ])('%s emits snapshot-only assistant content without polling', async (_label, path, payload) => {
+            sdkMocks.eventSubscribe.mockImplementationOnce(eventStream([
+                { type: 'message.part.updated', properties: { part: { id: 'part-snapshot-only', messageID: 'msg-assistant', type: 'text', sessionID: 'test-session-id' } } },
+                { type: 'message.part.updated', properties: { part: { id: 'part-snapshot-only', messageID: 'msg-assistant', type: 'text', text: 'Snapshot-only answer', sessionID: 'test-session-id' } } },
+                { type: 'message.updated', properties: { info: { id: 'msg-assistant', sessionID: 'test-session-id', role: 'assistant', finish: 'stop' } } }
+            ]));
+            sdkMocks.sessionMessages.mockRejectedValue(new Error('poll must not run'));
+            const res = await request(app)
+                .post(path)
+                .set('Authorization', 'Bearer test-key')
+                .set('anthropic-version', '2023-06-01')
+                .send(payload);
+            expect(res.statusCode).toBe(200);
+            expect(visibleTextFor(path, res.text).join('')).toBe('Snapshot-only answer');
+            expect(sdkMocks.sessionMessages).not.toHaveBeenCalled();
+        });
+
+        test.each([
+            ['chat', '/v1/chat/completions', { ...chatStreamPayload, tools: [readTool] }],
+            ['messages', '/v1/messages', { ...messagesStreamPayload, tools: [{ name: 'read', description: 'Read a file', input_schema: readTool.function.parameters }] }],
+            ['responses', '/v1/responses', { model: 'opencode/kimi-k2.5', input: 'Read a file', stream: true, tools: [{ type: 'function', name: 'read', parameters: readTool.function.parameters }] }]
+        ])('%s keeps divergent raw text visible while parsing a snapshot tool call', async (label, path, payload) => {
+            const callId = `call_divergent_${label}`;
+            sdkMocks.eventSubscribe.mockImplementationOnce(eventStream([
+                { type: 'message.part.updated', properties: { part: { id: 'part-content', messageID: 'msg-assistant', type: 'text', sessionID: 'test-session-id' }, delta: 'AC' } },
+                { type: 'message.part.updated', properties: { part: { id: 'part-reasoning', messageID: 'msg-assistant', type: 'reasoning', text: `<function_calls>{"id":"${callId}","name":"read","arguments":{"path":"a.txt"}}</function_calls>`, sessionID: 'test-session-id' } } },
+                { type: 'message.part.updated', properties: { part: { id: 'part-content', messageID: 'msg-assistant', type: 'text', text: 'ABC', sessionID: 'test-session-id' } } },
+                { type: 'message.updated', properties: { info: { id: 'msg-assistant', sessionID: 'test-session-id', role: 'assistant', finish: 'stop' } } }
+            ]));
+            sdkMocks.sessionMessages.mockRejectedValue(new Error('poll must not run'));
+            const res = await request(app)
+                .post(path)
+                .set('Authorization', 'Bearer test-key')
+                .set('anthropic-version', '2023-06-01')
+                .send(payload);
+            expect(res.statusCode).toBe(200);
+            expect(visibleTextFor(path, res.text).join('')).toBe('ABC');
+            expect(res.text).not.toContain('ACABC');
+            const calls = toolCallsFor(path, res.text);
+            expect(calls).toHaveLength(1);
+            expect(calls[0]).toMatchObject({ name: 'read' });
+            expect(JSON.stringify(calls[0].arguments ?? calls[0].input)).toContain('a.txt');
+            expect(sdkMocks.sessionMessages).not.toHaveBeenCalled();
+        });
+
+        test.each([
+            ['chat', '/v1/chat/completions', { ...chatStreamPayload, tools: [readTool] }],
+            ['messages', '/v1/messages', { ...messagesStreamPayload, tools: [{ name: 'read', description: 'Read a file', input_schema: readTool.function.parameters }] }],
+            ['responses', '/v1/responses', { model: 'opencode/kimi-k2.5', input: 'Read a file', stream: true, tools: [{ type: 'function', name: 'read', parameters: readTool.function.parameters }] }]
+        ])('%s never emits or parses a user prompt part', async (_label, path, payload) => {
+            const prompt = 'SECRET PROMPT <function_calls>{"id":"call_prompt","name":"read","arguments":{"path":"secret.txt"}}</function_calls>';
+            sdkMocks.eventSubscribe.mockImplementationOnce(eventStream([
+                {
+                    type: 'message.updated',
+                    properties: {
+                        info: {
+                            id: 'msg-user',
+                            sessionID: 'test-session-id',
+                            role: 'user',
+                            parts: [{ id: 'part-user', messageID: 'msg-user', type: 'text', text: prompt }]
+                        }
+                    }
+                },
+                { type: 'message.part.updated', properties: { part: { id: 'part-user', messageID: 'msg-user', type: 'text', text: prompt, sessionID: 'test-session-id' } } },
+                { type: 'message.updated', properties: { info: { id: 'msg-assistant', sessionID: 'test-session-id', role: 'assistant' } } },
+                { type: 'message.part.updated', properties: { part: { id: 'part-assistant', messageID: 'msg-assistant', type: 'text', sessionID: 'test-session-id' }, delta: 'Visible answer' } },
+                { type: 'message.part.updated', properties: { part: { id: 'part-assistant', messageID: 'msg-assistant', type: 'text', text: 'Visible answer', sessionID: 'test-session-id' } } },
+                { type: 'message.updated', properties: { info: { id: 'msg-assistant', sessionID: 'test-session-id', role: 'assistant', finish: 'stop' } } }
+            ]));
+            sdkMocks.sessionMessages.mockRejectedValue(new Error('poll must not run'));
+            const res = await request(app)
+                .post(path)
+                .set('Authorization', 'Bearer test-key')
+                .set('anthropic-version', '2023-06-01')
+                .send(payload);
+            expect(res.statusCode).toBe(200);
+            expect(visibleTextFor(path, res.text).join('')).toBe('Visible answer');
+            expect(res.text).not.toContain('SECRET PROMPT');
+            expect(res.text).not.toContain('call_prompt');
+            expect(toolCallsFor(path, res.text)).toEqual([]);
+            expect(sdkMocks.sessionMessages).not.toHaveBeenCalled();
         });
 
         test('chat stream disconnect aborts collection and deletes its session', async () => {
@@ -3180,10 +3433,24 @@ describe('Proxy Responses API previous_response_id', () => {
         });
 
         test('responses stream transfers a newly created owned session to response state', async () => {
-            sdkMocks.sessionMessages.mockResolvedValue([{ info: { role: 'assistant', finish: 'stop' }, parts: [] }]);
+            sdkMocks.sessionMessages.mockImplementation(async (args) => [{
+                info: {
+                    id: `assistant-${args?.path?.id}`,
+                    role: 'assistant',
+                    parentID: sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0]?.body?.messageID,
+                    finish: 'stop'
+                },
+                parts: []
+            }]);
             sdkMocks.eventSubscribe.mockImplementationOnce(eventStream([
                 { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: 'done' } },
-                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
+                { type: 'message.updated', properties: { info: {
+                    id: 'assistant-test-session-id',
+                    role: 'assistant',
+                    parentID: sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0]?.body?.messageID,
+                    sessionID: 'test-session-id',
+                    finish: 'stop'
+                } } }
             ]));
             sdkMocks.sessionCreate.mockClear();
             sdkMocks.sessionDelete.mockClear();
@@ -3211,11 +3478,22 @@ describe('Proxy Responses API previous_response_id', () => {
                 .send({ input: 'And a follow-up', previous_response_id: completed.response.id });
             expect(followUp.statusCode).toBe(200);
             expect(sdkMocks.sessionCreate).toHaveBeenCalledTimes(1);
+            expect(sdkMocks.sessionFork).toHaveBeenCalledWith({
+                path: { id: 'test-session-id' }
+            });
             expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
         });
 
         test('responses non-stream transfers a newly created owned session to response state', async () => {
-            sdkMocks.sessionMessages.mockResolvedValue([{ info: { role: 'assistant', finish: 'stop' }, parts: [] }]);
+            sdkMocks.sessionMessages.mockImplementation(async (args) => [{
+                info: {
+                    id: `assistant-${args?.path?.id}`,
+                    role: 'assistant',
+                    parentID: sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0]?.body?.messageID,
+                    finish: 'stop'
+                },
+                parts: []
+            }]);
             sdkMocks.sessionCreate.mockClear();
             sdkMocks.sessionDelete.mockClear();
             const res = await request(app)
@@ -3237,6 +3515,9 @@ describe('Proxy Responses API previous_response_id', () => {
                 .send({ input: 'And a follow-up', previous_response_id: res.body.id });
             expect(followUp.statusCode).toBe(200);
             expect(sdkMocks.sessionCreate).toHaveBeenCalledTimes(1);
+            expect(sdkMocks.sessionFork).toHaveBeenCalledWith({
+                path: { id: 'test-session-id' }
+            });
             expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
         });
 
@@ -3246,11 +3527,19 @@ describe('Proxy Responses API previous_response_id', () => {
                 .set('Authorization', 'Bearer test-key')
                 .send({ model: 'opencode/kimi-k2.5', input: 'seed' });
             expect(seed.statusCode).toBe(200);
+            const continuationSessionId = 'responses-error-fork';
+            sdkMocks.sessionFork.mockResolvedValueOnce({ data: { id: continuationSessionId } });
             sdkMocks.sessionDelete.mockClear();
-            sdkMocks.sessionMessages.mockResolvedValue([{ info: { role: 'assistant', finish: 'stop' }, parts: [] }]);
+            sdkMocks.sessionMessages.mockImplementation(async () => {
+                const latestPrompt = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+                return [{
+                    info: { role: 'assistant', parentID: latestPrompt?.body?.messageID, finish: 'stop' },
+                    parts: [],
+                }];
+            });
             sdkMocks.eventSubscribe.mockImplementationOnce(eventStream([
-                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: '<function_calls>{"name":"read" arguments</function_calls>' } },
-                { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
+                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: continuationSessionId }, delta: '<function_calls>{"name":"read" arguments</function_calls>' } },
+                { type: 'message.updated', properties: { info: { sessionID: continuationSessionId, finish: 'stop' } } }
             ]));
             const res = await request(app)
                 .post('/v1/responses')
@@ -3262,7 +3551,8 @@ describe('Proxy Responses API previous_response_id', () => {
                     tools: [{ type: 'function', name: 'read', parameters: readTool.function.parameters }]
                 });
             expect(res.text).toContain('response.failed');
-            expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
+            expect(sdkMocks.sessionDelete).toHaveBeenCalledWith({ path: { id: continuationSessionId } });
+            expect(sdkMocks.sessionDelete).not.toHaveBeenCalledWith({ path: { id: 'test-session-id' } });
         });
 
         test.each([
@@ -3756,7 +4046,8 @@ describe('Proxy Responses API previous_response_id', () => {
 
         test('Phase 2A mid-stream failure finalizes the announced item and reports it as partial failed output', async () => {
             setToolStream([
-                { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'test-session-id' }, delta: 'Partial answer' } },
+                { type: 'message.updated', properties: { info: { id: 'assistant-partial', role: 'assistant', sessionID: 'test-session-id' } } },
+                { type: 'message.part.updated', properties: { part: { id: 'partial-part', messageID: 'assistant-partial', type: 'text', sessionID: 'test-session-id' }, delta: 'Partial answer' } },
                 { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', error: { name: 'MessageAbortedError', data: { message: 'upstream aborted mid-turn' } } } } },
             ]);
             const res = await request(app)
@@ -4142,7 +4433,10 @@ describe('Proxy Responses API previous_response_id', () => {
             .set('Authorization', 'Bearer test-key')
             .send(payload);
         const replyWithToolCall = (callId, namespacedName, args) => sdkMocks.sessionPrompt.mockResolvedValueOnce({
-            data: { parts: [{ type: 'text', text: `<function_calls>{"id":"${callId}","name":"${namespacedName}","arguments":${args}}</function_calls>` }] }
+            data: {
+                info: { id: 'assistant-test-session-id', role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: `<function_calls>{"id":"${callId}","name":"${namespacedName}","arguments":${args}}</function_calls>` }]
+            }
         });
         const streamedCallReply = (callId, namespacedName, args) => sdkMocks.eventSubscribe.mockImplementationOnce(eventStreamLite([
             {
@@ -4152,7 +4446,7 @@ describe('Proxy Responses API previous_response_id', () => {
                     delta: `<function_calls>{"id":"${callId}","name":"${namespacedName}","arguments":${args}}</function_calls>`
                 }
             },
-            { type: 'message.updated', properties: { info: { sessionID: 'test-session-id', finish: 'stop' } } }
+            { type: 'message.updated', properties: { info: { id: 'assistant-test-session-id', role: 'assistant', sessionID: 'test-session-id', finish: 'stop' } } }
         ]));
 
         describe('declaration expansion', () => {
@@ -5358,6 +5652,38 @@ describe('Proxy Responses API previous_response_id', () => {
                 const first = await postResponses({ model: 'opencode/kimi-k2.5', input: 'Read a.txt', tools: [liteRead] });
                 expect(first.statusCode).toBe(200);
 
+                let continuationMessageID;
+                sdkMocks.sessionPrompt.mockImplementationOnce(async (params) => {
+                    continuationMessageID = params.body.messageID;
+                    return { data: { parts: [] } };
+                });
+                sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+                    stream: (async function* () {
+                        yield {
+                            type: 'message.part.delta',
+                            properties: {
+                                sessionID: 'test-session-id',
+                                messageID: 'assistant-stream-continuation',
+                                partID: 'continuation-answer-part',
+                                field: 'text',
+                                delta: 'Continuation completed',
+                            },
+                        };
+                        yield {
+                            type: 'message.updated',
+                            properties: {
+                                info: {
+                                    id: 'assistant-stream-continuation',
+                                    role: 'assistant',
+                                    parentID: continuationMessageID,
+                                    finish: 'stop',
+                                    sessionID: 'test-session-id',
+                                },
+                            },
+                        };
+                    })(),
+                }));
+
                 const res = await postResponses({
                     previous_response_id: first.body.id,
                     stream: true,
@@ -5394,7 +5720,10 @@ describe('Proxy Responses API previous_response_id', () => {
                         `{"id":"call_cap_${index}","name":"external__read","arguments":{"path":"a-${index}.txt"}}`
                 ).join(',');
                 sdkMocks.sessionPrompt.mockResolvedValueOnce({
-                    data: { parts: [{ type: 'text', text: `<function_calls>[${calls}]</function_calls>` }] }
+                    data: {
+                        info: { id: 'assistant-test-session-id', role: 'assistant', finish: 'stop' },
+                        parts: [{ type: 'text', text: `<function_calls>[${calls}]</function_calls>` }]
+                    }
                 });
                 const first = await postResponses({
                     model: 'opencode/kimi-k2.5',
@@ -5439,7 +5768,10 @@ describe('Proxy Responses API previous_response_id', () => {
                             `{"id":"call_cap_${index}","name":"external__read","arguments":{"path":"a-${index}.txt"}}`
                     ).join(',');
                     sdkMocks.sessionPrompt.mockResolvedValueOnce({
-                        data: { parts: [{ type: 'text', text: `<function_calls>[${calls}]</function_calls>` }] }
+                        data: {
+                            info: { id: 'assistant-test-session-id', role: 'assistant', finish: 'stop' },
+                            parts: [{ type: 'text', text: `<function_calls>[${calls}]</function_calls>` }]
+                        }
                     });
                     const res = await request(debugApp)
                         .post('/v1/responses')

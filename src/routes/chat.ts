@@ -13,6 +13,10 @@ import {
   createToolCallFilter,
   createExternalToolCallStreamParser,
 } from '../tool-runtime/parser.js';
+import {
+  isMalformedExternalToolCallError,
+  resolveAuthoritativeStreamSource,
+} from '../tool-runtime/stream-source.js';
 import { isTransientUpstreamError, normalizeBackendError, transformUpstreamError } from '../errors/upstream.js';
 import { engageFallbackForFreeLimit } from '../upstream-proxy/fallback.js';
 import { detectHostedSearchTools } from '../search/grounding.js';
@@ -27,6 +31,7 @@ import type { Application, Request, Response } from 'express';
 import type { AppContext } from '../types/context.js';
 import type { ExternalToolEntry } from '../tool-runtime/registry.js';
 import type { FinalToolCall } from '../tool-runtime/parser.js';
+import type { AuthoritativeStreamSource } from '../tool-runtime/stream-source.js';
 import { asRecord, toErrorMessage } from '../utils/guards.js';
 
 function asArray(value: unknown): unknown[] {
@@ -86,12 +91,94 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
   app.post('/v1/chat/completions', (req: Request, res: Response): void => {
     void (async (): Promise<void> => {
       try {
+        const body = asRecord((req as unknown as { body: unknown }).body);
+        const messages: unknown = body['messages'];
+        const model: unknown = body['model'];
+        const toolsRaw: unknown = body['tools'];
+        const tools: unknown[] = Array.isArray(toolsRaw) ? (toolsRaw as unknown[]) : [];
+        const tool_choice: unknown = body['tool_choice'];
+        const requestStream: unknown = body['stream'];
+        const temperature: unknown = body['temperature'];
+        const max_tokens: unknown = body['max_tokens'];
+        const top_p: unknown = body['top_p'];
+        const frequency_penalty: unknown = body['frequency_penalty'];
+        const presence_penalty: unknown = body['presence_penalty'];
+        const stop: unknown = body['stop'];
+        const reasoning_effort: unknown = body['reasoning_effort'];
+        const reasoning: unknown = body['reasoning'];
+        const requestOpencodeConfig: unknown = body['opencode'];
+        const parallelToolCalls: boolean = body['parallel_tool_calls'] !== false;
+        const stream = Boolean(requestStream);
+        if (!messages || !Array.isArray(messages) || (messages as unknown[]).length === 0) {
+          res.status(400).json({ error: { message: 'messages array is required' } });
+          return;
+        }
+        if (detectHostedSearchTools(tools).requested) {
+          res.status(400).json({
+            error: {
+              message:
+                'web_search is not supported on /v1/chat/completions; use POST /v1/responses with tools:[{type:"web_search"}] or POST /v1beta/interactions with tools:[{type:"google_search"}]',
+              type: 'invalid_request_error',
+            },
+          });
+          return;
+        }
+        const unsupportedChatToolIndex = tools.findIndex((def) => {
+          const t = asRecord(def);
+          return t['type'] !== 'function';
+        });
+        if (unsupportedChatToolIndex >= 0) {
+          const rawType = asRecord(tools[unsupportedChatToolIndex])['type'];
+          const label = typeof rawType === 'string' && rawType.trim() ? rawType.trim() : 'missing';
+          res.status(400).json({
+            error: {
+              message: `Unsupported tool type "${label}" at tools[${unsupportedChatToolIndex}]. Only function tools are supported on this endpoint.`,
+              type: 'invalid_request_error',
+              code: 'unsupported_tool_type',
+            },
+          });
+          return;
+        }
+
+        const reasoningLevel = normalizeReasoningEffort(
+          (reasoning_effort as string) || (asRecord(reasoning)['effort'] as string),
+          null,
+        );
+
+        const requestParams: Record<string, unknown> = {
+          temperature: typeof temperature === 'number' ? temperature : 0.7,
+          max_tokens: typeof max_tokens === 'number' ? max_tokens : null,
+          top_p: typeof top_p === 'number' ? top_p : 1.0,
+          frequency_penalty: typeof frequency_penalty === 'number' ? frequency_penalty : 0,
+          presence_penalty: typeof presence_penalty === 'number' ? presence_penalty : 0,
+          stop: Array.isArray(stop) ? stop : stop ? [stop] : null,
+          reasoning_effort: reasoningLevel,
+        };
+
+        logDebug('Request params', {
+          temperature: requestParams['temperature'],
+          max_tokens: requestParams['max_tokens'],
+          top_p: requestParams['top_p'],
+          reasoning_effort: reasoningLevel,
+        });
+
+        let pID = 'opencode';
+        let mID = 'kimi-k2.5-free';
+        const resolvedModel = (await withTimeout(
+          resolveRequestedModel(model),
+          REQUEST_TIMEOUT_MS,
+          'resolve model',
+        )) as unknown as { providerID: string; modelID: string; aliasFrom?: string; resolved?: string };
+        const resolvedRecord = asRecord(resolvedModel);
+        pID = String(resolvedRecord['providerID'] ?? pID);
+        mID = String(resolvedRecord['modelID'] ?? mID);
+        if (resolvedRecord['aliasFrom']) {
+          logDebug('Resolved model alias', { from: resolvedRecord['aliasFrom'], to: resolvedRecord['resolved'] });
+        }
+
         await lock(async (): Promise<void> => {
           let sessionId: string | null = null;
           let eventStream: { close?: unknown } | null = null;
-          let stream = false;
-          let pID = 'opencode';
-          let mID = 'kimi-k2.5-free';
           let id = `chatcmpl-${crypto.randomUUID()}`;
            let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
            const requestAbortController = new AbortController();
@@ -124,89 +211,6 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
           if (proxyPool.isEngaged()) switchToProxyBundle();
 
           try {
-            const body = asRecord((req as unknown as { body: unknown }).body);
-            const messages: unknown = body['messages'];
-            const model: unknown = body['model'];
-            const toolsRaw: unknown = body['tools'];
-            const tools: unknown[] = Array.isArray(toolsRaw) ? (toolsRaw as unknown[]) : [];
-            const tool_choice: unknown = body['tool_choice'];
-            const requestStream: unknown = body['stream'];
-            const temperature: unknown = body['temperature'];
-            const max_tokens: unknown = body['max_tokens'];
-            const top_p: unknown = body['top_p'];
-            const frequency_penalty: unknown = body['frequency_penalty'];
-            const presence_penalty: unknown = body['presence_penalty'];
-            const stop: unknown = body['stop'];
-            const reasoning_effort: unknown = body['reasoning_effort'];
-            const reasoning: unknown = body['reasoning'];
-            const requestOpencodeConfig: unknown = body['opencode'];
-            const parallelToolCalls: boolean = body['parallel_tool_calls'] !== false;
-            stream = Boolean(requestStream);
-            if (!messages || !Array.isArray(messages) || (messages as unknown[]).length === 0) {
-              res.status(400).json({ error: { message: 'messages array is required' } });
-              return;
-            }
-            if (detectHostedSearchTools(tools).requested) {
-              res.status(400).json({
-                error: {
-                  message:
-                    'web_search is not supported on /v1/chat/completions; use POST /v1/responses with tools:[{type:"web_search"}] or POST /v1beta/interactions with tools:[{type:"google_search"}]',
-                  type: 'invalid_request_error',
-                },
-              });
-              return;
-            }
-            const unsupportedChatToolIndex = tools.findIndex((def) => {
-              const t = asRecord(def);
-              return t['type'] !== 'function';
-            });
-            if (unsupportedChatToolIndex >= 0) {
-              const rawType = asRecord(tools[unsupportedChatToolIndex])['type'];
-              const label = typeof rawType === 'string' && rawType.trim() ? rawType.trim() : 'missing';
-              res.status(400).json({
-                error: {
-                  message: `Unsupported tool type "${label}" at tools[${unsupportedChatToolIndex}]. Only function tools are supported on this endpoint.`,
-                  type: 'invalid_request_error',
-                  code: 'unsupported_tool_type',
-                },
-              });
-              return;
-            }
-
-            const reasoningLevel = normalizeReasoningEffort(
-              (reasoning_effort as string) || (asRecord(reasoning)['effort'] as string),
-              null,
-            );
-
-            const requestParams: Record<string, unknown> = {
-              temperature: typeof temperature === 'number' ? temperature : 0.7,
-              max_tokens: typeof max_tokens === 'number' ? max_tokens : null,
-              top_p: typeof top_p === 'number' ? top_p : 1.0,
-              frequency_penalty: typeof frequency_penalty === 'number' ? frequency_penalty : 0,
-              presence_penalty: typeof presence_penalty === 'number' ? presence_penalty : 0,
-              stop: Array.isArray(stop) ? stop : stop ? [stop] : null,
-              reasoning_effort: reasoningLevel,
-            };
-
-            logDebug('Request params', {
-              temperature: requestParams['temperature'],
-              max_tokens: requestParams['max_tokens'],
-              top_p: requestParams['top_p'],
-              reasoning_effort: reasoningLevel,
-            });
-
-            const resolvedModel = await withTimeout(
-              resolveRequestedModel(model),
-              REQUEST_TIMEOUT_MS,
-              'resolve model',
-            ) as unknown as { providerID: string; modelID: string; aliasFrom?: string; resolved?: string };
-            const resolvedRecord = asRecord(resolvedModel);
-            pID = String(resolvedRecord['providerID'] ?? pID);
-            mID = String(resolvedRecord['modelID'] ?? mID);
-            if (resolvedRecord['aliasFrom']) {
-              logDebug('Resolved model alias', { from: resolvedRecord['aliasFrom'], to: resolvedRecord['resolved'] });
-            }
-
             const normalizeMessageContent = (content: unknown): string => normalizeTextContent(content);
 
             const buildPromptParts = async (
@@ -471,6 +475,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
             res.setHeader('Cache-Control', 'no-cache');
             res.setHeader('Connection', 'keep-alive');
             if (stream) {
+              res.setHeader('X-Accel-Buffering', 'no');
               const flushHeaders = (res as unknown as { flushHeaders?: unknown }).flushHeaders;
              if (typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
              const onClientClose = (): void => {
@@ -515,8 +520,8 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               const ensureKeepalive = (): void => {
                 if (!keepaliveInterval) {
                   keepaliveInterval = setInterval(() => {
-                    if (!res.destroyed) {
-                      res.write(': keepalive\n\n');
+                    if (!res.destroyed && !res.writableEnded) {
+                      res.write(': keepalive\n');
                     }
                   }, 15000);
                 }
@@ -568,10 +573,16 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
 
                let collected: Record<string, unknown> | null = null;
                let lastStreamAttemptError: unknown = null;
-               let polledSnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
+               let polledSnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null = null;
                let snapshotPolled = false;
-               let snapshotPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> | null = null;
-               const pollSnapshot = async (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> => {
+               let snapshotPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> | null = null;
+               const hasRecoveryEvidence = (snapshot: { content: string; reasoning: string; toolParts?: unknown }): boolean =>
+                 Boolean(
+                   snapshot.content ||
+                     snapshot.reasoning ||
+                     (Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0),
+                 );
+               const pollSnapshot = async (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean }> => {
                  snapshotPolled = true;
                  if (!snapshotPromise) {
                     snapshotPromise = activePollForAssistantResponse(
@@ -586,13 +597,14 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                };
                // Recovery snapshots repeat what the event stream already delivered. Only the
                // suffix past the raw prefix may be replayed, otherwise every recovered turn
-               // duplicates text. A snapshot the raw prefix does not match is still sent in
-               // full rather than dropped.
+               // duplicates text. A divergent snapshot (raw "AC", snapshot "ABC") is not a
+               // safe replay: emitting the whole snapshot would produce "ACABC". Tool calls
+               // are still parsed from the snapshot group; visible text keeps the raw stream.
                const unsentSuffix = (full: unknown, raw: string): string => {
                  const text = typeof full === 'string' ? full : '';
                  if (!text) return '';
                  if (!raw) return text;
-                 return text.startsWith(raw) ? text.slice(raw.length) : text;
+                 return text.startsWith(raw) ? text.slice(raw.length) : '';
                };
                 const replaySnapshot = (snapshot: { content: string; reasoning: string; error: unknown }): void => {
                   if (snapshot.error != null) throw snapshot.error;
@@ -601,45 +613,31 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   if (remainingReasoning) sendDelta(remainingReasoning, true);
                   if (remainingContent) sendDelta(remainingContent, false);
                 };
-                const hasPartialOutput = (): boolean => {
-                  const current = asRecord(collected);
-                  return Boolean(
-                    rawStreamedContent ||
-                    rawStreamedReasoning ||
-                    streamedToolCalls.length > 0 ||
-                    current['content'] ||
-                    current['reasoning'],
-                  );
-                };
                 const recoverSnapshot = async (
                   fallbackError: unknown = null,
-                ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown } | null> => {
+                ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean } | null> => {
                   if (clientDisconnected) return null;
-                  let snapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown };
+                  let snapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; partial?: boolean };
                   try {
                     snapshot = await pollSnapshot();
                   } catch (error: unknown) {
                     if (clientDisconnected) return null;
-                    if (hasPartialOutput()) {
-                      logDebug('Ignoring recovery poll failure after partial stream output', { error: toErrorMessage(error) });
-                      return null;
-                    }
                     if (fallbackError != null) throw fallbackError;
                     throw error;
                   }
-                   if (snapshot.error != null) throw snapshot.error;
-                   if (
-                     fallbackError != null &&
-                     !snapshot.content &&
-                     !snapshot.reasoning &&
-                     !(Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0)
-                   ) throw fallbackError;
-                   return snapshot;
-
+                  if (snapshot.error != null) throw snapshot.error;
+                  if (snapshot.partial === true) throw new Error('Recovery poll returned incomplete response');
+                  if (!hasRecoveryEvidence(snapshot)) {
+                    if (fallbackError != null) throw fallbackError;
+                    return null;
+                  }
+                  return snapshot;
                 };
 
               for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
                 if (attempt > 1) {
+                  if (fallbackToProxy) switchToProxyBundle();
+                  await ensureActiveModel(activeClient, pID, mID).catch(() => {});
                   try {
                     await activeClient.session.delete({ path: { id: sessionId } });
                   } catch (e: unknown) {
@@ -662,6 +660,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                     polledSnapshot = null;
                     snapshotPolled = false;
                     snapshotPromise = null;
+                    fallbackServed = false;
                    filterContentDelta = createToolCallFilter({
                      disableTools: DISABLE_TOOLS,
                      forceStrip: shouldBufferExternalStream,
@@ -684,8 +683,13 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                     // through the proxy bundle instead of the event stream.
                     // Deltas go out immediately so the post-loop poll is skipped.
                     await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-                     const pres = (await pollSnapshot()) as { content: string; reasoning: string; error: unknown };
-                     polledSnapshot = pres;
+                    const pres = await pollSnapshot();
+                    if (pres.error != null) throw pres.error;
+                    if (pres.partial === true) throw new Error('Recovery poll returned incomplete response');
+                    if (!hasRecoveryEvidence(pres) && externalToolChoice.mode !== 'required') {
+                      throw new Error('Recovery poll returned empty response');
+                    }
+                    polledSnapshot = pres;
                     const presReasoning = unsentSuffix(pres.reasoning, rawStreamedReasoning);
                     const presContent = unsentSuffix(pres.content, rawStreamedContent);
                     if (presReasoning) sendDelta(presReasoning, true);
@@ -696,7 +700,7 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                     collected = {
                       content: pres.content,
                       reasoning: pres.reasoning,
-                      ...(pres.error ? { error: pres.error } : {}),
+                      toolParts: pres.toolParts,
                     };
                   } else {
                     const collectPromise = collectFromEvents(
@@ -761,8 +765,8 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                     polledSnapshot = snapshot;
                     replaySnapshot(snapshot);
                   }
-                } else if (collectedR['noData']) {
-                  logDebug('Fallback to polling (stream)', { sessionId });
+                } else if (collectedR['noData'] || collectedR['cut']) {
+                  logDebug('Fallback to polling (stream)', { sessionId, cut: Boolean(collectedR['cut']) });
                   const snapshot = await recoverSnapshot();
                   if (snapshot) {
                     polledSnapshot = snapshot;
@@ -792,11 +796,14 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   !collectedR['__error'] &&
                   !collectedR['noData'] &&
                   !collectedR['idleTimeout'] &&
+                  !collectedR['cut'] &&
                   !collectedR['cancelled'] &&
+                  collectedR['finish'] !== 'tool' &&
+                  collectedR['finish'] !== 'tool-calls' &&
                   (rawStreamedContent || rawStreamedReasoning || streamedToolCalls.length > 0 || collectedR['content'] || collectedR['reasoning']),
                 );
 
-                if (!fallbackServed && !rawStreamedContent && !rawStreamedReasoning && !hasValidTerminal) {
+                if (!fallbackServed && !hasValidTerminal) {
                   logDebug('SSE returned empty, falling back to polling', { sessionId });
                   const snapshot = await recoverSnapshot();
                   if (snapshot) {
@@ -821,12 +828,53 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   }
                 }
 
+                if (!hasValidTerminal && !polledSnapshot && !fallbackServed) {
+                  if (streamedToolCalls.length === 0 && externalToolChoice.mode !== 'required') {
+                    throw new Error('Stream ended without valid terminal');
+                  }
+                }
+
 
               const flushedReasoningCalls = parseReasoningToolCalls.flush ? parseReasoningToolCalls.flush() : [];
               const flushedContentCalls = parseContentToolCalls.flush ? parseContentToolCalls.flush() : [];
               const flushedReasoningText = filterReasoningDelta.flush ? filterReasoningDelta.flush() : '';
               const flushedContentText = filterContentDelta.flush ? filterContentDelta.flush() : '';
+              const parseJoined = (reasoning: string, content: string): FinalToolCall[] =>
+                externalToolRegistry.length > 0
+                  ? parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content)
+                  : [];
+              const callsFromText = (source: AuthoritativeStreamSource): FinalToolCall[] =>
+                externalToolRegistry.length > 0
+                  ? parseJoined(source.reasoning, source.content)
+                  : [];
+              const callsFromRaw = (source: AuthoritativeStreamSource): FinalToolCall[] =>
+                externalToolRegistry.length > 0
+                  ? mergeToolCallArtifacts(
+                      streamedToolCalls,
+                      flushedReasoningCalls,
+                      flushedContentCalls,
+                      parseJoined(source.reasoning, source.content),
+                    )
+                  : [];
+              // One authoritative source group. The snapshot (recovery poll or
+              // collector-authoritative full text) replaces the raw delta group;
+              // validating both independently fails complete snapshots whenever a
+              // delta was dropped. Raw is only used when no snapshot exists.
+              let authoritativeSource = resolveAuthoritativeStreamSource({
+                collected: collectedR,
+                polledSnapshot,
+                rawContent: rawStreamedContent,
+                rawReasoning: rawStreamedReasoning,
+              });
+              const streamSource = (): string[][] => [[authoritativeSource.reasoning, authoritativeSource.content]];
+
               if (!shouldBufferExternalStream) {
+                if (rawStreamedContent && authoritativeSource.content && !authoritativeSource.content.startsWith(rawStreamedContent)) {
+                  throw new Error('Stream content diverged from authoritative snapshot');
+                }
+                if (rawStreamedReasoning && authoritativeSource.reasoning && !authoritativeSource.reasoning.startsWith(rawStreamedReasoning)) {
+                  throw new Error('Stream reasoning diverged from authoritative snapshot');
+                }
                 appendFilteredDelta(flushedReasoningText, true);
                 appendFilteredDelta(flushedContentText, false);
                 writeVisibleDelta(flushedReasoningText, true);
@@ -834,49 +882,89 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               } else {
                 const visible = stripExternalToolCallMarkupFromJoinedText(
                   externalToolRegistry,
-                  rawStreamedReasoning,
-                  rawStreamedContent,
+                  authoritativeSource.reasoning,
+                  authoritativeSource.content,
                 );
                 streamedReasoning = visible.reasoning;
                 streamedContent = visible.content;
               }
 
-              const snapshotReasoning = polledSnapshot?.reasoning ?? (typeof collectedR['reasoning'] === 'string' ? collectedR['reasoning'] as string : rawStreamedReasoning);
-              const snapshotContent = polledSnapshot?.content ?? (typeof collectedR['content'] === 'string' ? collectedR['content'] as string : rawStreamedContent);
-              const parseJoined = (reasoning: string, content: string): FinalToolCall[] =>
-                externalToolRegistry.length > 0
-                  ? parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content)
-                  : [];
-              const streamSource = [
-                [snapshotReasoning, snapshotContent],
-                [rawStreamedReasoning, rawStreamedContent]
-              ];
-              let parsedToolCalls: FinalToolCall[] = externalToolRegistry.length > 0
-                ? mergeToolCallArtifacts(
-                    streamedToolCalls,
-                    flushedReasoningCalls,
-                    flushedContentCalls,
-                    parseJoined(snapshotReasoning, snapshotContent),
-                    parseJoined(rawStreamedReasoning, rawStreamedContent),
-                  )
-                : [];
+              let parsedToolCalls: FinalToolCall[] = authoritativeSource.fromSnapshot
+                ? callsFromText(authoritativeSource)
+                : callsFromRaw(authoritativeSource);
+              const repairFromSnapshot = async (): Promise<boolean> => {
+                if (externalToolRegistry.length === 0) return false;
+                // Reuse an already-polled snapshot (partial timeout snapshots are
+                // valid repair evidence when they contain a complete call). Only
+                // poll when no snapshot attempt has been made.
+                let snapshot = polledSnapshot;
+                if (!snapshot) {
+                  if (snapshotPolled) return false;
+                  try {
+                    snapshot = await recoverSnapshot();
+                  } catch {
+                    return false;
+                  }
+                }
+                if (!snapshot || snapshot.error != null) return false;
+                const repairedSource: AuthoritativeStreamSource = {
+                  content: String(snapshot.content ?? ''),
+                  reasoning: String(snapshot.reasoning ?? ''),
+                  kind: 'polled-snapshot',
+                  fromSnapshot: true,
+                };
+                const snapshotCalls = parseJoined(repairedSource.reasoning, repairedSource.content);
+                if (snapshotCalls.length === 0) return false;
+                try {
+                  assertToolCallArtifactIntegrity(snapshotCalls, externalToolRegistry, [
+                    [repairedSource.reasoning, repairedSource.content],
+                  ]);
+                } catch {
+                  return false;
+                }
+                polledSnapshot = snapshot;
+                authoritativeSource = repairedSource;
+                parsedToolCalls = snapshotCalls;
+                if (shouldBufferExternalStream) {
+                  const visible = stripExternalToolCallMarkupFromJoinedText(
+                    externalToolRegistry,
+                    authoritativeSource.reasoning,
+                    authoritativeSource.content,
+                  );
+                  streamedReasoning = visible.reasoning;
+                  streamedContent = visible.content;
+                }
+                return true;
+              };
               let finalStreamedToolCalls: FinalToolCall[];
               try {
-                assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource);
+                try {
+                  assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource());
+                } catch (integrityError) {
+                  if (!isMalformedExternalToolCallError(integrityError) || !(await repairFromSnapshot())) {
+                    throw integrityError;
+                  }
+                }
                 if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
                   const forcedResponse = await requestForcedChatToolCall();
                   if (forcedResponse) {
                     const forcedReasoning = typeof forcedResponse['reasoning'] === 'string' ? forcedResponse['reasoning'] as string : '';
                     const forcedContent = typeof forcedResponse['content'] === 'string' ? forcedResponse['content'] as string : '';
                     parsedToolCalls = mergeToolCallArtifacts(parsedToolCalls, parseJoined(forcedReasoning, forcedContent));
-                    assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [forcedReasoning, forcedContent]);
+                    authoritativeSource = {
+                      content: `${authoritativeSource.content}${forcedContent}`,
+                      reasoning: `${authoritativeSource.reasoning}${forcedReasoning}`,
+                      kind: authoritativeSource.kind,
+                      fromSnapshot: authoritativeSource.fromSnapshot,
+                    };
+                    assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource());
                   }
                 }
                 finalStreamedToolCalls = finalizeStreamToolCalls(
                   parsedToolCalls,
                   externalToolRegistry,
                   externalToolChoice,
-                  streamSource,
+                  streamSource(),
                   parallelToolCalls,
                 ) as unknown as FinalToolCall[];
               } catch (toolError) {
@@ -989,6 +1077,8 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                   return;
                 }
                 if (attempt > 1) {
+                  if (fallbackToProxy) switchToProxyBundle();
+                  await ensureActiveModel(activeClient, pID, mID).catch(() => {});
                   try {
                     await activeClient.session.delete({ path: { id: sessionId } });
                   } catch (e: unknown) {
@@ -1016,9 +1106,18 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
                      requestAbortController.signal,
                    );
 
-                  content = collected.content || '';
-                  reasoning = collected.reasoning || '';
-                  error = collected.error || null;
+                   content = collected.content || '';
+                   reasoning = collected.reasoning || '';
+                   error =
+                     collected.error ||
+                     (collected.partial === true
+                       ? new Error('Polling returned incomplete response')
+                       : externalToolChoice.mode !== 'required' &&
+                           !content &&
+                           !reasoning &&
+                           !(Array.isArray(collected.toolParts) && collected.toolParts.length > 0)
+                         ? new Error('Polling returned empty response')
+                         : null);
                 } catch (promptError: unknown) {
                   content = '';
                   reasoning = '';
@@ -1165,10 +1264,18 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
             if (!res.headersSent) {
               const transformed = transformUpstreamError(error);
               res.status(transformed.statusCode).json(transformed.error);
-            } else if (!res.destroyed) {
-              const transformed = transformUpstreamError(error);
-              res.write(`data: ${JSON.stringify({ error: transformed.error })}\n\n`);
-              res.end();
+            } else if (!res.writableEnded && !res.destroyed) {
+              try {
+                const transformed = transformUpstreamError(error);
+                res.write(`data: ${JSON.stringify({ error: transformed.error })}\n\n`);
+              } catch {
+                // ignore write failure on closed stream
+              }
+              try {
+                res.end();
+              } catch {
+                // ignore end failure
+              }
             }
              if (sessionId) {
                try {
@@ -1199,13 +1306,16 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
       } catch (error: unknown) {
         console.error('[Proxy] Request Handler Error:', toErrorMessage(error));
         if (!res.headersSent) {
-          const er = asRecord(error);
-          res.status(500).json({
-            error: {
-              message: toErrorMessage(error),
-              type: error instanceof Error ? error.constructor.name : String(er['name'] ?? 'Error'),
-            },
-          });
+          const transformed = transformUpstreamError(error);
+          res.status(transformed.statusCode).json(transformed.error);
+        } else if (!res.writableEnded && !res.destroyed) {
+          try {
+            const transformed = transformUpstreamError(error);
+            res.write(`data: ${JSON.stringify({ error: transformed.error })}\n\n`);
+          } catch {
+            // ignore
+          }
+          res.end();
         }
       }
     })();

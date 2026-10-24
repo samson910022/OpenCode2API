@@ -1,5 +1,6 @@
 // P4 TS: POST /v1/responses (ported from P3 .js, behavior identical).
 import crypto from 'crypto';
+import { makeId } from '../converters/json.js';
 import {
   ADDITIONAL_TOOLS_ITEM_TYPE,
   collectAdditionalToolSources,
@@ -21,6 +22,10 @@ import {
   createToolCallFilter,
   createExternalToolCallStreamParser,
 } from '../tool-runtime/parser.js';
+import {
+  isMalformedExternalToolCallError,
+  resolveAuthoritativeStreamSource,
+} from '../tool-runtime/stream-source.js';
 import { isTransientUpstreamError, normalizeBackendError, transformUpstreamError, createInvalidRequestError, createToolDiscoveryUnavailableError } from '../errors/upstream.js';
 import { engageFallbackForFreeLimit } from '../upstream-proxy/fallback.js';
 import {
@@ -41,7 +46,9 @@ import type { AppContext } from '../types/context.js';
 import type { ExternalToolEntry } from '../tool-runtime/registry.js';
 import type { ResponseToolCallState } from '../types/backend.js';
 import type { FinalToolCall } from '../tool-runtime/parser.js';
+import type { AuthoritativeStreamSource } from '../tool-runtime/stream-source.js';
 import { asRecord, toErrorMessage } from '../utils/guards.js';
+import { getContinuationTenantId, getIdempotencyControl } from '../idempotency/middleware.js';
 
 function readDataMessage(e: unknown): string {
   const r = asRecord(e);
@@ -214,9 +221,22 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
   } = ctx;
 
   app.post('/v1/responses', async (req: Request, res: Response): Promise<void> => {
+     const idempotency = getIdempotencyControl(req);
      let responsesKeepalive: ReturnType<typeof setInterval> | null = null;
      let responsesResClosed: Promise<boolean> | null = null;
      const responsesAbortController = new AbortController();
+     responsesResClosed = new Promise<boolean>((resolve) =>
+       res.once('close', () => {
+         const disconnected = !(res as unknown as { writableFinished?: boolean }).writableFinished;
+         if (disconnected) responsesAbortController.abort();
+         resolve(disconnected);
+       }),
+     );
+     const assertResponsesCanPrompt = (): void => {
+       if (responsesAbortController.signal.aborted || res.destroyed || res.writableEnded) {
+         throw new Error('Client disconnected');
+       }
+     };
 
     const stopResponsesKeepalive = (): void => {
       if (responsesKeepalive) {
@@ -231,17 +251,32 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
     let activePromptWithTimeout = promptWithTimeout;
     let activePollForAssistantResponse = pollForAssistantResponse;
     let fallbackToProxy = false;
+    let fallbackServed = false;
     let ownedResponsesSessionId: string | null = null;
+    let responsesCleanupScheduled = false;
     let responsesStreamState: ResponsesStreamState | null = null;
-    const cleanupOwnedResponsesSession = async (): Promise<void> => {
+    const cleanupOwnedResponsesSessionNow = async (): Promise<void> => {
       const ownedSessionId = ownedResponsesSessionId;
-      ownedResponsesSessionId = null;
       if (!ownedSessionId) return;
       try {
         await activeClient.session.delete({ path: { id: ownedSessionId } });
+        if (ownedResponsesSessionId === ownedSessionId) ownedResponsesSessionId = null;
       } catch (error: unknown) {
         logDebug('Failed to cleanup owned responses session', { sessionId: ownedSessionId, error: toErrorMessage(error) });
       }
+    };
+    const cleanupOwnedResponsesSession = async (): Promise<void> => {
+      if (!ownedResponsesSessionId) return;
+      if (idempotency?.submitted) {
+        // Keep a possibly submitted child available for unknown-outcome
+        // reconciliation. Delete only after the full wire response is cached.
+        if (!responsesCleanupScheduled) {
+          responsesCleanupScheduled = true;
+          idempotency.onCompleted(() => cleanupOwnedResponsesSessionNow());
+        }
+        return;
+      }
+      await cleanupOwnedResponsesSessionNow();
     };
     const switchToProxyBundle = (): boolean => {
       if (!proxyClient) return false;
@@ -268,7 +303,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
             ? previousModel
             : 'unknown';
       const state: ResponsesStreamState = {
-        id: `resp_${crypto.randomUUID()}`,
+        id: idempotency?.publicId ?? `resp_${crypto.randomUUID()}`,
         createdAt: Math.floor(Date.now() / 1000),
         model: initialModel,
         tools: requestTools,
@@ -305,26 +340,22 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       };
       state.adoptResolvedModel = (resolvedModel: string) => {
         state.model = resolvedModel;
-        state.emitCreated();
+        if (!idempotency?.reconciling) state.emitCreated();
       };
+      idempotency?.setPublicId(state.id);
       responsesStreamState = state;
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
       const flushHeaders = (res as unknown as { flushHeaders?: unknown }).flushHeaders;
-      if (typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
-      responsesKeepalive = setInterval(() => {
-        if (!res.destroyed && !res.writableEnded) res.write(': heartbeat\n\n');
-      }, 15000);
-      responsesResClosed = new Promise<boolean>((resolve) =>
-        res.once('close', () => {
-          if (!res.writableEnded) {
-            responsesAbortController.abort();
-            resolve(true);
-          }
-        }),
-      );
-      return state;
+      if (!idempotency?.reconciling && typeof flushHeaders === 'function') (flushHeaders as () => void).call(res);
+      if (!idempotency?.reconciling) {
+        responsesKeepalive = setInterval(() => {
+          if (!res.destroyed && !res.writableEnded) res.write(': heartbeat\n');
+        }, 15000);
+      }
+       return state;
     };
     const getResponsesResClosed = (): Promise<boolean> | null => responsesResClosed;
     if (proxyPool.isEngaged()) switchToProxyBundle();
@@ -354,10 +385,12 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       const previousResponseId: unknown = body['previous_response_id'];
       const requestOpencodeConfig: unknown = body['opencode'];
 
+      const tenantId = getContinuationTenantId(req);
+      const store = body['store'] !== false;
       const previousState =
-        typeof previousResponseId === 'string' && previousResponseId ? getResponseState(previousResponseId) : null;
+        typeof previousResponseId === 'string' && previousResponseId ? getResponseState(previousResponseId, tenantId) : null;
       if (stream) responsesStreamState = initializeResponsesStream(model, previousState?.model, tools, parallelToolCalls);
-      if (previousResponseId && !previousState) {
+      if (!idempotency?.reconciling && previousResponseId && (!previousState || !previousState.checkpointId)) {
         rejectInvalidRequest('Invalid or expired previous_response_id', 'invalid_previous_response_id');
         return;
       }
@@ -633,12 +666,13 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       }
 
       const resolvedModel = (await withTimeout(
-        resolveRequestedModel(model ?? previousState?.model),
+        resolveRequestedModel(model ?? idempotency?.model ?? previousState?.model),
         REQUEST_TIMEOUT_MS,
         'resolve model',
       )) as unknown as { providerID: string; modelID: string };
       const pID = String(asRecord(resolvedModel)['providerID']);
       const mID = String(asRecord(resolvedModel)['modelID']);
+      idempotency?.setModel(`${pID}/${mID}`);
       if (responsesStreamState) responsesStreamState.adoptResolvedModel(`${pID}/${mID}`);
 
       await ensureBackend(config);
@@ -650,8 +684,25 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         // ignore
       }
 
-      let sessionId: string | null = previousState?.sessionId || null;
-      if (!sessionId) {
+      let sessionId: string | null = idempotency?.reconciling ? idempotency.childSessionId : null;
+      if (idempotency?.reconciling) {
+        // Unknown retries reuse the exact recorded child and never fork again.
+        if (!sessionId) throw new Error('Idempotency reconciliation is missing its child session');
+        // This is a request-owned child, not the parent continuation session.
+        // Keep it until the wire result is captured unless it becomes stored state.
+        ownedResponsesSessionId = sessionId;
+      } else if (previousState) {
+        const forkRes = (await withTimeout(
+          activeClient.session.fork({
+            path: { id: previousState.sessionId },
+          }),
+          REQUEST_TIMEOUT_MS,
+          'fork continuation session',
+        )) as unknown;
+        sessionId = (asRecord(asRecord(forkRes)['data'])['id'] as string | undefined) ?? null;
+        if (!sessionId) throw new Error('Failed to fork OpenCode continuation session');
+        ownedResponsesSessionId = sessionId;
+      } else {
         const sessionRes = (await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
         sessionId = (asRecord(asRecord(sessionRes)['data'])['id'] as string | undefined) ?? null;
         if (!sessionId) {
@@ -755,8 +806,42 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           toolOverrides,
           requestTimeoutMs: REQUEST_TIMEOUT_MS,
           forbidThinkBlock: false,
+          signal: responsesAbortController.signal,
+          requireTerminalCompletion: Boolean(idempotency),
+          assertCanPrompt: assertResponsesCanPrompt,
+          ...(idempotency
+            ? {
+                beforePrompt: (forcedSessionId: string, userMessageId: string): void => {
+                  idempotency.markSubmitted(forcedSessionId, userMessageId, `${pID}/${mID}`);
+                },
+              }
+            : {}),
         });
       let requestForcedResponsesToolCall = makeForcedResponsesToolCallRequester();
+      const confirmForcedResponsesToolCall = (forcedResponse: Record<string, unknown>): void => {
+        if (!idempotency) return;
+        const assistantMessageId = forcedResponse['assistantMessageId'];
+        const userMessageId = forcedResponse['userMessageId'];
+        const hasActiveToolState = Array.isArray(forcedResponse['toolParts']) &&
+          (forcedResponse['toolParts'] as unknown[]).some((part) => {
+            const partRecord = asRecord(part);
+            const state = asRecord(partRecord['state']);
+            const status = state['status'] ?? partRecord['status'];
+            return partRecord['type'] === 'tool' && (status === 'pending' || status === 'running');
+          });
+        if (
+          forcedResponse['complete'] !== true ||
+          typeof assistantMessageId !== 'string' ||
+          !assistantMessageId ||
+          typeof idempotency.userMessageId !== 'string' ||
+          !idempotency.userMessageId ||
+          userMessageId !== idempotency.userMessageId ||
+          hasActiveToolState
+        ) {
+          throw new Error('Idempotency forced tool result is incomplete or does not identify the exact assistant turn');
+        }
+        idempotency.confirmResult(idempotency.userMessageId, assistantMessageId);
+      };
 
       const promptParams: { path: { id: string }; body: Record<string, unknown> } = {
         path: { id: sessionId as string },
@@ -768,6 +853,39 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           ...(temperature !== undefined ? { temperature } : {}),
           ...(top_p !== undefined ? { top_p } : {}),
         },
+      };
+      promptParams.body.messageID = idempotency?.reconciling
+        ? idempotency.userMessageId
+        : makeId('msg_');
+      if (typeof promptParams.body.messageID !== 'string' || !promptParams.body.messageID) {
+        throw new Error('Idempotency reconciliation is missing its user message ID');
+      }
+      const hasConfirmedIdempotencyResult = (): boolean => Boolean(
+        idempotency?.resultConfirmed &&
+        typeof idempotency.confirmedAssistantMessageId === 'string' &&
+        idempotency.confirmedAssistantMessageId.trim(),
+      );
+      const assertIdempotencyResultConfirmed = (): void => {
+        if (idempotency?.submitted && !hasConfirmedIdempotencyResult()) {
+          throw new Error('Idempotency result is not confirmed for the exact assistant turn');
+        }
+      };
+      const isExactTerminalPoll = (result: unknown): boolean => {
+        const poll = asRecord(result);
+        return poll['complete'] === true &&
+          poll['partial'] !== true &&
+          typeof poll['assistantMessageId'] === 'string' &&
+          poll['assistantMessageId'].trim().length > 0 &&
+          typeof idempotency?.userMessageId === 'string' &&
+          poll['userMessageId'] === idempotency.userMessageId;
+      };
+      const confirmExactTerminalPoll = (result: unknown): void => {
+        if (!idempotency?.submitted) return;
+        if (!isExactTerminalPoll(result)) {
+          throw new Error('Idempotency result is incomplete or does not identify the exact assistant turn');
+        }
+        const poll = asRecord(result);
+        idempotency.confirmResult(idempotency.userMessageId as string, poll['assistantMessageId'] as string);
       };
       // Stage-5: strip false entries for free-tier suspects (any false gates; true-only sent, all-false omitted).
       const promptToolOverrides = selectPromptToolOverrides(toolOverrides, pID, mID);
@@ -1011,7 +1129,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         // Intentional: buffer while any external tool contract is declared so tool
         // markup is never streamed before classification. Pure-text turns also batch.
         const shouldBufferExternalStream = externalToolRegistry.length > 0;
-        const deferVisibleOutput = shouldBufferExternalStream || hostedSearch.requested;
+        const deferVisibleOutput = shouldBufferExternalStream || hostedSearch.requested || Boolean(idempotency);
         let filterContentDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
         let filterReasoningDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldBufferExternalStream, registry: externalToolRegistry });
         let parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
@@ -1098,8 +1216,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               summary_index: 0,
               delta: filtered,
             });
-          } else if (filtered.trim()) {
+          } else {
             const entry = ensureOutputScaffold();
+            announcedContent = true;
             emit({
               type: 'response.output_text.delta',
               sequence_number: nextSeq(),
@@ -1121,143 +1240,426 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           appendVisibleDelta(filtered, isReasoning);
           if (!deferVisibleOutput) writeVisibleDelta(filtered, isReasoning);
         };
+         // Only the suffix past the raw prefix is safe to replay. A divergent
+         // snapshot (raw "AC", snapshot "ABC") would duplicate visible text if
+         // appended whole; tool calls can still be parsed from the snapshot.
          const unsentSuffix = (full: unknown, raw: string): string => {
            const text = typeof full === 'string' ? full : '';
            if (!text) return '';
            if (!raw) return text;
-           return text.startsWith(raw) ? text.slice(raw.length) : text;
+           return text.startsWith(raw) ? text.slice(raw.length) : '';
+         };
+         // Snapshot replay is display-only: tool calls are parsed once from the
+         // authoritative source. Feeding snapshot text through the delta parser
+         // would create streamed artifacts with empty arguments and mix stale
+         // partial calls into the final merge.
+         const replaySnapshotText = (snapshotContent: unknown, snapshotReasoning: unknown): void => {
+           const remainingContent = unsentSuffix(snapshotContent, rawContent);
+           const remainingReasoning = unsentSuffix(snapshotReasoning, rawReasoning);
+           if (!remainingContent && !remainingReasoning) return;
+           // Keep the buffered raw text in sync so the later static strip of
+           // `rawContent`/`rawReasoning` does not erase the replayed suffix.
+           if (remainingContent) rawContent += remainingContent;
+           if (remainingReasoning) rawReasoning += remainingReasoning;
+           const visible = stripExternalToolCallMarkupFromJoinedText(
+             externalToolRegistry,
+             remainingReasoning,
+             remainingContent,
+           );
+           if (!visible.content && !visible.reasoning) return;
+           appendVisibleDelta(visible.reasoning, true);
+           appendVisibleDelta(visible.content, false);
+           if (!deferVisibleOutput) {
+             writeVisibleDelta(visible.reasoning, true);
+             writeVisibleDelta(visible.content, false);
+           }
          };
 
-        let collected: Record<string, unknown> | null = null;
-        try {
-          if (fallbackToProxy) {
-            // SSE subscribe ignores custom fetch (SDK gap): prompt through the
-            // proxy bundle; the poll below (line ~614) fills content/reasoning.
-            await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-          } else {
-            const collectPromise = collectFromEvents(
-              sessionId as string,
-              REQUEST_TIMEOUT_MS,
-              sendResponsesDelta,
-               DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-               DEFAULT_EVENT_IDLE_TIMEOUT_MS,
-               responsesAbortController.signal,
-             );
-
-             const safeCollect = collectPromise.catch((err: unknown) => ({ __error: err }));
-             activeClient.session.prompt(promptParams).catch((err: unknown) => logDebug('Responses prompt error:', toErrorMessage(err)));
-             const closePromise = getResponsesResClosed();
-             const raced = closePromise
-               ? await Promise.race([safeCollect, closePromise.then(() => ({ __cancelled: true }))])
-               : await safeCollect;
-            const racedRecord = asRecord(raced);
-            if (racedRecord['__cancelled']) {
-              stopResponsesKeepalive();
-              try {
-                if (!res.destroyed) res.end();
-              } catch {
-                // ignore
-              }
-              return;
-            }
-            collected = raced as Record<string, unknown>;
-          }
-        } catch (e: unknown) {
-          collected = { __error: e };
-        }
-
-          const collectedR = asRecord(collected);
-          if (responsesAbortController.signal.aborted || collectedR['cancelled']) {
-            stopResponsesKeepalive();
-            return;
-          }
-          if (collectedR['error'] != null) {
-
-           throw normalizeBackendError(collectedR['error']);
-         }
         let streamSearchToolParts: unknown[] = [];
         const keepStreamToolParts = (polled: { toolParts?: unknown }): void => {
           if (hostedSearch.requested && Array.isArray(polled.toolParts) && polled.toolParts.length > 0) {
             streamSearchToolParts = polled.toolParts;
           }
         };
-         let recoverySnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
-         let recoveryPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> | null = null;
-         const pollRecoverySnapshot = (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown }> => {
-           if (!recoveryPromise) {
-             recoveryPromise = activePollForAssistantResponse(
-               sessionId as string,
-               REQUEST_TIMEOUT_MS,
-               undefined,
-               responsesAbortController.signal,
-             );
-           }
-           return recoveryPromise;
-         };
-         const hasPartialOutput = (): boolean => Boolean(
-           rawContent || rawReasoning || streamedToolCalls.length > 0 || content || reasoning,
-         );
-         const hasValidTerminal = Boolean(
-           collected &&
-           !collectedR['__error'] &&
+        let recoverySnapshot: { content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; userMessageId?: string; partial?: boolean; complete?: boolean } | null = null;
+        let recoveryPromise: Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; userMessageId?: string; partial?: boolean; complete?: boolean }> | null = null;
+        let currentAssistantMessageId: string | null = null;
+        const isContinuation = Boolean(previousState?.sessionId);
+        const hasRecoveryEvidence = (snapshot: { content: string; reasoning: string; toolParts?: unknown }): boolean =>
+          Boolean(
+            snapshot.content ||
+              snapshot.reasoning ||
+              (Array.isArray(snapshot.toolParts) && snapshot.toolParts.length > 0),
+          );
+        const pollRecoverySnapshot = (): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; userMessageId?: string; partial?: boolean; complete?: boolean }> => {
+          if (!recoveryPromise) {
+            recoveryPromise = activePollForAssistantResponse(
+              sessionId as string,
+              REQUEST_TIMEOUT_MS,
+              undefined,
+              responsesAbortController.signal,
+              idempotency?.submitted
+                ? (idempotency.userMessageId ?? undefined)
+                : isContinuation ? String(promptParams.body['messageID']) : undefined,
+              Boolean(idempotency),
+            );
+          }
+          return recoveryPromise;
+        };
+        let collected: Record<string, unknown> | null = null;
+        let lastStreamAttemptError: unknown = null;
+        let promptSubmitted = false;
+        let promptPromise: Promise<unknown> | null = null;
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          collected = null;
+          let promptError: unknown = null;
+          if (attempt > 1) {
+            if (fallbackToProxy) switchToProxyBundle();
+            await ensureActiveModel(activeClient, pID, mID).catch(() => {});
+            const retriedSessionId = sessionId;
+            if (!isContinuation && !idempotency?.submitted) {
+              promptSubmitted = false;
+              if (retriedSessionId && ownedResponsesSessionId === retriedSessionId) {
+                await cleanupOwnedResponsesSession();
+                if (ownedResponsesSessionId === retriedSessionId) {
+                  throw new Error('Failed to cleanup retried OpenCode session');
+                }
+              }
+              const retrySessionRes = (await withTimeout(
+                activeClient.session.create(),
+                REQUEST_TIMEOUT_MS,
+                'create session',
+              )) as unknown;
+              sessionId = (asRecord(asRecord(retrySessionRes)['data'])['id'] as string | undefined) ?? null;
+              if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
+              ownedResponsesSessionId = sessionId;
+              promptParams.path.id = sessionId;
+            } else {
+              if (promptPromise) {
+                await promptPromise.catch(() => {});
+              }
+            }
+            requestForcedResponsesToolCall = makeForcedResponsesToolCallRequester();
+            content = '';
+            reasoning = '';
+            rawContent = '';
+            rawReasoning = '';
+            streamedToolCalls.length = 0;
+            filterContentDelta = createToolCallFilter({
+              disableTools: DISABLE_TOOLS,
+              forceStrip: shouldBufferExternalStream,
+              registry: externalToolRegistry,
+            });
+            filterReasoningDelta = createToolCallFilter({
+              disableTools: DISABLE_TOOLS,
+              forceStrip: shouldBufferExternalStream,
+              registry: externalToolRegistry,
+            });
+            parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+            parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+            recoverySnapshot = null;
+            recoveryPromise = null;
+            fallbackServed = false;
+            await sleep(computeRetryDelay(attempt - 1, lastStreamAttemptError));
+          }
+          try {
+            if (idempotency?.reconciling) {
+              const reconciled = await activePollForAssistantResponse(
+                sessionId as string,
+                REQUEST_TIMEOUT_MS,
+                undefined,
+              responsesAbortController.signal,
+              idempotency.userMessageId ?? undefined,
+              true,
+            );
+              if (reconciled.error != null) {
+                if (isExactTerminalPoll(reconciled)) {
+                  confirmExactTerminalPoll(reconciled);
+                  throw normalizeBackendError(reconciled.error);
+                }
+                throw new Error('Idempotency reconciliation has no confirmed assistant result');
+              }
+              if (
+                !isExactTerminalPoll(reconciled)
+              ) {
+                throw new Error('Idempotency reconciliation has no confirmed assistant result');
+              }
+              confirmExactTerminalPoll(reconciled);
+              recoverySnapshot = reconciled;
+              currentAssistantMessageId = reconciled.assistantMessageId ?? null;
+              keepStreamToolParts(reconciled);
+              responsesStreamState?.emitCreated();
+              replaySnapshotText(reconciled.content, reconciled.reasoning);
+              collected = {
+                content: reconciled.content,
+                reasoning: reconciled.reasoning,
+                toolParts: reconciled.toolParts,
+                assistantMessageId: reconciled.assistantMessageId,
+                userMessageId: reconciled.userMessageId,
+                complete: reconciled.complete,
+                finish: 'stop',
+              };
+            } else if (fallbackToProxy) {
+              // SSE subscribe ignores custom fetch (SDK gap): prompt through the
+              // proxy bundle; the poll below fills content/reasoning.
+              if (!((isContinuation || idempotency?.submitted) && promptSubmitted)) {
+                if (isContinuation) {
+                  promptSubmitted = true;
+                }
+                if (idempotency) {
+                  idempotency.markSubmitted(
+                    sessionId as string,
+                    String(promptParams.body['messageID']),
+                    `${pID}/${mID}`,
+                  );
+                }
+                promptSubmitted = true;
+                assertResponsesCanPrompt();
+                const promptResult = await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                const promptInfo = asRecord(asRecord(asRecord(promptResult)['data'])['info']);
+                const promptMessageId = promptInfo['id'] ?? promptInfo['messageID'] ?? promptInfo['messageId'];
+          if (typeof promptMessageId === 'string' && promptMessageId) currentAssistantMessageId = promptMessageId;
+                promptSubmitted = true;
+              }
+              const pres = await pollRecoverySnapshot();
+              if (idempotency?.submitted) confirmExactTerminalPoll(pres);
+              if (pres.error != null) {
+                collected = { error: pres.error };
+              } else if (pres.partial === true) {
+                collected = { error: new Error('Recovery poll returned incomplete response') };
+              } else if (!hasRecoveryEvidence(pres) && externalToolChoice.mode !== 'required') {
+                collected = { error: new Error('Recovery poll returned empty response') };
+              } else {
+                recoverySnapshot = pres;
+                currentAssistantMessageId = pres.assistantMessageId ?? currentAssistantMessageId;
+                keepStreamToolParts(pres);
+                if (pres.content || pres.reasoning) {
+                  replaySnapshotText(pres.content, pres.reasoning);
+                  fallbackServed = true;
+                }
+                collected = {
+                  content: pres.content,
+                  reasoning: pres.reasoning,
+                  toolParts: pres.toolParts,
+                  assistantMessageId: pres.assistantMessageId,
+                  userMessageId: pres.userMessageId,
+                  complete: pres.complete,
+                };
+              }
+            } else {
+              const collectPromise = collectFromEvents(
+                sessionId as string,
+                REQUEST_TIMEOUT_MS,
+                sendResponsesDelta,
+                DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
+                DEFAULT_EVENT_IDLE_TIMEOUT_MS,
+                responsesAbortController.signal,
+                idempotency?.submitted
+                  ? (idempotency.userMessageId ?? undefined)
+                  : isContinuation ? String(promptParams.body['messageID']) : undefined,
+              );
+
+              const safeCollect = collectPromise.catch((err: unknown) => ({ __error: err }));
+              if ((isContinuation || idempotency?.submitted) && promptSubmitted) {
+                // Do NOT prompt again!
+              } else {
+                if (isContinuation || idempotency) {
+                  promptSubmitted = true;
+                }
+                if (idempotency) {
+                  idempotency.markSubmitted(
+                    sessionId as string,
+                    String(promptParams.body['messageID']),
+                    `${pID}/${mID}`,
+                  );
+                }
+                assertResponsesCanPrompt();
+                promptPromise = activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS)
+                  .then((promptResult: unknown) => {
+                    const promptInfo = asRecord(asRecord(asRecord(promptResult)['data'])['info']);
+                    const promptMessageId = promptInfo['id'] ?? promptInfo['messageID'] ?? promptInfo['messageId'];
+                if (typeof promptMessageId === 'string' && promptMessageId) currentAssistantMessageId = promptMessageId;
+                    promptSubmitted = true;
+                  })
+                  .catch((err: unknown) => {
+                    promptError = err;
+                    logDebug('Responses prompt error:', toErrorMessage(err));
+                  });
+              }
+              const closePromise = getResponsesResClosed();
+              const raced = closePromise
+                ? await Promise.race([safeCollect, closePromise.then(() => ({ __cancelled: true }))])
+                : await safeCollect;
+              const racedRecord = asRecord(raced);
+              if (racedRecord['__cancelled']) {
+                stopResponsesKeepalive();
+                try {
+                  if (!res.destroyed) res.end();
+                } catch {
+                  // ignore
+                }
+                return;
+              }
+              collected = raced as Record<string, unknown>;
+            }
+          } catch (e: unknown) {
+            collected = { __error: e };
+          }
+
+          const collectedRecord = asRecord(collected);
+          if (typeof collectedRecord['assistantMessageId'] === 'string') {
+            currentAssistantMessageId = collectedRecord['assistantMessageId'] as string;
+          }
+          let attemptError: unknown = promptError ?? (collectedRecord['error'] ?? collectedRecord['__error'] ?? null);
+          if (!attemptError && (collectedRecord['noData'] || collectedRecord['cut'] || collectedRecord['idleTimeout'])) {
+            try {
+              const recovery = await pollRecoverySnapshot();
+              if (recovery.error != null) {
+                attemptError = recovery.error;
+              } else if (recovery.partial === true) {
+                attemptError = new Error('Recovery poll returned incomplete response');
+              } else if (!hasRecoveryEvidence(recovery)) {
+                if (streamedToolCalls.length === 0 && externalToolChoice.mode !== 'required') {
+                  attemptError = new Error('Recovery poll returned empty response');
+                }
+              } else {
+                recoverySnapshot = recovery;
+                keepStreamToolParts(recovery);
+                replaySnapshotText(recovery.content, recovery.reasoning);
+                currentAssistantMessageId = recovery.assistantMessageId ?? currentAssistantMessageId;
+                collected = {
+                  content: recovery.content,
+                  reasoning: recovery.reasoning,
+                  toolParts: recovery.toolParts,
+                  assistantMessageId: recovery.assistantMessageId,
+                };
+              }
+            } catch (pollErr: unknown) {
+              attemptError = pollErr;
+            }
+          }
+          const nothingStreamed = !rawContent && !rawReasoning && streamedToolCalls.length === 0;
+          if (idempotency?.submitted && attemptError) {
+            const recovered = await pollRecoverySnapshot();
+            confirmExactTerminalPoll(recovered);
+            if (recovered.error != null) throw normalizeBackendError(recovered.error);
+            recoverySnapshot = recovered;
+            currentAssistantMessageId = recovered.assistantMessageId ?? currentAssistantMessageId;
+            keepStreamToolParts(recovered);
+            collected = recovered;
+            attemptError = null;
+          } else if (isContinuation && attemptError) {
+            throw normalizeBackendError(attemptError);
+          }
+          if (attemptError && nothingStreamed && attempt < maxAttempts && engageProxyFallback(attemptError)) {
+            lastStreamAttemptError = attemptError;
+            continue;
+          }
+          if (attemptError && nothingStreamed && attempt < maxAttempts && isTransientUpstreamError(attemptError)) {
+            console.warn(
+              `[Proxy] Transient upstream error in responses stream (attempt ${attempt}/${maxAttempts}), retrying:`,
+              readDataMessage(attemptError),
+            );
+            lastStreamAttemptError = attemptError;
+            continue;
+          }
+          break;
+        }
+
+        const collectedR = asRecord(collected);
+        if (responsesAbortController.signal.aborted || collectedR['cancelled']) {
+          stopResponsesKeepalive();
+          return;
+        }
+        if (collectedR['error'] != null) {
+          throw normalizeBackendError(collectedR['error']);
+        }
+          const hasValidEventTerminal = Boolean(
+            collected &&
+            !collectedR['__error'] &&
            !collectedR['noData'] &&
            !collectedR['idleTimeout'] &&
+           !collectedR['cut'] &&
            !collectedR['cancelled'] &&
-           (rawContent || rawReasoning || streamedToolCalls.length > 0 || content || reasoning),
-         );
-         const recoverSnapshot = async (
-           fallbackError: unknown = null,
-         ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown } | null> => {
+           collectedR['finish'] !== 'tool' &&
+           collectedR['finish'] !== 'tool-calls' &&
+           (rawContent ||
+             rawReasoning ||
+             streamedToolCalls.length > 0 ||
+             content ||
+             reasoning ||
+              collectedR['content'] ||
+              collectedR['reasoning']),
+          );
+          const hasValidConfirmedEventTerminal = Boolean(
+            hasValidEventTerminal &&
+            collectedR['finish'] === 'stop' &&
+            typeof collectedR['assistantMessageId'] === 'string' &&
+            collectedR['assistantMessageId'].trim().length > 0 &&
+            collectedR['userMessageId'] === idempotency?.userMessageId,
+          );
+          const hasValidTerminal = idempotency?.submitted
+            ? hasValidConfirmedEventTerminal || isExactTerminalPoll(collectedR)
+            : hasValidEventTerminal;
+          if (idempotency?.submitted && hasValidConfirmedEventTerminal) {
+            idempotency.confirmResult(
+              idempotency.userMessageId as string,
+              collectedR['assistantMessageId'] as string,
+            );
+          } else if (idempotency?.submitted && isExactTerminalPoll(collectedR)) {
+            confirmExactTerminalPoll(collectedR);
+          }
+          const recoverSnapshot = async (
+            fallbackError: unknown = null,
+          ): Promise<{ content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; userMessageId?: string; partial?: boolean; complete?: boolean } | null> => {
            if (responsesAbortController.signal.aborted) return null;
-           let polled: { content: string; reasoning: string; error: unknown; toolParts?: unknown };
+            let polled: { content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; userMessageId?: string; partial?: boolean; complete?: boolean };
            try {
              polled = await pollRecoverySnapshot();
            } catch (error: unknown) {
              if (responsesAbortController.signal.aborted) return null;
-             if (hasPartialOutput()) {
-               logDebug('Ignoring responses recovery poll failure after partial stream output', { error: toErrorMessage(error) });
-               return null;
-             }
              if (fallbackError != null) throw normalizeBackendError(fallbackError);
              throw normalizeBackendError(error);
            }
-           if (polled.error != null) throw normalizeBackendError(polled.error);
-           if (
-             fallbackError != null &&
-             !polled.content &&
-             !polled.reasoning &&
-             !(Array.isArray(polled.toolParts) && polled.toolParts.length > 0)
-           ) throw normalizeBackendError(fallbackError);
-           recoverySnapshot = polled;
+             if (idempotency?.submitted) confirmExactTerminalPoll(polled);
+             if (polled.error != null) {
+               throw polled.error;
+             }
+           if (polled.partial === true) throw new Error('Recovery poll returned incomplete response');
+            if (!hasRecoveryEvidence(polled)) {
+             if (fallbackError != null) throw normalizeBackendError(fallbackError);
+              return null;
+            }
+            recoverySnapshot = polled;
+           currentAssistantMessageId = polled.assistantMessageId ?? currentAssistantMessageId;
            return polled;
          };
          const needsRecovery = Boolean(
-           collectedR['__error'] || collectedR['noData'] || collectedR['idleTimeout'] || !hasValidTerminal,
+           collectedR['__error'] || collectedR['noData'] || collectedR['idleTimeout'] || collectedR['cut'] || !hasValidTerminal,
          );
          if (needsRecovery) {
            if (collectedR['__error'] && !fallbackToProxy) engageProxyFallback(collectedR['__error']);
            const polled = await recoverSnapshot(collectedR['__error']);
            if (polled) {
              keepStreamToolParts(polled);
-             const remainingReasoning = unsentSuffix(polled.reasoning, rawReasoning);
-             const remainingContent = unsentSuffix(polled.content, rawContent);
-             if (remainingReasoning) sendResponsesDelta(remainingReasoning, true);
-             if (remainingContent) sendResponsesDelta(remainingContent, false);
+             replaySnapshotText(polled.content, polled.reasoning);
            }
          } else if (collected && ((collectedR['content'] as string) || (collectedR['reasoning'] as string))) {
-           const remainingReasoning = unsentSuffix(collectedR['reasoning'], rawReasoning);
-           const remainingContent = unsentSuffix(collectedR['content'], rawContent);
-           if (remainingReasoning) sendResponsesDelta(remainingReasoning, true);
-           if (remainingContent) sendResponsesDelta(remainingContent, false);
+           replaySnapshotText(collectedR['content'], collectedR['reasoning']);
          }
 
          if (hostedSearch.requested && streamSearchToolParts.length === 0) {
            try {
              const evPoll = await activePollForAssistantResponse(
-               sessionId as string,
-               Math.min(15000, REQUEST_TIMEOUT_MS),
-               undefined,
-               responsesAbortController.signal,
+              sessionId as string,
+              Math.min(15000, REQUEST_TIMEOUT_MS),
+              undefined,
+              responsesAbortController.signal,
+               idempotency?.submitted
+                 ? (idempotency.userMessageId ?? undefined)
+                 : isContinuation ? String(promptParams.body['messageID']) : undefined,
+               Boolean(idempotency),
              );
              if (Array.isArray(evPoll.toolParts)) streamSearchToolParts = evPoll.toolParts;
            } catch {
@@ -1266,19 +1668,22 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
 
          if (responsesAbortController.signal.aborted) return;
 
-         let polledForToolCalls: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
+         let polledForToolCalls: { content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; partial?: boolean } | null = null;
          if (externalToolRegistry.length > 0 && !hasValidTerminal && !recoveryPromise) {
            const polled = await recoverSnapshot();
            if (polled) {
              polledForToolCalls = polled;
              if (shouldBufferExternalStream) {
-               const remainingReasoning = unsentSuffix(polled.reasoning, rawReasoning);
-               const remainingContent = unsentSuffix(polled.content, rawContent);
-               if (remainingReasoning) sendResponsesDelta(remainingReasoning, true);
-               if (remainingContent) sendResponsesDelta(remainingContent, false);
+               replaySnapshotText(polled.content, polled.reasoning);
              }
            }
          }
+
+           if (!hasValidTerminal && !recoverySnapshot && !fallbackServed) {
+             if (streamedToolCalls.length === 0 && externalToolChoice.mode !== 'required') {
+               throw new Error('Stream ended without valid terminal');
+             }
+           }
 
 
          const flushedReasoningCalls = parseReasoningToolCalls.flush ? parseReasoningToolCalls.flush() : [];
@@ -1287,59 +1692,140 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
          const flushedContentText = filterContentDelta.flush ? filterContentDelta.flush() : '';
          appendVisibleDelta(flushedReasoningText, true);
          appendVisibleDelta(flushedContentText, false);
-         if (shouldBufferExternalStream) {
-           const visible = stripExternalToolCallMarkupFromJoinedText(
-             externalToolRegistry,
-             rawReasoning,
-             rawContent,
-           );
-           reasoning = visible.reasoning;
-           content = visible.content;
-         } else if (!deferVisibleOutput) {
-           writeVisibleDelta(flushedReasoningText, true);
-           writeVisibleDelta(flushedContentText, false);
-         }
-
-          const recoveryForParse = recoverySnapshot as { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null;
-          const snapshotReasoning = polledForToolCalls?.reasoning ?? recoveryForParse?.reasoning ?? (typeof collectedR['reasoning'] === 'string' ? collectedR['reasoning'] as string : rawReasoning);
-          const snapshotContent = polledForToolCalls?.content ?? recoveryForParse?.content ?? (typeof collectedR['content'] === 'string' ? collectedR['content'] as string : rawContent);
-
+         const recoveryForParse = recoverySnapshot as { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null;
          const parseJoined = (reasoningText: string, contentText: string): FinalToolCall[] =>
            externalToolRegistry.length > 0
              ? parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoningText, contentText)
              : [];
-         const streamSource = [
-           [snapshotReasoning, snapshotContent],
-           [rawReasoning, rawContent]
-         ];
-          let parsedToolCalls: FinalToolCall[] = externalToolRegistry.length > 0
-            ? mergeToolCallArtifacts(
-                streamedToolCalls,
-                flushedReasoningCalls,
-                flushedContentCalls,
-                parseJoined(snapshotReasoning, snapshotContent),
-                parseJoined(rawReasoning, rawContent),
-              )
-            : [];
-          let validatedStreamedToolCalls: FinalToolCall[];
-          try {
-            assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource);
-            if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
-              const forcedResponse = await requestForcedResponsesToolCall();
-              if (forcedResponse) {
+         const callsFromText = (source: AuthoritativeStreamSource): FinalToolCall[] =>
+           externalToolRegistry.length > 0
+             ? parseJoined(source.reasoning, source.content)
+             : [];
+         const callsFromRaw = (source: AuthoritativeStreamSource): FinalToolCall[] =>
+           externalToolRegistry.length > 0
+             ? mergeToolCallArtifacts(
+                 streamedToolCalls,
+                 flushedReasoningCalls,
+                 flushedContentCalls,
+                 parseJoined(source.reasoning, source.content),
+               )
+             : [];
+         // One authoritative source group: snapshot when available, otherwise
+         // the raw delta text. Never validate both groups independently.
+         let authoritativeSource = resolveAuthoritativeStreamSource({
+           collected: collectedR,
+           polledSnapshot: polledForToolCalls ?? recoveryForParse,
+           rawContent,
+           rawReasoning,
+         });
+         const streamSource = (): string[][] => [[authoritativeSource.reasoning, authoritativeSource.content]];
+
+         if (shouldBufferExternalStream) {
+           const visible = stripExternalToolCallMarkupFromJoinedText(
+             externalToolRegistry,
+             authoritativeSource.reasoning,
+             authoritativeSource.content,
+           );
+           reasoning = visible.reasoning;
+           content = visible.content;
+         } else if (deferVisibleOutput) {
+           reasoning = authoritativeSource.reasoning;
+           content = authoritativeSource.content;
+         } else {
+           if (rawContent && authoritativeSource.content && !authoritativeSource.content.startsWith(rawContent)) {
+             throw new Error('Stream content diverged from authoritative snapshot');
+           }
+           if (rawReasoning && authoritativeSource.reasoning && !authoritativeSource.reasoning.startsWith(rawReasoning)) {
+             throw new Error('Stream reasoning diverged from authoritative snapshot');
+           }
+           writeVisibleDelta(flushedReasoningText, true);
+           writeVisibleDelta(flushedContentText, false);
+         }
+
+         let parsedToolCalls: FinalToolCall[] = authoritativeSource.fromSnapshot
+           ? callsFromText(authoritativeSource)
+           : callsFromRaw(authoritativeSource);
+         const repairFromSnapshot = async (): Promise<boolean> => {
+           if (externalToolRegistry.length === 0) return false;
+           // Reuse the first recovery snapshot (partial timeout snapshots are
+           // valid repair evidence when they carry a complete call). Only poll
+           // when no recovery attempt has been made.
+           let snapshot = polledForToolCalls ?? recoverySnapshot;
+           if (!snapshot) {
+             if (recoveryPromise) return false;
+             try {
+               snapshot = await recoverSnapshot();
+             } catch {
+               return false;
+             }
+           }
+           if (!snapshot || snapshot.error != null) return false;
+           const repairedSource: AuthoritativeStreamSource = {
+             content: String(snapshot.content ?? ''),
+             reasoning: String(snapshot.reasoning ?? ''),
+             kind: 'polled-snapshot',
+             fromSnapshot: true,
+           };
+           const snapshotCalls = parseJoined(repairedSource.reasoning, repairedSource.content);
+           if (snapshotCalls.length === 0) return false;
+           try {
+             assertToolCallArtifactIntegrity(snapshotCalls, externalToolRegistry, [
+               [repairedSource.reasoning, repairedSource.content],
+             ]);
+           } catch {
+             return false;
+           }
+           polledForToolCalls = snapshot;
+           authoritativeSource = repairedSource;
+           parsedToolCalls = snapshotCalls;
+           if (shouldBufferExternalStream) {
+             const visible = stripExternalToolCallMarkupFromJoinedText(
+               externalToolRegistry,
+               authoritativeSource.reasoning,
+               authoritativeSource.content,
+             );
+             reasoning = visible.reasoning;
+             content = visible.content;
+           }
+           return true;
+         };
+         let validatedStreamedToolCalls: FinalToolCall[];
+         try {
+           try {
+             assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource());
+           } catch (integrityError) {
+             if (!isMalformedExternalToolCallError(integrityError) || !(await repairFromSnapshot())) {
+               throw integrityError;
+             }
+            }
+            if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required' && !idempotency?.reconciling) {
+               const forcedResponse = await requestForcedResponsesToolCall();
+               if (forcedResponse) {
+                 confirmForcedResponsesToolCall(forcedResponse);
+                 currentAssistantMessageId =
+                   typeof forcedResponse['assistantMessageId'] === 'string'
+                     ? (forcedResponse['assistantMessageId'] as string)
+                     : currentAssistantMessageId;
+                 if (forcedResponse['error'] != null) throw normalizeBackendError(forcedResponse['error']);
                 const forcedReasoning = typeof forcedResponse['reasoning'] === 'string' ? forcedResponse['reasoning'] as string : '';
                 const forcedContent = typeof forcedResponse['content'] === 'string' ? forcedResponse['content'] as string : '';
                 parsedToolCalls = mergeToolCallArtifacts(parsedToolCalls, parseJoined(forcedReasoning, forcedContent));
-                assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [forcedReasoning, forcedContent]);
-              }
-            }
-            validatedStreamedToolCalls = finalizeStreamToolCalls(
-              parsedToolCalls,
-              externalToolRegistry,
-              externalToolChoice,
-              streamSource,
-              parallelToolCalls,
-            ) as unknown as FinalToolCall[];
+               authoritativeSource = {
+                 content: `${authoritativeSource.content}${forcedContent}`,
+                 reasoning: `${authoritativeSource.reasoning}${forcedReasoning}`,
+                 kind: authoritativeSource.kind,
+                 fromSnapshot: authoritativeSource.fromSnapshot,
+               };
+               assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, streamSource());
+             }
+           }
+           validatedStreamedToolCalls = finalizeStreamToolCalls(
+             parsedToolCalls,
+             externalToolRegistry,
+             externalToolChoice,
+             streamSource(),
+             parallelToolCalls,
+           ) as unknown as FinalToolCall[];
           } catch (toolError) {
             const toolCode = (toolError as Error & { code?: string }).code;
             const failClosedCodes = [
@@ -1401,10 +1887,11 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
          );
          const safeContent = joinedSafe.content;
          const safeReasoning = joinedSafe.reasoning;
-         if (!safeContent.trim() && !safeReasoning.trim() && validatedStreamedToolCalls.length === 0) {
-           throw new Error('Upstream returned no assistant data');
-         }
-          const streamEvidence = hostedSearch.requested
+           if (!safeContent.trim() && !safeReasoning.trim() && validatedStreamedToolCalls.length === 0) {
+             throw new Error('Upstream returned no assistant data');
+           }
+           assertIdempotencyResultConfirmed();
+           const streamEvidence = hostedSearch.requested
             ? extractSearchEvidence(streamSearchToolParts)
             : { queries: [] as string[], sources: [] as { url: string; title: string }[] };
           const streamSearchCallItems = buildWebSearchCallItems(streamEvidence);
@@ -1440,6 +1927,7 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           streamSearchCallItems.forEach((item) => emitWebSearchCallItem(item));
 
           if (deferVisibleOutput) {
+            assertIdempotencyResultConfirmed();
             writeVisibleDelta(safeReasoning, true);
             writeVisibleDelta(safeContent, false);
           }
@@ -1480,10 +1968,24 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
              output_tokens_details: { reasoning_tokens: reasoningTokens },
            },
          };
-         emit({ type: 'response.completed', sequence_number: nextSeq(), response });
-         res.write('data: [DONE]\n\n');
-         storeResponseState(responseId, sessionId, `${pID}/${mID}`, buildStoredResponseToolCalls(validatedStreamedToolCalls));
-         if (ownedResponsesSessionId === sessionId) ownedResponsesSessionId = null;
+           const stateStored = store && currentAssistantMessageId
+             ? storeResponseState(
+                 responseId,
+                 sessionId,
+                 `${pID}/${mID}`,
+                 buildStoredResponseToolCalls(validatedStreamedToolCalls),
+                 currentAssistantMessageId,
+                 tenantId,
+               )
+            : false;
+          if (stateStored) {
+            if (ownedResponsesSessionId === sessionId) ownedResponsesSessionId = null;
+          } else {
+            await cleanupOwnedResponsesSession();
+          }
+           assertIdempotencyResultConfirmed();
+           emit({ type: 'response.completed', sequence_number: nextSeq(), response });
+          res.write('data: [DONE]\n\n');
          stopResponsesKeepalive();
          res.end();
          return;
@@ -1497,57 +1999,166 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       let polledFilled = false;
       let lastResponsesAttemptError: unknown = null;
       let searchToolParts: unknown[] = [];
+      const isNonStreamContinuation = Boolean(previousState?.sessionId);
+      let promptSubmitted = false;
+      let currentAssistantMessageId: string | null = null;
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-        if (res.writableEnded || res.destroyed) {
+        if (responsesAbortController.signal.aborted || res.writableEnded || res.destroyed) {
           logDebug('Client gone, stop retrying', { sessionId, attempt });
           return;
         }
         if (attempt > 1) {
-          const retriedSessionId = sessionId;
-          if (ownedResponsesSessionId === retriedSessionId) ownedResponsesSessionId = null;
-          // A `previous_response_id` parent session is shared with earlier turns; only
-          // a session this request created may be discarded on retry.
-          if (retriedSessionId && retriedSessionId !== previousState?.sessionId) {
-            try {
-              await activeClient.session.delete({ path: { id: retriedSessionId } });
-            } catch (e: unknown) {
-              logDebug('Failed to delete retried session', { sessionId, error: toErrorMessage(e) });
+          if (fallbackToProxy) switchToProxyBundle();
+          await ensureActiveModel(activeClient, pID, mID).catch(() => {});
+          if (!isNonStreamContinuation && !idempotency?.submitted) {
+            promptSubmitted = false;
+            const retriedSessionId = sessionId;
+            if (retriedSessionId && ownedResponsesSessionId === retriedSessionId) {
+              await cleanupOwnedResponsesSession();
+              if (ownedResponsesSessionId === retriedSessionId) {
+                throw new Error('Failed to cleanup retried OpenCode session');
+              }
             }
+            const retrySessionRes = (await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
+            sessionId = (asRecord(asRecord(retrySessionRes)['data'])['id'] as string | undefined) ?? null;
+            if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
+            ownedResponsesSessionId = sessionId;
+            promptParams.path.id = sessionId;
           }
-          const retrySessionRes = (await withTimeout(activeClient.session.create(), REQUEST_TIMEOUT_MS, 'create session')) as unknown;
-          sessionId = (asRecord(asRecord(retrySessionRes)['data'])['id'] as string | undefined) ?? null;
-          if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
-          ownedResponsesSessionId = sessionId;
-          promptParams.path.id = sessionId;
           requestForcedResponsesToolCall = makeForcedResponsesToolCallRequester();
           await sleep(computeRetryDelay(attempt - 1, lastResponsesAttemptError));
         }
-        let polledResponse: { content: string; reasoning: string; error: unknown; toolParts?: unknown } | null = null;
+        let polledResponse: { content: string; reasoning: string; error: unknown; toolParts?: unknown; assistantMessageId?: string; userMessageId?: string; partial?: boolean; complete?: boolean } | null = null;
         try {
-          responseRes = await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-          const dataParts: unknown = asRecord(asRecord(responseRes)['data'])['parts'];
-          responseParts = Array.isArray(dataParts) ? (dataParts as unknown[]) : [];
-          promptContent = responseParts
-            .filter((p) => asRecord(p)['type'] === 'text')
-            .map((p) => String(asRecord(p)['text'] ?? ''))
-            .join('\n');
-          promptReasoning = responseParts
-            .filter((p) => asRecord(p)['type'] === 'reasoning')
-            .map((p) => String(asRecord(p)['text'] ?? ''))
-            .join('\n');
-                      promptParsedToolCalls =
-             externalToolRegistry.length > 0
-               ? parseExternalToolCallsFromJoinedText(externalToolRegistry, promptReasoning, promptContent)
-               : [];
-          if (promptContent || promptReasoning) break;
-           polledResponse = await activePollForAssistantResponse(
-             sessionId as string,
-             REQUEST_TIMEOUT_MS,
-             undefined,
-             responsesAbortController.signal,
-           );
-
+          if (idempotency?.reconciling) {
+            polledResponse = await activePollForAssistantResponse(
+              sessionId as string,
+              REQUEST_TIMEOUT_MS,
+              undefined,
+              responsesAbortController.signal,
+              idempotency.userMessageId ?? undefined,
+              true,
+            );
+            if (polledResponse.error != null) {
+              if (isExactTerminalPoll(polledResponse)) {
+                confirmExactTerminalPoll(polledResponse);
+                throw normalizeBackendError(polledResponse.error);
+              }
+              throw new Error('Idempotency reconciliation has no confirmed assistant result');
+            }
+            if (
+              !isExactTerminalPoll(polledResponse)
+            ) {
+              throw new Error('Idempotency reconciliation has no confirmed assistant result');
+            }
+            confirmExactTerminalPoll(polledResponse);
+            currentAssistantMessageId = polledResponse.assistantMessageId ?? null;
+          } else if ((isNonStreamContinuation || idempotency?.submitted) && promptSubmitted) {
+            polledResponse = await activePollForAssistantResponse(
+              sessionId as string,
+              REQUEST_TIMEOUT_MS,
+              undefined,
+              responsesAbortController.signal,
+              idempotency?.submitted
+                ? (idempotency.userMessageId ?? undefined)
+                : isNonStreamContinuation ? String(promptParams.body['messageID']) : undefined,
+              Boolean(idempotency),
+            );
+            currentAssistantMessageId = polledResponse.assistantMessageId ?? currentAssistantMessageId;
+          } else {
+            if (isNonStreamContinuation || idempotency) {
+              promptSubmitted = true;
+            }
+            if (idempotency) {
+              idempotency.markSubmitted(
+                sessionId as string,
+                String(promptParams.body['messageID']),
+                `${pID}/${mID}`,
+              );
+            }
+            assertResponsesCanPrompt();
+            responseRes = await activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+            promptSubmitted = true;
+            if (idempotency) assertResponsesCanPrompt();
+            const promptData = asRecord(asRecord(responseRes)['data']);
+            const promptInfo = asRecord(promptData['info']);
+            const promptMessageId = promptInfo['id'] ?? promptInfo['messageID'] ?? promptInfo['messageId'];
+            if (typeof promptMessageId === 'string' && promptMessageId) currentAssistantMessageId = promptMessageId;
+            const dataParts: unknown = promptData['parts'];
+            responseParts = Array.isArray(dataParts) ? (dataParts as unknown[]) : [];
+            promptContent = responseParts
+              .filter((p) => asRecord(p)['type'] === 'text')
+              .map((p) => String(asRecord(p)['text'] ?? ''))
+              .join('\n');
+            promptReasoning = responseParts
+              .filter((p) => asRecord(p)['type'] === 'reasoning')
+              .map((p) => String(asRecord(p)['text'] ?? ''))
+              .join('\n');
+            promptParsedToolCalls =
+              externalToolRegistry.length > 0
+                ? parseExternalToolCallsFromJoinedText(externalToolRegistry, promptReasoning, promptContent)
+                : [];
+            if (idempotency) {
+              const promptTime = asRecord(promptInfo['time']);
+              const promptFinish = promptInfo['finish'];
+              const hasActiveToolPart = responseParts.some((part) => {
+                const partRecord = asRecord(part);
+                const state = asRecord(partRecord['state']);
+                const status = state['status'] ?? partRecord['status'];
+                return partRecord['type'] === 'tool' && (status === 'pending' || status === 'running');
+              });
+              const finishIsIntermediate = promptFinish === 'tool' || promptFinish === 'tool-calls';
+              const explicitTerminal = !finishIsIntermediate &&
+                ((promptFinish != null) || Boolean(promptTime['completed']));
+              const exactTurn =
+                promptInfo['role'] === 'assistant' &&
+                promptInfo['parentID'] === idempotency.userMessageId &&
+                typeof promptMessageId === 'string' &&
+                promptMessageId.length > 0;
+              if (promptInfo['error'] != null || !explicitTerminal || !exactTurn || hasActiveToolPart) {
+                // Prompt return values may contain a still-growing snapshot.
+                // Reconcile only the exact submitted user turn before
+                // returning text when the snapshot is incomplete or errored.
+                responseParts = [];
+                promptContent = '';
+                promptReasoning = '';
+                promptParsedToolCalls = [];
+                polledResponse = await activePollForAssistantResponse(
+                  sessionId as string,
+                  REQUEST_TIMEOUT_MS,
+                  undefined,
+                  responsesAbortController.signal,
+                  idempotency.userMessageId ?? undefined,
+                  true,
+                );
+                currentAssistantMessageId = polledResponse.assistantMessageId ?? currentAssistantMessageId;
+              }
+            }
+            const needsRequiredToolFollowup = Boolean(
+              idempotency?.submitted &&
+              externalToolChoice.mode === 'required' &&
+              promptParsedToolCalls.length === 0 &&
+              (promptContent || promptReasoning),
+            );
+            if ((promptContent || promptReasoning) && (!idempotency?.submitted || needsRequiredToolFollowup)) break;
+            if (!polledResponse) {
+              polledResponse = await activePollForAssistantResponse(
+                sessionId as string,
+                REQUEST_TIMEOUT_MS,
+                undefined,
+                responsesAbortController.signal,
+                  idempotency?.submitted
+                    ? (idempotency.userMessageId ?? undefined)
+                    : isNonStreamContinuation ? String(promptParams.body['messageID']) : undefined,
+                  Boolean(idempotency),
+                );
+              currentAssistantMessageId = polledResponse.assistantMessageId ?? currentAssistantMessageId;
+            }
+          }
         } catch (loopError: unknown) {
+          if (isNonStreamContinuation || idempotency?.submitted) {
+            throw normalizeBackendError(loopError);
+          }
           if (attempt < maxAttempts && engageProxyFallback(loopError)) {
             lastResponsesAttemptError = loopError;
             continue;
@@ -1562,24 +2173,42 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
           }
           throw normalizeBackendError(loopError);
         }
-                  if (polledResponse && polledResponse.error != null) {
-          if (attempt < maxAttempts && engageProxyFallback(polledResponse.error)) {
-            lastResponsesAttemptError = polledResponse.error;
+        if (idempotency?.submitted && polledResponse) confirmExactTerminalPoll(polledResponse);
+        const polledEmpty = Boolean(
+          polledResponse &&
+            !polledResponse.content &&
+            !polledResponse.reasoning &&
+            !(Array.isArray(polledResponse.toolParts) && polledResponse.toolParts.length > 0),
+        );
+        const polledError =
+          polledResponse?.error ??
+          (polledResponse?.partial === true
+            ? new Error('Polling returned incomplete response')
+            : polledEmpty && externalToolChoice.mode !== 'required'
+              ? new Error('Polling returned empty response')
+              : null);
+        if (polledResponse && polledError != null) {
+            if (isNonStreamContinuation || idempotency?.submitted) {
+              throw normalizeBackendError(polledError);
+          }
+          if (attempt < maxAttempts && engageProxyFallback(polledError)) {
+            lastResponsesAttemptError = polledError;
             continue;
           }
-          if (attempt < maxAttempts && isTransientUpstreamError(polledResponse.error)) {
+          if (attempt < maxAttempts && isTransientUpstreamError(polledError)) {
             console.warn(
               `[Proxy] Transient upstream error (attempt ${attempt}/${maxAttempts}), retrying:`,
-              readDataMessage(polledResponse.error),
+              readDataMessage(polledError),
             );
-            lastResponsesAttemptError = polledResponse.error;
+            lastResponsesAttemptError = polledError;
             continue;
           }
-          throw normalizeBackendError(polledResponse.error);
+          throw normalizeBackendError(polledError);
         }
         if (polledResponse) {
           content = polledResponse.content || content;
           reasoning = polledResponse.reasoning || reasoning;
+          currentAssistantMessageId = polledResponse.assistantMessageId ?? currentAssistantMessageId;
           polledFilled = true;
           if (Array.isArray(polledResponse.toolParts) && polledResponse.toolParts.length > 0) {
             searchToolParts = polledResponse.toolParts;
@@ -1597,8 +2226,12 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
              sessionId as string,
              Math.min(15000, REQUEST_TIMEOUT_MS),
              undefined,
-             responsesAbortController.signal,
-           );
+              responsesAbortController.signal,
+              idempotency?.submitted
+                ? (idempotency.userMessageId ?? undefined)
+                : isNonStreamContinuation ? String(promptParams.body['messageID']) : undefined,
+              Boolean(idempotency),
+            );
 
           if (Array.isArray(evPoll.toolParts) && evPoll.toolParts.length > 0) {
             searchToolParts = evPoll.toolParts;
@@ -1636,25 +2269,31 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
            : externalToolRegistry.length > 0
              ? parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content)
              : [];
-       let validatedToolCalls: FinalToolCall[] = [];
-       try {
-         assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
-         if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
-           const forcedResponse = await requestForcedResponsesToolCall();
-           if (forcedResponse) {
-             content = String(forcedResponse['content'] ?? content);
-             reasoning = String(forcedResponse['reasoning'] ?? reasoning);
-             parsedToolCalls = parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content);
-             assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
-           }
-         }
-         validatedToolCalls = finalizeStreamToolCalls(
-           parsedToolCalls,
-           externalToolRegistry,
-           externalToolChoice,
-           [reasoning, content],
-           parallelToolCalls,
-         ) as unknown as FinalToolCall[];
+        let validatedToolCalls: FinalToolCall[] = [];
+        try {
+          assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
+          if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required' && !idempotency?.reconciling) {
+             const forcedResponse = await requestForcedResponsesToolCall();
+             if (forcedResponse) {
+               confirmForcedResponsesToolCall(forcedResponse);
+               currentAssistantMessageId =
+                 typeof forcedResponse['assistantMessageId'] === 'string'
+                   ? (forcedResponse['assistantMessageId'] as string)
+                   : currentAssistantMessageId;
+               if (forcedResponse['error'] != null) throw normalizeBackendError(forcedResponse['error']);
+               content = String(forcedResponse['content'] ?? content);
+              reasoning = String(forcedResponse['reasoning'] ?? reasoning);
+              parsedToolCalls = parseExternalToolCallsFromJoinedText(externalToolRegistry, reasoning, content);
+              assertToolCallArtifactIntegrity(parsedToolCalls, externalToolRegistry, [reasoning, content]);
+            }
+          }
+          validatedToolCalls = finalizeStreamToolCalls(
+            parsedToolCalls,
+            externalToolRegistry,
+            externalToolChoice,
+            [reasoning, content],
+            parallelToolCalls,
+          ) as unknown as FinalToolCall[];
        } catch (toolError) {
          const toolCode = (toolError as Error & { code?: string }).code;
          const failClosedCodes = [
@@ -1723,7 +2362,8 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
       });
       const orderedOutput = orderResponsesOutputItems(output);
 
-      const responseId = `resp_${crypto.randomUUID()}`;
+      const responseId = idempotency?.publicId ?? `resp_${crypto.randomUUID()}`;
+      idempotency?.setPublicId(responseId);
       const createdAt = Math.floor(Date.now() / 1000);
       const response = {
         ...buildResponsesResponseEnvelope({
@@ -1747,14 +2387,49 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         },
       };
 
-      storeResponseState(responseId, sessionId, `${pID}/${mID}`, buildStoredResponseToolCalls(validatedToolCalls));
-      if (ownedResponsesSessionId === sessionId) ownedResponsesSessionId = null;
+       const stateStored = store && currentAssistantMessageId
+         ? storeResponseState(
+             responseId,
+             sessionId,
+             `${pID}/${mID}`,
+             buildStoredResponseToolCalls(validatedToolCalls),
+             currentAssistantMessageId,
+             tenantId,
+           )
+        : false;
+      if (stateStored) {
+        if (ownedResponsesSessionId === sessionId) ownedResponsesSessionId = null;
+      } else {
+        await cleanupOwnedResponsesSession();
+      }
 
-      res.json(response);
+       assertIdempotencyResultConfirmed();
+       res.json(response);
       return;
     } catch (error: unknown) {
       stopResponsesKeepalive();
       console.error('[Proxy] Responses API Error:', toErrorMessage(error));
+      const isUnconfirmedStreamingReconciliation =
+        idempotency?.reconciling && Boolean(asRecord((req as unknown as { body: unknown }).body)['stream']);
+      if (
+        idempotency?.submitted &&
+        !idempotency.resultConfirmed &&
+        !responsesAbortController.signal.aborted &&
+        !res.headersSent &&
+        !res.destroyed &&
+        !isUnconfirmedStreamingReconciliation
+      ) {
+        res.removeHeader('Content-Type');
+        res.status(503).json({
+          error: {
+            type: 'idempotency_error',
+            code: 'idempotency_reconciliation_pending',
+            message: 'The previous outcome is still uncertain; retry the same request to reconcile it',
+            retryable: true,
+          },
+        });
+        return;
+      }
       if (!fallbackToProxy) engageProxyFallback(error);
       const transformed = transformUpstreamError(error);
       if (responsesStreamState) {
@@ -1786,12 +2461,21 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
         } catch (writeError: unknown) {
           logDebug('Failed to report error on open response stream', { error: toErrorMessage(writeError) });
         }
-        res.end();
+        if (!res.writableEnded && !res.destroyed) {
+          res.end();
+        }
         return;
       }
-      res.status(transformed.statusCode).json(transformed.error);
+      if (!res.headersSent) {
+        res.status(transformed.statusCode).json(transformed.error);
+        return;
+      }
+      if (!res.writableEnded && !res.destroyed) {
+        res.end();
+      }
       return;
     } finally {
+      stopResponsesKeepalive();
       await cleanupOwnedResponsesSession();
     }
   });

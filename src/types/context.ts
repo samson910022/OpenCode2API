@@ -48,6 +48,12 @@ export interface ForcedToolCallRequesterOptions {
   toolOverrides: Record<string, boolean> | null;
   requestTimeoutMs: number;
   forbidThinkBlock?: boolean;
+  signal?: AbortSignal;
+  requireTerminalCompletion?: boolean;
+  /** Checked immediately before the forced prompt is submitted. */
+  assertCanPrompt?: () => void;
+  /** Called immediately before the forced prompt can reach the backend. */
+  beforePrompt?: (sessionId: string, userMessageId: string) => void;
 }
 
 export interface CollectorHandle {
@@ -57,15 +63,27 @@ export interface CollectorHandle {
     sessionId: string,
     timeoutMs: number,
     intervalMs?: number,
-    signal?: AbortSignal
-  ) => Promise<{ content: string; reasoning: string; error: unknown; toolParts: unknown[] }>;
+    signal?: AbortSignal,
+    expectedCurrentUserMessageId?: string,
+    requireTerminalCompletion?: boolean,
+  ) => Promise<{
+    content: string;
+    reasoning: string;
+    error: unknown;
+    toolParts: unknown[];
+    assistantMessageId?: string;
+    userMessageId?: string;
+    partial?: boolean;
+    complete?: boolean;
+  }>;
   collectFromEvents: (
     sessionId: string,
     timeoutMs: number,
     onDelta?: ((delta: string, isReasoning?: boolean) => void) | null,
     firstDeltaTimeoutMs?: number | null,
     idleTimeoutMs?: number | null,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    expectedCurrentUserMessageId?: string,
   ) => Promise<Record<string, unknown>>;
 }
 
@@ -106,13 +124,14 @@ export interface AppContext {
   maxRetries: number;
   maxAttempts: number;
   getProvidersList: () => Promise<ProviderInfo[]>;
+  invalidateProvidersCache: () => void;
   buildModelsList: (providersList: unknown) => ModelInfo[];
   normalizeModelID: (modelID: unknown) => unknown;
   resolveRequestedModel: (requestedModel: unknown) => Promise<ResolvedModel>;
   logDebug: (...args: unknown[]) => void;
   responseState: Map<string, ResponseStateEntry>;
-  getResponseState: (responseId: unknown) => ResponseStateEntry | null;
-  storeResponseState: (responseId: unknown, sessionId: unknown, model: unknown, toolCalls?: unknown) => void;
+  getResponseState: (responseId: unknown, tenantId: string) => ResponseStateEntry | null;
+  storeResponseState: (responseId: unknown, sessionId: unknown, model: unknown, toolCalls: unknown, checkpointId: unknown, tenantId: string) => boolean;
   sweepResponseState: () => Promise<void>;
   TOOL_MODE: ToolModeSet;
   TOOL_GUARD_MESSAGE: string;
@@ -171,14 +190,19 @@ export interface AppContext {
   getDiscoveryLastError: () => string | null;
   /** Wired N×N translator registry (Phase 1 wiring; optional so manual test ctx still compiles). */
   translators?: TranslatorRegistry;
+  /** Cleanup app-owned listeners, subscriptions, and timers. */
+  dispose?: () => void;
 }
 
 export interface CreateAppResult {
   app: import('express').Application;
   client: ProxyClient;
+  ctx?: AppContext;
 }
 
 export interface StartProxyResult {
   server: import('node:http').Server;
   killBackend: () => void;
+  /** Idempotently dispose app-owned listeners; also called when server closes. */
+  dispose: () => void;
 }

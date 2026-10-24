@@ -1,7 +1,8 @@
 // P4 TS: system routes (models/health/details/metrics/404) (ported from P3 .js, behavior identical).
-import type { Application, Request, Response } from 'express';
+import type { Application, NextFunction, Request, Response } from 'express';
 import type { AppContext } from '../types/context.js';
 import { buildEffectiveApiKeys, createApiKeyVerifier } from '../auth/keys.js';
+import { classifyHttpError } from '../errors/http.js';
 
 function toErrorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String((e as Record<string, unknown>)?.['message'] ?? e);
@@ -224,5 +225,16 @@ export function registerNotFoundRoute(app: Application): void {
         type: 'not_found_error',
       },
     });
+  });
+}
+
+export function registerErrorHandler(app: Application): void {
+  app.use((err: unknown, req: Request, res: Response, next: NextFunction): void => {
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    const { status, body } = classifyHttpError(err, req.originalUrl || req.path);
+    res.status(status).json(body);
   });
 }

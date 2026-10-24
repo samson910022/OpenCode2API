@@ -205,7 +205,7 @@ curl -X POST http://127.0.0.1:10000/v1/responses \
   }'
 ```
 
-非流式 `responses` 响应会在 `response.output` 中返回 `type: "function_call"` 项；流式模式会发送 function_call 生命周期和参数增量事件。`previous_response_id` 续写只保留最近 128 条工具调用元数据（超出时丢弃最旧、保留最新；按 response ID 链作用域保存，内存态、30min TTL + 60s 清扫，重启动失）；`function_call_output` 的 `call_id` 不在 state 且无 `name` 时返回 400 `unknown_tool_call_id`。
+非流式 `responses` 响应会在 `response.output` 中返回 `type: "function_call"` 项；流式模式会发送 function_call 生命周期和参数增量事件。`previous_response_id` 续写会将完整父 session fork 为隔离子 session，不会向父 session 追加本轮消息；工具调用元数据只保留最近 128 条（超出时丢弃最旧、保留最新；按 response ID 链作用域保存，内存态、30min TTL + 60s 清扫，重启动失）。`function_call_output` 的 `call_id` 不在 state 且无 `name` 时返回 400 `unknown_tool_call_id`。
 
 **服务端联网搜索（`web_search`）:**
 
@@ -237,9 +237,27 @@ POST /v1/interactions
 | `tools` | array | - | 仅支持 `{type: "google_search"}`（等价 `web_search`），其余 function 工具返回 400 |
 | `previous_interaction_id` | string | - | 续写上轮会话（等价 responses 的 `previous_response_id`） |
 | `stream` | boolean | - | SSE：`interaction.created` / `step.delta` / `interaction.completed`（无 `[DONE]`，错误为 `{type:'error'}` 事件；15s heartbeat） |
-| `store` | boolean | - | `false` 则不持久化；仅删除本请求新建的会话，复用的父会话保留（注意：带 `previous_interaction_id` 的 `store:false` 轮次仍会追加到父会话历史，并非完全无痕） |
+| `store` | boolean | - | `false` 则不持久化；仅删除本请求新建或 fork 的子会话，父会话保留且不会被本轮修改 |
 
 响应为 `Interaction` 资源：`{id, status, model, output_text, steps[], usage: {grounding_tool_count}}`，其中 `steps` 含 `google_search_call{queries}`、`google_search_result{sources}`（标注为 opencode websearch 代理结果，非 Google 原生）、`model_output{text, annotations}`。文本往返与 `web_search` 接地逻辑复用 Responses 管线；限流错误的重试与代理 fallback 和其余路由一致（engage + 换 session，最多 `maxAttempts` 次），普通错误直接返回。
+
+### Continuation Idempotency and Retries / Continuation 幂等与重试
+
+`POST /v1/responses`, `POST /v1beta/interactions`, and alias `POST /v1/interactions` support an optional `Idempotency-Key` request header. Clients should supply a unique key per logical operation and retry after timeouts or disconnections using the **same key and identical JSON request body**. The idempotency scope is isolated by authenticated tenant (a cryptographic digest of the API key; unauthenticated requests share an anonymous tenant when auth is disabled), target endpoint, parent continuation ID (`previous_response_id` / `previous_interaction_id`), and key. The two Interactions paths (`/v1beta/interactions` and `/v1/interactions`) map to the same endpoint and share idempotency records. Records are never shared between Responses and Interactions, across distinct parent IDs, or between different tenant API keys.
+
+- **Payload conflicts & in-progress handling**: Reusing an existing key in the same scope with a different payload returns HTTP `409` with error code `idempotency_key_reused`. Concurrent duplicate requests for an in-flight prompt return a retryable HTTP `409` with code `idempotency_in_progress`. Request bodies are compared via canonical JSON normalization, so object property order does not affect the payload hash.
+- **Exact replay from beginning**: Confirmed completed JSON and SSE responses are cached and **replayed exactly from the beginning**, preserving the original HTTP status code, relevant headers, and the full response body. SSE retry replay is not resumable delta streaming—it replays the complete wire byte stream and terminal events from start to finish.
+- **Unconfirmed prompt submission & reconciliation**: If a prompt was submitted to the upstream backend but the outcome has not yet been confirmed, the record is marked as unknown. Retrying with the same key will only poll and reconcile the recorded child session and message; it will never resubmit the prompt or spawn an unintended child session. If confirmation is still pending during a retry, the proxy returns HTTP `503 idempotency_reconciliation_pending`; clients should retry later with the same key and payload.
+- **Isolated child session fork**: Continuation turns specifying a parent continuation ID fork the entire saved parent session into an isolated child session. Turns are appended to the child session while the parent session remains completely unmodified, allowing multiple independent conversational branches.
+- **In-memory process-local ledger**: The idempotency ledger is held **strictly in process memory**. Completed or definitively failed replayable records are retained for a 60-minute default TTL (minimum retention floor is 30 minutes; currently not user-configurable). In-progress records do not expire via TTL; disconnections prior to prompt submission are abandoned, while disconnections after prompt submission transition to `unknown`. `unknown` entries never expire automatically and are freed only upon successful reconciliation or process restart. Persistent unreconciled entries may count against per-tenant capacity limits until restart. All records are discarded on server restart and are not shared across multi-process clusters or replicas. This mechanism prevents duplicate execution within a single server process lifecycle, but does not replace persistent distributed idempotency storage.
+
+`POST /v1/responses`、`POST /v1beta/interactions` 与别名 `POST /v1/interactions` 支持可选的 `Idempotency-Key` 请求头。建议每个逻辑操作使用唯一 key，并在超时或断线后用**相同 key 与相同 JSON 请求体**重试。作用域按认证租户（API key 的摘要；未启用鉴权时共用匿名租户）、端点、父 ID（`previous_response_id` / `previous_interaction_id`）及 key 隔离；两个 Interactions 路径是同一端点，故共享幂等记录。Responses 与 Interactions 之间、不同父 ID 之间、不同 API key 租户之间不会共享记录。
+
+- 同一作用域内 key 对应不同 payload 时返回 `409`，错误码 `idempotency_key_reused`；同一请求仍在处理中时返回可重试的 `409 idempotency_in_progress`。请求体按 JSON 规范化后比较，对象属性顺序不影响 payload hash。
+- 已确认完成的 JSON 或 SSE 响应会缓存并**从头精确重播**：包括原 HTTP 状态、相关响应头与完整响应 body。SSE 重试不是从断点续传，而是重放原始流的全部字节及终止事件。
+- 如果 prompt 已提交但结果尚未确认，结果会标记为未知。使用相同 key 重试只会轮询/调和已记录的子 session 与消息；不会再次提交 prompt，也不会因为未确认而创建另一个子 session。尚未确认时可能收到 `503 idempotency_reconciliation_pending`，稍后继续用原 key 和原 payload 查询。
+- 带 continuation parent ID 的新操作会从完整父 session fork 一个隔离子 session；本轮写入 child，不修改 parent。这样允许多个分支独立续写。
+- Idempotency ledger 是**进程内存态**。已完成/确定失败的可重播记录目前固定保留 60 分钟（代码保留时长下限为 30 分钟，当前没有配置项）；未完成请求中的 `in_progress` 记录不会按 TTL 淘汰，断线且尚未提交 prompt 时会被放弃，已提交但结果未确认时则转为 `unknown`。`unknown` 记录不会自动过期或淘汰，只能在成功调和后释放，无法调和时会保留到服务重启，并可能使该租户后续新 key 遇到容量限制。服务重启会丢失全部记录；多进程/多副本之间不共享记录。因此它能防止同一进程生命周期内的重复执行，不能替代跨重启或分布式的持久化幂等存储。
 
 ### 🧭 推荐提示模板（OpenClaw / Claude Code）
 
@@ -284,7 +302,13 @@ Great, now answer the original request using the tool result.
 
 > 这个两段式模式是当前 `opencode2api` 外部工具桥接的推荐集成方式。
 
-### 🌊 流式工具调用
+### 🌊 流式输出与反向代理缓冲 / Streaming & Reverse Proxy Buffering
+
+所有流式接口（`POST /v1/chat/completions`、`POST /v1/messages`、`POST /v1/responses`、`POST /v1/interactions` 及别名 `POST /v1beta/interactions`）在开启 `stream: true` 时，均会自动附加 `X-Accel-Buffering: no` 响应头。该响应头指示反向代理（如 Nginx、Cloudflare、Caddy 等）立即关闭响应缓冲（response buffering），防止中间代理积攒数据块，确保 Server-Sent Events (SSE) 分块数据与保活注释行（`: comment\n`）能够实时无延迟地推送至客户端。
+
+All streaming routes (`POST /v1/chat/completions`, `POST /v1/messages`, `POST /v1/responses`, `POST /v1/interactions`, and alias `POST /v1beta/interactions`) automatically emit the `X-Accel-Buffering: no` HTTP header when `stream: true` is enabled. This header instructs reverse proxies (such as Nginx, Cloudflare, Caddy) to disable response buffering so Server-Sent Events (SSE) chunks and keepalive comments are delivered to clients immediately without intermediate buffering lag.
+
+#### 流式工具调用示例 / Streaming Tool Call Example
 
 ```bash
 curl -N -X POST http://127.0.0.1:10000/v1/responses \
@@ -318,6 +342,7 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
 - Chat Completions 会在 `chat.completion.chunk` 中返回 `delta.tool_calls`
 - Responses API 会返回 `response.output_item.added`、`response.function_call_arguments.delta`、`response.function_call_arguments.done`、`response.output_item.done` 等事件
 - Messages API 会返回 `message_start`、`content_block_start`、`content_block_delta`（`text_delta`/`thinking_delta`/`input_json_delta`）、`content_block_stop`、`message_delta`、`message_stop`（无 `[DONE]`）
+- Interactions API 会在 SSE 中返回 `interaction.created`、`step.delta`、`interaction.completed`（无 `[DONE]`）
 
 > 注意：代理内部会使用命名空间隔离同名工具，但这些内部名称不会作为公开 API 返回给客户端。
 

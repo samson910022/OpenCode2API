@@ -25,6 +25,7 @@
 | 🔑 **多 Key 认证** | `API_KEY` 与 `OPENCODE_API_KEYS` 合并；`Bearer` 或 `x-api-key`；为空免认证 |
 | 🔀 **免费限流 fallback 代理** | 仅免费限流 429 时轮换 `OPENCODE_UPSTREAM_PROXIES` |
 | 📡 **流式输出** | Chat、Responses、Messages、Interactions 全支持 SSE |
+| 🔄 **Continuation 幂等重播** | `/v1/responses` 与 `/v1/interactions` 支持作用域隔离的 `Idempotency-Key` |
 | 🧠 **推理控制** | `reasoning_effort` / `reasoning: {"effort": "high"}` |
 | 🐳 **Docker 部署** | 一键部署，自动启动后端 |
 | 🛡️ **工具安全** | 默认禁用工具调用 |
@@ -141,13 +142,13 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
 
 ### 模型名称格式
 
-支持 `opencode/big-pickle`、`gpt5-nano`（自动解析）与 `opencode/gpt5-nano`；详见 [API 参考文档](./docs/api-reference.md)。
+支持 `opencode/big-pickle`、`gpt5-nano`（自动解析）与 `opencode/gpt5-nano`；详见 [API 参考文档](./docs/api-reference.md)。若请求的上游 Provider 中未找到指定模型，代理会毫秒级快速失败并返回 HTTP 404（`model_not_found`）及可用模型列表（`available_models`），避免排队阻塞后续请求。
 
 ---
 
 ## 🔧 故障排查
 
-卡住：试 `OPENCODE_USE_ISOLATED_HOME=false`。模型缺失：检查 `/v1/models`。无推理：用 `stream: true` + `reasoning.effort` 的 Responses API。
+卡住：试 `OPENCODE_USE_ISOLATED_HOME=false`。模型缺失：检查 `/v1/models`（未知模型会快速返回 HTTP 404 `model_not_found`）。无推理：用 `stream: true` + `reasoning.effort` 的 Responses API。
 
 > 📖 完整指南：[故障排查](./docs/troubleshooting.md)
 
