@@ -94,13 +94,13 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
     const closeOpenBlocks = (): void => {
       if (res.destroyed || res.writableEnded) return;
       try {
-        if (textBlockOpen && textIndex !== null) {
-          res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
-          textBlockOpen = false;
-        }
         if (thinkingBlockOpen && thinkingIndex !== null) {
           res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: thinkingIndex }));
           thinkingBlockOpen = false;
+        }
+        if (textBlockOpen && textIndex !== null) {
+          res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
+          textBlockOpen = false;
         }
       } catch {
         // ignore
@@ -619,6 +619,10 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           );
           const sendTextDelta = (delta: string): void => {
             if (!delta) return;
+            if (thinkingBlockOpen && thinkingIndex !== null) {
+              res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: thinkingIndex }));
+              thinkingBlockOpen = false;
+            }
             const idx = ensureTextIndex();
             if (!textBlockOpen) {
               res.write(sseEvent('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'text', text: '' } }));
@@ -629,6 +633,10 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
           };
           const sendReasoningDelta = (delta: string): void => {
             if (!delta) return;
+            if (textBlockOpen && textIndex !== null) {
+              res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
+              textBlockOpen = false;
+            }
             const idx = ensureThinkingIndex();
             if (!thinkingBlockOpen) {
               res.write(sseEvent('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'thinking', thinking: '', signature: '' } }));
@@ -1109,6 +1117,8 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                  thinkingBlockOpen = true;
                }
                res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'thinking_delta', thinking: streamedReasoning } }));
+               res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: idx }));
+               thinkingBlockOpen = false;
              }
              if (streamedText) {
                const idx = ensureTextIndex();
@@ -1117,6 +1127,8 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                  textBlockOpen = true;
                }
                res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: streamedText } }));
+               res.write(sseEvent('content_block_stop', { type: 'content_block_stop', index: idx }));
+               textBlockOpen = false;
              }
            }
            closeOpenBlocks();

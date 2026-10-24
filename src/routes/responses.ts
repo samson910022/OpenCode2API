@@ -1216,8 +1216,9 @@ export function registerResponsesRoutes(app: Application, ctx: AppContext): void
               summary_index: 0,
               delta: filtered,
             });
-          } else if (announcedContent || filtered.trim()) {
+          } else {
             const entry = ensureOutputScaffold();
+            announcedContent = true;
             emit({
               type: 'response.output_text.delta',
               sequence_number: nextSeq(),

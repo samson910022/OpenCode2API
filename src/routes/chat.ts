@@ -1268,9 +1268,13 @@ export function registerChatRoutes(app: Application, ctx: AppContext): void {
               try {
                 const transformed = transformUpstreamError(error);
                 res.write(`data: ${JSON.stringify({ error: transformed.error })}\n\n`);
-                res.end();
               } catch {
                 // ignore write failure on closed stream
+              }
+              try {
+                res.end();
+              } catch {
+                // ignore end failure
               }
             }
              if (sessionId) {

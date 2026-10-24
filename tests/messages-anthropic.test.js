@@ -666,4 +666,95 @@ describe('POST /v1/messages', () => {
         expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(2);
         expect(res.text).not.toContain('[DONE]');
     });
+    test('stream: reasoning followed by text emits content_block_stop for thinking before content_block_start for text', async () => {
+        sdkMocks.sessionMessages.mockResolvedValue([{ info: { role: 'assistant', finish: 'stop' }, parts: [] }]);
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+            stream: (async function* () {
+                yield { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: 'msg-session' }, delta: 'Thinking about this' } };
+                yield { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'msg-session' }, delta: 'Here is the answer' } };
+                yield { type: 'message.updated', properties: { info: { sessionID: 'msg-session', finish: 'stop' } } };
+            })()
+        }));
+        const res = await request(app).post('/v1/messages')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/muse-spark-1.3-contributor-free', max_tokens: 100, stream: true, messages: [{ role: 'user', content: 'hello' }] });
+        expect(res.statusCode).toBe(200);
+        const frames = parseMessagesSseFrames(res.text);
+
+        const thinkStarts = messagesThinkingStarts(frames);
+        expect(thinkStarts).toHaveLength(1);
+        expect(thinkStarts[0].data.index).toBe(0);
+
+        const thinkDeltas = messagesThinkingDeltas(frames);
+        expect(thinkDeltas).toHaveLength(1);
+        expect(thinkDeltas[0].data.delta.thinking).toBe('Thinking about this');
+
+        const textDeltas = messagesTextDeltas(frames);
+        expect(textDeltas).toHaveLength(1);
+        expect(textDeltas[0].data.delta.text).toBe('Here is the answer');
+
+        const textStarts = frames.filter((f) => f.event === 'content_block_start' && f.data?.content_block?.type === 'text');
+        expect(textStarts).toHaveLength(1);
+        expect(textStarts[0].data.index).toBe(1);
+
+        const thinkStopIdx = frames.findIndex((f) => f.event === 'content_block_stop' && f.data.index === 0);
+        const textStartIdx = frames.findIndex((f) => f.event === 'content_block_start' && f.data.index === 1);
+        const textStopIdx = frames.findIndex((f) => f.event === 'content_block_stop' && f.data.index === 1);
+
+        expect(thinkStopIdx).toBeGreaterThan(-1);
+        expect(textStartIdx).toBeGreaterThan(-1);
+        expect(textStopIdx).toBeGreaterThan(-1);
+        expect(thinkStopIdx).toBeLessThan(textStartIdx);
+        expect(textStartIdx).toBeLessThan(textStopIdx);
+
+        const stopFrames = frames.filter((f) => f.event === 'content_block_stop');
+        expect(stopFrames).toHaveLength(2);
+    });
+    test('shouldBufferExternalStream: thinking block is started and stopped before text block is started and stopped', async () => {
+        sdkMocks.sessionMessages.mockResolvedValue([{ info: { role: 'assistant', finish: 'stop' }, parts: [] }]);
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+            stream: (async function* () {
+                yield { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: 'msg-session' }, delta: 'Plan: read file' } };
+                yield { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'msg-session' }, delta: 'Calling tool now ' } };
+                yield { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'msg-session' }, delta: '<function_calls>[{"id":"toolu_buf_1","name":"external__read","arguments":{"path":"file.txt"}}]</function_calls>' } };
+                yield { type: 'message.updated', properties: { info: { sessionID: 'msg-session', finish: 'stop' } } };
+            })()
+        }));
+        const res = await request(app).post('/v1/messages')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/muse-spark-1.3-contributor-free',
+                max_tokens: 100,
+                stream: true,
+                messages: [{ role: 'user', content: 'Read file.txt' }],
+                tools: [{ name: 'read', description: 'Read a file', input_schema: { type: 'object', properties: { path: { type: 'string' } } } }]
+            });
+        expect(res.statusCode).toBe(200);
+        const frames = parseMessagesSseFrames(res.text);
+
+        const thinkStartIdx = frames.findIndex((f) => f.event === 'content_block_start' && f.data?.content_block?.type === 'thinking');
+        const thinkDeltaIdx = frames.findIndex((f) => f.event === 'content_block_delta' && f.data?.delta?.type === 'thinking_delta');
+        const thinkStopIdx = frames.findIndex((f) => f.event === 'content_block_stop' && f.data?.index === 0);
+
+        const textStartIdx = frames.findIndex((f) => f.event === 'content_block_start' && f.data?.content_block?.type === 'text');
+        const textDeltaIdx = frames.findIndex((f) => f.event === 'content_block_delta' && f.data?.delta?.type === 'text_delta');
+        const textStopIdx = frames.findIndex((f) => f.event === 'content_block_stop' && f.data?.index === 1);
+
+        const toolStartIdx = frames.findIndex((f) => f.event === 'content_block_start' && f.data?.content_block?.type === 'tool_use');
+        const toolDeltaIdx = frames.findIndex((f) => f.event === 'content_block_delta' && f.data?.delta?.type === 'input_json_delta');
+        const toolStopIdx = frames.findIndex((f) => f.event === 'content_block_stop' && f.data?.index === 2);
+
+        expect(thinkStartIdx).toBeLessThan(thinkDeltaIdx);
+        expect(thinkDeltaIdx).toBeLessThan(thinkStopIdx);
+        expect(thinkStopIdx).toBeLessThan(textStartIdx);
+        expect(textStartIdx).toBeLessThan(textDeltaIdx);
+        expect(textDeltaIdx).toBeLessThan(textStopIdx);
+        expect(textStopIdx).toBeLessThan(toolStartIdx);
+        expect(toolStartIdx).toBeLessThan(toolDeltaIdx);
+        expect(toolDeltaIdx).toBeLessThan(toolStopIdx);
+
+        const stopFrames = frames.filter((f) => f.event === 'content_block_stop');
+        expect(stopFrames).toHaveLength(3);
+        expect(stopFrames.map((f) => f.data.index)).toEqual([0, 1, 2]);
+    });
 });

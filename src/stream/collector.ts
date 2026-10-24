@@ -38,6 +38,12 @@ function readInfoMessageId(info: Record<string, unknown>): string | null {
   return String(value);
 }
 
+export function readParentMessageId(record: Record<string, unknown>): string | null {
+  const value = record['parentID'] ?? record['parentId'] ?? record['parent_id'];
+  if (value == null || typeof value === 'boolean') return null;
+  return String(value);
+}
+
 // --- Mutex Logic with Timeout ---
 export async function getImageDataUri(url: unknown): Promise<string> {
   const urlStr = String(url ?? '');
@@ -267,7 +273,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
           if (info['role'] !== 'assistant') continue;
           if (
             expectedCurrentUserMessageId !== undefined &&
-            info['parentID'] !== expectedCurrentUserMessageId
+            (readParentMessageId(info) ?? readParentMessageId(entry)) !== expectedCurrentUserMessageId
           ) continue;
           const { content, reasoning, toolParts } = extractFromParts(entry['parts'] ?? []);
           const error: unknown = info['error'] ?? null;
@@ -316,7 +322,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
               error: error ? (asRecord(error)['name'] as unknown) : null,
             });
             const assistantMessageId = readInfoMessageId(info);
-            const userMessageId = typeof info['parentID'] === 'string' ? info['parentID'] : undefined;
+            const userMessageId = (readParentMessageId(info) ?? readParentMessageId(entry)) ?? undefined;
             return {
               content,
               reasoning,
@@ -329,7 +335,7 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
           }
           if (content || reasoning || toolParts.length > 0 || error != null) {
             const assistantMessageId = readInfoMessageId(info);
-            const userMessageId = typeof info['parentID'] === 'string' ? info['parentID'] : undefined;
+            const userMessageId = (readParentMessageId(info) ?? readParentMessageId(entry)) ?? undefined;
             lastPartial = {
               content,
               reasoning,
@@ -710,8 +716,6 @@ export function createCollector(deps: CollectorDeps): CollectorHandle {
       };
       const readPartMessageId = (record: Record<string, unknown>): string | null =>
         readPartId(record['messageID'] ?? record['messageId']);
-      const readParentMessageId = (record: Record<string, unknown>): string | null =>
-        readPartId(record['parentID'] ?? record['parentId'] ?? record['parent_id']);
       const idPartKey = (messageID: string | null, partID: string): string =>
         messageID == null ? `n\u0000${partID}` : `s${messageID.length}\u0000${messageID}${partID}`;
       const toolPartKey = (messageID: string | null, part: unknown): string => {

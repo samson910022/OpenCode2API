@@ -257,6 +257,36 @@ describe('Phase 2: SSE Framing, Keepalives, Headers, and Wire Integrity', () => 
             expect(res.text).not.toContain('data: [DONE]');
         });
 
+        test('chat streaming error ends response even if res.write fails', async () => {
+            sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+                stream: (async function* () {
+                    yield {
+                        type: 'session.error',
+                        properties: { sessionID: SESSION_ID, error: { message: 'Write fail error' } }
+                    };
+                })()
+            }));
+
+            const app = buildApp();
+            const server = (req, res) => {
+                const origWrite = res.write.bind(res);
+                res.write = function (chunk, ...args) {
+                    if (typeof chunk === 'string' && chunk.includes('data: {"error"')) {
+                        throw new Error('Broken pipe during error write');
+                    }
+                    return origWrite(chunk, ...args);
+                };
+                app(req, res);
+            };
+
+            const res = await request(server)
+                .post('/v1/chat/completions')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }], stream: true });
+
+            expect(res.statusCode).toBe(200);
+        });
+
         test('responses streaming error wire shape: response.failed then data: [DONE]', async () => {
             sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
                 stream: (async function* () {
@@ -1068,6 +1098,77 @@ describe('Phase 2: SSE Framing, Keepalives, Headers, and Wire Integrity', () => 
             const msgItem = completedEvent.response.output.find((item) => item.type === 'message');
             expect(msgItem).toBeDefined();
             expect(msgItem.content[0].text).toBe('Authoritative search answer');
+        });
+
+        test('POST /v1/responses streaming preserves leading whitespace in output_text.delta', async () => {
+            sdkMocks.eventSubscribe.mockImplementationOnce(async () => ({
+                stream: (async function* () {
+                    yield {
+                        type: 'message.updated',
+                        properties: { info: { id: 'assistant-ws', role: 'assistant', sessionID: SESSION_ID } }
+                    };
+                    yield {
+                        type: 'message.part.updated',
+                        properties: { part: { id: 'p1', messageID: 'assistant-ws', type: 'text', sessionID: SESSION_ID }, delta: '\n\n' }
+                    };
+                    yield {
+                        type: 'message.part.updated',
+                        properties: { part: { id: 'p1', messageID: 'assistant-ws', type: 'text', sessionID: SESSION_ID }, delta: 'Hello world' }
+                    };
+                    yield {
+                        type: 'message.updated',
+                        properties: { info: { id: 'assistant-ws', role: 'assistant', sessionID: SESSION_ID, finish: 'stop' } }
+                    };
+                })()
+            }));
+
+            const res = await request(buildApp())
+                .post('/v1/responses')
+                .set('Authorization', 'Bearer test-key')
+                .send({ model: 'big-pickle', input: 'hi', stream: true });
+
+            expect(res.statusCode).toBe(200);
+            const lines = res.text.split('\n');
+            const deltaEvents = lines
+                .filter((line) => line.startsWith('data: ') && !line.includes('[DONE]'))
+                .map((line) => JSON.parse(line.slice(6)))
+                .filter((event) => event.type === 'response.output_text.delta');
+
+            const deltas = deltaEvents.map((e) => e.delta);
+            expect(deltas[0]).toBe('\n\n');
+            expect(deltas.join('')).toBe('\n\nHello world');
+        });
+    });
+
+    describe('9. Collector: pollForAssistantResponse parentId/parent_id casing resilience', () => {
+        test('recognizes parentId casing for filtering and output', async () => {
+            const client = {
+                session: {
+                    messages: async () => ([
+                        { info: { id: 'asst-1', role: 'assistant', parentId: 'user-msg-1', finish: 'stop' }, parts: [{ type: 'text', text: 'Answer 1' }] }
+                    ])
+                }
+            };
+            const collector = createCollector({ client, logDebug: () => {} });
+            const result = await collector.pollForAssistantResponse('collector-session', 1000, 1, undefined, 'user-msg-1');
+            expect(result.content).toBe('Answer 1');
+            expect(result.userMessageId).toBe('user-msg-1');
+            expect(result.complete).toBe(true);
+        });
+
+        test('recognizes parent_id casing for filtering and output', async () => {
+            const client = {
+                session: {
+                    messages: async () => ([
+                        { info: { id: 'asst-2', role: 'assistant', parent_id: 'user-msg-2', finish: 'stop' }, parts: [{ type: 'text', text: 'Answer 2' }] }
+                    ])
+                }
+            };
+            const collector = createCollector({ client, logDebug: () => {} });
+            const result = await collector.pollForAssistantResponse('collector-session', 1000, 1, undefined, 'user-msg-2');
+            expect(result.content).toBe('Answer 2');
+            expect(result.userMessageId).toBe('user-msg-2');
+            expect(result.complete).toBe(true);
         });
     });
 });
