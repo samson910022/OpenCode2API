@@ -701,6 +701,57 @@ describe('Streaming Retries on 503 Transient Error', () => {
         expect(sdkMocks.sessionDelete).toHaveBeenCalledWith({ path: { id: 'msg-session-1' } });
     });
 
+    test('Messages stream retries a rejected prompt promise when no output was produced', async () => {
+        let sessionCount = 0;
+        sdkMocks.sessionCreate.mockImplementation(async () => {
+            sessionCount += 1;
+            return { data: { id: `msg-prompt-session-${sessionCount}` } };
+        });
+        const promptError = Object.assign(new Error('Endpoint is unavailable.'), {
+            data: { statusCode: 503, message: 'Endpoint is unavailable.' },
+        });
+        sdkMocks.sessionPrompt
+            .mockRejectedValueOnce(promptError)
+            .mockResolvedValueOnce({ data: { parts: [] } });
+        sdkMocks.eventSubscribe.mockImplementation(async () => {
+            const currentSession = `msg-prompt-session-${sessionCount}`;
+            return {
+                stream: (async function* () {
+                    if (currentSession !== 'msg-prompt-session-1') {
+                        yield {
+                            type: 'message.part.updated',
+                            properties: {
+                                part: { type: 'text', sessionID: currentSession },
+                                delta: 'Recovered after prompt rejection',
+                            },
+                        };
+                        yield {
+                            type: 'message.updated',
+                            properties: {
+                                info: { sessionID: currentSession, finish: 'stop' },
+                            },
+                        };
+                    }
+                })(),
+            };
+        });
+
+        const res = await request(app)
+            .post('/v1/messages')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                max_tokens: 100,
+                messages: [{ role: 'user', content: 'hello' }],
+                stream: true,
+            });
+
+        expect(res.status).toBe(200);
+        expect(sessionCount).toBe(2);
+        expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(2);
+        expect(res.text).toContain('Recovered after prompt rejection');
+        expect(sdkMocks.sessionDelete).toHaveBeenCalledWith({ path: { id: 'msg-prompt-session-1' } });
+    });
+
     test('Interactions retries 503 transient error on attempt 1 and succeeds on attempt 2', async () => {
         let sessionCount = 0;
         sdkMocks.sessionCreate.mockImplementation(async () => {
@@ -1869,6 +1920,22 @@ describe('Backend Lifecycle & Active Model Retries', () => {
         notifyBackendReconnect();
         await ctx2.getProvidersList();
         expect(sdkMocks.configProviders).toHaveBeenCalledTimes(1);
+    });
+
+    test('ctx.dispose clears response-state and conversation-cleanup timers', () => {
+        jest.useFakeTimers();
+        try {
+            const { ctx } = createApp(baseConfig({
+                AUTO_CLEANUP_CONVERSATIONS: true,
+                CLEANUP_INTERVAL_MS: 60_000,
+            }));
+            expect(jest.getTimerCount()).toBeGreaterThanOrEqual(3);
+            ctx.dispose();
+            ctx.dispose();
+            expect(jest.getTimerCount()).toBe(0);
+        } finally {
+            jest.useRealTimers();
+        }
     });
 
     test('startProxy unregisters its app reconnect listener on close and disposal is idempotent', async () => {

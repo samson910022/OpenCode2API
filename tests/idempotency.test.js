@@ -174,6 +174,12 @@ describe('idempotency canonicalization and bounded registry', () => {
         expect(canonicalJsonHash({ list: [1, 2] })).not.toBe(canonicalJsonHash({ list: [2, 1] }));
     });
 
+    test('rejects non-finite numbers instead of canonicalizing them as null', () => {
+        expect(() => canonicalJsonHash({ max_output_tokens: Infinity })).toThrow(/non-finite number/);
+        expect(() => canonicalJsonHash({ max_output_tokens: -Infinity })).toThrow(/non-finite number/);
+        expect(() => canonicalJsonHash({ max_output_tokens: NaN })).toThrow(/non-finite number/);
+    });
+
     test('same scope with a different payload hash conflicts and distinct scopes remain independent', () => {
         const registry = new IdempotencyRegistry();
         const first = registry.begin('scope-a', canonicalJsonHash({ input: 'one' }));
@@ -270,6 +276,28 @@ describe('idempotency canonicalization and bounded registry', () => {
         now += MIN_IDEMPOTENCY_TTL_MS * 10;
         expect(registry.get('unknown-scope')?.state).toBe('unknown');
         expect(registry.begin('different-scope', canonicalJsonHash({ input: 'y' })).kind).toBe('created');
+    });
+
+    test('submitted child sessions stay pinned while their operation is unresolved', () => {
+        const registry = new IdempotencyRegistry();
+        const entry = registry.begin('unresolved-child', canonicalJsonHash({ input: 'x' }), 'tenant-a');
+        expect(entry.kind).toBe('created');
+        registry.markSubmitted(entry.record, entry.record.generation, 'child-session', 'user-message');
+        expect(registry.hasUnresolvedChildSession('child-session')).toBe(true);
+
+        registry.markUnknown(entry.record, entry.record.generation);
+        expect(registry.hasUnresolvedChildSession('child-session')).toBe(true);
+        const retry = registry.begin('unresolved-child', canonicalJsonHash({ input: 'x' }), 'tenant-a');
+        expect(retry.kind).toBe('existing');
+        expect(registry.hasUnresolvedChildSession('child-session')).toBe(true);
+
+        registry.confirmResult(retry.record, retry.record.generation, 'user-message', 'assistant-message');
+        expect(registry.complete(retry.record, retry.record.generation, 'completed', {
+            statusCode: 200,
+            headers: { 'content-type': 'application/json' },
+            body: Buffer.from('{"ok":true}'),
+        })).toBe(true);
+        expect(registry.hasUnresolvedChildSession('child-session')).toBe(false);
     });
 
     test('registry refuses new live entries at its bound instead of evicting uncertain records', () => {
@@ -511,6 +539,23 @@ describe('Idempotency-Key middleware', () => {
         expect(conflict.statusCode).toBe(409);
         expect(conflict.body.error.code).toBe('idempotency_key_reused');
         expect(handlerCalls).toBe(1);
+    });
+
+    test('rejects an overflowed JSON number rather than replaying it as null', async () => {
+        let handlerCalls = 0;
+        const { app } = createMiddlewareApp({ route: (_req, res) => {
+            handlerCalls += 1;
+            res.json({ ok: true });
+        } });
+
+        const overflow = await request(app).post('/v1/responses')
+            .set('Idempotency-Key', 'overflow-number')
+            .set('Content-Type', 'application/json')
+            .send('{"max_output_tokens":1e400}');
+
+        expect(overflow.statusCode).toBe(400);
+        expect(overflow.body.error.code).toBe('invalid_idempotency_payload');
+        expect(handlerCalls).toBe(0);
     });
 
     test('case-insensitive Express paths share replay and conflict scopes', async () => {
@@ -1388,6 +1433,63 @@ describe('Responses and Interactions idempotent routes', () => {
         expect(replayed.body.id).toBe(first.body.id);
         expect(sdkMocks.sessionCreate).toHaveBeenCalledTimes(1);
         expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(1);
+    });
+
+    test('expired response state does not delete a child pinned by an unknown idempotent outcome', async () => {
+        const { app, ctx } = createRouteApp();
+        const largeText = 'x'.repeat(DEFAULT_IDEMPOTENCY_MAX_RESPONSE_BYTES + 1024);
+        sdkMocks.sessionPrompt.mockImplementationOnce(async (args) => {
+            promptBySession.set(args.path.id, structuredClone(args));
+            return {
+                data: {
+                    info: {
+                        id: 'oversized-assistant',
+                        role: 'assistant',
+                        parentID: args.body.messageID,
+                        finish: 'stop',
+                    },
+                    parts: [{ type: 'text', text: largeText }],
+                },
+            };
+        });
+        sdkMocks.sessionMessages.mockImplementationOnce(async ({ path }) => {
+            const prompt = promptBySession.get(path.id);
+            return [{
+                info: {
+                    id: 'oversized-assistant-poll',
+                    role: 'assistant',
+                    parentID: prompt.body.messageID,
+                    sessionID: path.id,
+                    finish: 'stop',
+                },
+                parts: [{ type: 'text', text: largeText }],
+            }];
+        });
+        const payload = { model: 'opencode/kimi-k2.5', input: 'large response for retention test' };
+        const first = await request(app).post('/v1/responses')
+            .set('Idempotency-Key', 'oversized-child-retention')
+            .send(payload);
+
+        expect(first.statusCode).toBe(200);
+        const state = ctx.responseState.get(first.body.id);
+        expect(state).toBeDefined();
+        state.expiresAt = Date.now() - 1;
+        await ctx.sweepResponseState();
+        expect(ctx.responseState.has(first.body.id)).toBe(false);
+        expect(sdkMocks.sessionDelete).not.toHaveBeenCalledWith({ path: { id: state.sessionId } });
+
+        const reconciled = await request(app).post('/v1/responses')
+            .set('Idempotency-Key', 'oversized-child-retention')
+            .send(payload);
+        expect(reconciled.statusCode).toBe(200);
+        expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(1);
+        expect(sdkMocks.sessionMessages).toHaveBeenCalledTimes(2);
+
+        const reconciledState = ctx.responseState.get(reconciled.body.id);
+        expect(reconciledState).toBeDefined();
+        reconciledState.expiresAt = Date.now() - 1;
+        await ctx.sweepResponseState();
+        expect(sdkMocks.sessionDelete).toHaveBeenCalledWith({ path: { id: state.sessionId } });
     });
 
     test('keyed non-stream prompt with tool finish and completion time polls for the complete exact turn', async () => {

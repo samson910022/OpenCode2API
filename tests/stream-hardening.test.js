@@ -791,14 +791,14 @@ describe('collector authoritative snapshots', () => {
         expect(result.content).not.toContain('old snapshot');
     });
 
-    test('flushes an early delta whose numeric partID was stringified', async () => {
+    test('does not attach an ownerless early delta to a later explicit part owner', async () => {
         const result = await run([
             { type: 'message.part.delta', properties: { sessionID: 'collector-session', partID: 7, field: 'text', delta: 'early ' } },
             { type: 'message.part.updated', properties: { part: { id: 7, messageID: 'msg-1', type: 'text', sessionID: 'collector-session' } } },
             { type: 'message.part.delta', properties: { sessionID: 'collector-session', messageID: 'msg-1', partID: 7, field: 'text', delta: 'answer' } },
             stop()
         ]);
-        expect(result.content).toBe('early answer');
+        expect(result.content).toBe('answer');
         expect(result.authoritative).toBeUndefined();
     });
 
@@ -1048,6 +1048,122 @@ describe('collector authoritative snapshots', () => {
         expect(result.noData).toBe(true);
         expect(result.finish).toBeUndefined();
         expect(deltas).toEqual([]);
+    });
+
+    test('a reused part ID from an unverified message cannot overwrite the verified current turn', async () => {
+        const deltas = [];
+        const reusedPartID = 'reused-ownerless-part';
+        const client = {
+            event: {
+                subscribe: async () => ({
+                    stream: (async function* () {
+                        yield {
+                            type: 'message.part.updated',
+                            properties: {
+                                part: {
+                                    id: reusedPartID,
+                                    type: 'text',
+                                    text: 'ownerless early snapshot',
+                                    sessionID: 'collector-session',
+                                },
+                            },
+                        };
+                        yield {
+                            type: 'message.updated',
+                            properties: {
+                                info: {
+                                    id: 'assistant-current',
+                                    role: 'assistant',
+                                    parentID: 'current-user',
+                                    sessionID: 'collector-session',
+                                    parts: [{ id: reusedPartID, type: 'text', text: 'verified current answer' }],
+                                },
+                            },
+                        };
+                        yield {
+                            type: 'message.updated',
+                            properties: {
+                                info: {
+                                    id: 'assistant-unverified',
+                                    role: 'assistant',
+                                    sessionID: 'collector-session',
+                                    parts: [{ id: reusedPartID, type: 'text', text: 'foreign overwrite' }],
+                                },
+                            },
+                        };
+                        yield {
+                            type: 'message.updated',
+                            properties: {
+                                info: {
+                                    id: 'assistant-current',
+                                    role: 'assistant',
+                                    parentID: 'current-user',
+                                    finish: 'stop',
+                                    sessionID: 'collector-session',
+                                },
+                            },
+                        };
+                    })(),
+                }),
+            },
+        };
+
+        const result = await createCollector({ client, logDebug: () => {} })
+            .collectFromEvents('collector-session', 1000, (delta) => deltas.push(delta), null, null, undefined, 'current-user');
+
+        expect(result.content).toBe('verified current answer');
+        expect(result.content).not.toContain('foreign overwrite');
+        expect(deltas).not.toContain('foreign overwrite');
+    });
+
+    test('empty message IDs cannot alias ownerless part state or pending deltas', async () => {
+        const reusedPartID = 'empty-message-id-part';
+        const client = {
+            event: {
+                subscribe: async () => ({
+                    stream: (async function* () {
+                        yield {
+                            type: 'message.part.delta',
+                            properties: {
+                                sessionID: 'collector-session',
+                                partID: reusedPartID,
+                                field: 'text',
+                                delta: 'ownerless prefix',
+                            },
+                        };
+                        yield {
+                            type: 'message.part.delta',
+                            properties: {
+                                sessionID: 'collector-session',
+                                messageID: '',
+                                partID: reusedPartID,
+                                field: 'text',
+                                delta: 'FOREIGN EMPTY-ID TEXT',
+                            },
+                        };
+                        yield {
+                            type: 'message.updated',
+                            properties: {
+                                info: {
+                                    id: 'assistant-current',
+                                    role: 'assistant',
+                                    parentID: 'current-user',
+                                    finish: 'stop',
+                                    sessionID: 'collector-session',
+                                    parts: [{ id: reusedPartID, type: 'text', text: 'verified answer' }],
+                                },
+                            },
+                        };
+                    })(),
+                }),
+            },
+        };
+
+        const result = await createCollector({ client, logDebug: () => {} })
+            .collectFromEvents('collector-session', 1000, null, null, null, undefined, 'current-user');
+
+        expect(result.content).toBe('verified answer');
+        expect(result.content).not.toContain('FOREIGN EMPTY-ID TEXT');
     });
 
     test('remembers stale part IDs for ID-less deltas without blocking an explicitly different message', async () => {
@@ -1784,12 +1900,550 @@ describe('collector continuation turn correlation', () => {
             stopMessage({ id: 'assistant-current', role: 'assistant', parentID: currentUserID }),
         ], (text) => deltas.push(text));
 
-        expect(result.content).toBe('Current explicit answer plus unique ownerless text');
+        expect(result.content).toBe('Current explicit answer');
         expect(result.content).not.toContain('STALE');
         expect(result.content).not.toContain('LEAKED');
         expect(result.finish).toBe('stop');
         expect(result.cut).toBeUndefined();
-        expect(deltas).toEqual(['Current explicit answer', ' plus unique ownerless text']);
+        expect(deltas).toEqual(['Current explicit answer']);
+    });
+
+    test.each(['text', 'reasoning'])('keeps ID-less %s snapshots isolated by message owner', async (type) => {
+        const result = await collect([
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        messageID: 'assistant-current',
+                        parentID: currentUserID,
+                        type,
+                        text: 'verified current content',
+                        sessionID: 'collector-session',
+                    },
+                },
+            },
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        messageID: 'assistant-unverified',
+                        type,
+                        text: 'foreign owner overwrite',
+                        sessionID: 'collector-session',
+                    },
+                },
+            },
+            stopMessage({ id: 'assistant-current', role: 'assistant', parentID: currentUserID }),
+        ]);
+
+        expect(type === 'text' ? result.content : result.reasoning).toBe('verified current content');
+        expect(result.content).not.toContain('foreign owner overwrite');
+        expect(result.reasoning).not.toContain('foreign owner overwrite');
+    });
+
+    test('an empty message ID cannot claim an ownerless ID-less text delta', async () => {
+        const deltas = [];
+        const result = await collect([
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: { type: 'text', sessionID: 'collector-session' },
+                    delta: 'OWNERLESS TEXT MUST STAY QUARANTINED',
+                },
+            },
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: { messageID: '', type: 'text', sessionID: 'collector-session' },
+                },
+            },
+            stopMessage({ id: '', role: 'assistant', parentID: currentUserID }),
+        ], (text) => deltas.push(text));
+
+        expect(result.content).toBe('');
+        expect(result.content).not.toContain('OWNERLESS TEXT');
+        expect(deltas).toEqual([]);
+    });
+
+    test('an empty message ID cannot inherit an ownerless running tool update', async () => {
+        const partID = 'empty-owner-tool';
+        const result = await collect([
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        id: partID,
+                        type: 'tool',
+                        tool: 'bash',
+                        state: { status: 'running' },
+                        sessionID: 'collector-session',
+                    },
+                },
+            },
+            stopMessage({
+                id: '',
+                role: 'assistant',
+                parentID: currentUserID,
+                parts: [{
+                    id: partID,
+                    type: 'tool',
+                    tool: 'bash',
+                    state: { status: 'completed' },
+                }],
+            }),
+        ]);
+
+        expect(result.finish).toBe('stop');
+        expect(result.cut).toBeUndefined();
+        expect(result.idleTimeout).toBeUndefined();
+    });
+
+    test('a reused tool part ID cannot inherit an ownerless update after ownership is ambiguous', async () => {
+        const partID = 'ambiguous-owner-tool';
+        const result = await collect([
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        id: partID,
+                        type: 'tool',
+                        tool: 'bash',
+                        state: { status: 'running' },
+                        sessionID: 'collector-session',
+                    },
+                },
+            },
+            stopMessage({
+                id: 'assistant-stale',
+                role: 'assistant',
+                parts: [{ id: partID, type: 'tool', tool: 'bash', state: { status: 'running' } }],
+            }),
+            stopMessage({
+                id: 'assistant-current',
+                role: 'assistant',
+                parentID: currentUserID,
+                parts: [{ id: partID, type: 'tool', tool: 'bash', state: { status: 'completed' } }],
+            }),
+        ]);
+
+        expect(result.finish).toBe('stop');
+        expect(result.cut).toBeUndefined();
+        expect(result.idleTimeout).toBeUndefined();
+    });
+
+    test('an ambiguous part ID cannot attach or release an ownerless pending text delta', async () => {
+        const deltas = [];
+        const partID = 'ambiguous-pending-text';
+        const result = await collect([
+            {
+                type: 'message.part.delta',
+                properties: {
+                    sessionID: 'collector-session',
+                    partID,
+                    field: 'text',
+                    delta: 'FOREIGN OWNERLESS PENDING TEXT',
+                },
+            },
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        id: partID,
+                        messageID: 'assistant-stale',
+                        type: 'tool',
+                        tool: 'bash',
+                        state: { status: 'completed' },
+                        sessionID: 'collector-session',
+                    },
+                },
+            },
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        id: partID,
+                        messageID: 'assistant-current',
+                        parentID: currentUserID,
+                        type: 'text',
+                        text: 'verified current answer',
+                        sessionID: 'collector-session',
+                    },
+                },
+            },
+            stopMessage({
+                id: 'assistant-current',
+                role: 'assistant',
+                parentID: currentUserID,
+                parts: [{ id: partID, type: 'text', text: 'verified current answer' }],
+            }),
+        ], (text) => deltas.push(text));
+
+        expect(result.content).toBe('verified current answer');
+        expect(result.content).not.toContain('FOREIGN OWNERLESS PENDING TEXT');
+        expect(deltas).not.toContain('FOREIGN OWNERLESS PENDING TEXT');
+    });
+
+    test('does not stream an ownerless delta against a unique owner before later ID reuse is known', async () => {
+        const deltas = [];
+        const partID = 'late-reuse-ownerless-delta';
+        const result = await collect([
+            {
+                type: 'message.updated',
+                properties: {
+                    info: {
+                        id: 'assistant-current',
+                        role: 'assistant',
+                        parentID: currentUserID,
+                        sessionID: 'collector-session',
+                        parts: [{ id: partID, type: 'text', text: 'verified current answer' }],
+                    },
+                },
+            },
+            {
+                type: 'message.part.delta',
+                properties: {
+                    sessionID: 'collector-session',
+                    partID,
+                    field: 'text',
+                    delta: 'FOREIGN LATE OWNERLESS TEXT',
+                },
+            },
+            {
+                type: 'message.updated',
+                properties: {
+                    info: {
+                        id: 'assistant-stale',
+                        role: 'assistant',
+                        parentID: 'previous-user',
+                        sessionID: 'collector-session',
+                        parts: [{ id: partID, type: 'text', text: 'stale owner text' }],
+                    },
+                },
+            },
+            stopMessage({ id: 'assistant-current', role: 'assistant', parentID: currentUserID }),
+        ], (text) => deltas.push(text));
+
+        expect(result.content).toBe('verified current answer');
+        expect(result.content).not.toContain('FOREIGN LATE OWNERLESS TEXT');
+        expect(deltas).not.toContain('FOREIGN LATE OWNERLESS TEXT');
+    });
+
+    test('an ambiguous text part ID cannot release an ownerless quarantined tool', async () => {
+        const partID = 'ambiguous-quarantined-tool';
+        const result = await collect([
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        id: partID,
+                        type: 'tool',
+                        tool: 'bash',
+                        state: { status: 'running' },
+                        sessionID: 'collector-session',
+                    },
+                },
+            },
+            stopMessage({
+                id: 'assistant-stale',
+                role: 'assistant',
+                parts: [{ id: partID, type: 'text', text: 'stale unverified text' }],
+            }),
+            stopMessage({
+                id: 'assistant-current',
+                role: 'assistant',
+                parentID: currentUserID,
+                parts: [{ id: partID, type: 'text', text: 'verified answer' }],
+            }),
+        ]);
+
+        expect(result.content).toBe('verified answer');
+        expect(result.finish).toBe('stop');
+        expect(result.cut).toBeUndefined();
+        expect(result.idleTimeout).toBeUndefined();
+    });
+
+    test('an ambiguous tool part is not released by a terminal snapshot with no message ID', async () => {
+        const partID = 'ambiguous-ownerless-terminal-tool';
+        const result = await collect([
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        id: partID,
+                        type: 'tool',
+                        tool: 'bash',
+                        state: { status: 'running' },
+                        sessionID: 'collector-session',
+                    },
+                },
+            },
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: { id: partID, messageID: 'assistant-a', type: 'text', sessionID: 'collector-session' },
+                },
+            },
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: { id: partID, messageID: 'assistant-b', type: 'text', sessionID: 'collector-session' },
+                },
+            },
+            stopMessage({
+                role: 'assistant',
+                parentID: currentUserID,
+                parts: [{ id: partID, type: 'text', text: 'verified answer' }],
+            }),
+        ]);
+
+        expect(result.content).toBe('');
+        expect(result.finish).toBe('stop');
+        expect(result.cut).toBeUndefined();
+        expect(result.idleTimeout).toBeUndefined();
+    });
+
+    test('a terminal tool update from another message cannot clear the active tool owner', async () => {
+        const partID = 'shared-active-tool-id';
+        const result = await collect([
+            stopMessage({
+                id: 'assistant-a',
+                role: 'assistant',
+                parentID: currentUserID,
+                finish: 'tool',
+                parts: [{ id: partID, type: 'tool', tool: 'bash', state: { status: 'running' } }],
+            }),
+            stopMessage({
+                id: 'assistant-b',
+                role: 'assistant',
+                parentID: currentUserID,
+                finish: 'stop',
+                parts: [{ id: partID, type: 'tool', tool: 'bash', state: { status: 'completed' } }],
+            }),
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        id: partID,
+                        messageID: 'assistant-a',
+                        parentID: currentUserID,
+                        type: 'tool',
+                        tool: 'bash',
+                        state: { status: 'completed' },
+                        sessionID: 'collector-session',
+                    },
+                },
+            },
+            stopMessage({
+                id: 'assistant-a',
+                role: 'assistant',
+                parentID: currentUserID,
+                parts: [{ id: 'assistant-a-answer', type: 'text', text: 'final answer after tool' }],
+            }),
+        ]);
+
+        expect(result.content).toBe('final answer after tool');
+        expect(result.finish).toBe('stop');
+        expect(result.cut).toBeUndefined();
+    });
+
+    test('a later part-ID reuse revokes an ownerless terminal tool fallback', async () => {
+        const partID = 'ownerless-terminal-late-reuse';
+        const result = await collect([
+            stopMessage({
+                id: 'assistant-a',
+                role: 'assistant',
+                parentID: currentUserID,
+                finish: 'tool',
+                parts: [{ id: partID, type: 'tool', tool: 'bash', state: { status: 'running' } }],
+            }),
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        id: partID,
+                        type: 'tool',
+                        tool: 'bash',
+                        state: { status: 'completed' },
+                        sessionID: 'collector-session',
+                    },
+                },
+            },
+            stopMessage({
+                id: 'assistant-b',
+                role: 'assistant',
+                parentID: currentUserID,
+                finish: 'stop',
+                parts: [{ id: partID, type: 'tool', tool: 'bash', state: { status: 'completed' } }],
+            }),
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        id: partID,
+                        messageID: 'assistant-a',
+                        parentID: currentUserID,
+                        type: 'tool',
+                        tool: 'bash',
+                        state: { status: 'completed' },
+                        sessionID: 'collector-session',
+                    },
+                },
+            },
+            stopMessage({
+                id: 'assistant-a',
+                role: 'assistant',
+                parentID: currentUserID,
+                parts: [{ id: 'assistant-a-answer', type: 'text', text: 'answer after A completes' }],
+            }),
+        ]);
+
+        expect(result.content).toBe('answer after A completes');
+        expect(result.finish).toBe('stop');
+        expect(result.cut).toBeUndefined();
+    });
+
+    test('an out-of-turn reused part ID still revokes an ownerless tool fallback', async () => {
+        const partID = 'rejected-owner-reuse-tool';
+        const result = await collect([
+            stopMessage({
+                id: 'assistant-a',
+                role: 'assistant',
+                parentID: currentUserID,
+                finish: 'tool',
+                parts: [{ id: partID, type: 'tool', tool: 'bash', state: { status: 'running' } }],
+            }),
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        id: partID,
+                        type: 'tool',
+                        tool: 'bash',
+                        state: { status: 'completed' },
+                        sessionID: 'collector-session',
+                    },
+                },
+            },
+            stopMessage({ id: 'assistant-b', role: 'assistant', parentID: 'previous-user' }),
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        id: partID,
+                        messageID: 'assistant-b',
+                        type: 'tool',
+                        tool: 'bash',
+                        state: { status: 'completed' },
+                        sessionID: 'collector-session',
+                    },
+                },
+            },
+            stopMessage({ id: 'assistant-a', role: 'assistant', parentID: currentUserID }),
+            {
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        id: partID,
+                        messageID: 'assistant-a',
+                        parentID: currentUserID,
+                        type: 'tool',
+                        tool: 'bash',
+                        state: { status: 'completed' },
+                        sessionID: 'collector-session',
+                    },
+                },
+            },
+            stopMessage({
+                id: 'assistant-a',
+                role: 'assistant',
+                parentID: currentUserID,
+                parts: [{ id: 'assistant-a-answer', type: 'text', text: 'answer after A completes' }],
+            }),
+        ]);
+
+        expect(result.content).toBe('answer after A completes');
+        expect(result.finish).toBe('stop');
+        expect(result.cut).toBeUndefined();
+    });
+
+    test('non-continuation finalization discards ownerless pending deltas after ID ownership becomes ambiguous', async () => {
+        const partID = 'ambiguous-final-pending-text';
+        const deltas = [];
+        const events = [
+            {
+                type: 'message.part.delta',
+                properties: { sessionID: 'collector-session', partID, field: 'text', delta: 'FOREIGN PENDING TEXT' },
+            },
+            ...['assistant-a', 'assistant-b'].map((messageID) => ({
+                type: 'message.part.updated',
+                properties: {
+                    part: {
+                        id: partID,
+                        messageID,
+                        type: 'tool',
+                        tool: 'bash',
+                        state: { status: 'completed' },
+                        sessionID: 'collector-session',
+                    },
+                },
+            })),
+            stopMessage({ id: 'assistant-a', role: 'assistant' }),
+        ];
+        const client = {
+            event: {
+                subscribe: async () => ({
+                    stream: (async function* () { yield* events; })(),
+                }),
+            },
+        };
+
+        const result = await createCollector({ client, logDebug: () => {} })
+            .collectFromEvents('collector-session', 1000, (text) => deltas.push(text), null, null);
+
+        expect(result.content).toBe('');
+        expect(result.content).not.toContain('FOREIGN PENDING TEXT');
+        expect(deltas).toEqual([]);
+    });
+
+    test('non-continuation finalization discards ownerless text state after ID ownership becomes ambiguous', async () => {
+        const partID = 'ambiguous-final-text-state';
+        const client = {
+            event: {
+                subscribe: async () => ({
+                    stream: (async function* () {
+                        yield {
+                            type: 'message.part.updated',
+                            properties: {
+                                part: { id: partID, type: 'text', sessionID: 'collector-session' },
+                                delta: 'OWNERLESS TEXT STATE MUST NOT LEAK',
+                            },
+                        };
+                        for (const messageID of ['assistant-a', 'assistant-b']) {
+                            yield {
+                                type: 'message.part.updated',
+                                properties: {
+                                    part: {
+                                        id: partID,
+                                        messageID,
+                                        type: 'tool',
+                                        tool: 'bash',
+                                        state: { status: 'completed' },
+                                        sessionID: 'collector-session',
+                                    },
+                                },
+                            };
+                        }
+                        yield stopMessage({ id: 'assistant-a', role: 'assistant' });
+                    })(),
+                }),
+            },
+        };
+
+        const result = await createCollector({ client, logDebug: () => {} })
+            .collectFromEvents('collector-session', 1000);
+
+        expect(result.content).toBe('');
+        expect(result.content).not.toContain('OWNERLESS TEXT STATE');
     });
 });
 

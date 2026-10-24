@@ -408,4 +408,3 @@ export function toAnthropicErrorType(statusCode: number, upstreamType?: string):
     if (statusCode === 529) return 'overloaded_error';
     return 'api_error';
 }
-

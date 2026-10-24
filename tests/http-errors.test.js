@@ -488,6 +488,38 @@ describe('Terminal Express Error Handler with Supertest', () => {
         });
     });
 
+    test('unauthenticated incomplete upload is rejected and the connection is closed', async () => {
+        const server = app.listen(0, '127.0.0.1');
+        try {
+            await new Promise((resolve) => server.once('listening', resolve));
+            const address = server.address();
+            const port = typeof address === 'object' && address ? address.port : 0;
+            const rawResponse = await new Promise((resolve, reject) => {
+                const socket = net.createConnection({ host: '127.0.0.1', port });
+                let response = '';
+                socket.setTimeout(3000, () => socket.destroy(new Error('server did not close unauthorized request')));
+                socket.on('connect', () => {
+                    socket.write([
+                        'POST /v1/responses HTTP/1.1',
+                        'Host: 127.0.0.1',
+                        'Content-Type: application/json',
+                        'Content-Length: 1048576',
+                        'Connection: keep-alive',
+                        '',
+                        'x'.repeat(64 * 1024),
+                    ].join('\r\n'));
+                });
+                socket.on('data', (chunk) => { response += chunk.toString('utf8'); });
+                socket.on('error', reject);
+                socket.on('end', () => resolve(response));
+            });
+            expect(rawResponse).toMatch(/^HTTP\/1\.1 401\b/);
+            expect(rawResponse).toMatch(/Connection: close/i);
+        } finally {
+            await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+        }
+    });
+
     test('unauthorized request on /v1/messages/ with trailing slash returns Anthropic error format', async () => {
         const res = await request(app)
             .post('/v1/messages/')

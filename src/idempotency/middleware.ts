@@ -482,7 +482,7 @@ export function createIdempotencyMiddleware(options: IdempotencyMiddlewareOption
     try {
       payloadHash = canonicalJsonHash((req as IdempotencyRequest).body);
     } catch {
-      jsonError(res, 400, 'invalid_idempotency_payload', 'The request payload exceeds idempotency processing limits');
+      jsonError(res, 400, 'invalid_idempotency_payload', 'The request payload cannot be safely canonicalized');
       return;
     }
     const prior = registry.get(scopeId);

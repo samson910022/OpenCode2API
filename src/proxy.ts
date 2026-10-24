@@ -153,6 +153,21 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   // instead of assuming a shared reference.
   const effectiveApiKeys: string[] = buildEffectiveApiKeys(API_KEY, API_KEYS);
   const apiKeyVerifier = createApiKeyVerifier(effectiveApiKeys);
+  const rejectRequestAndClose = (req: Request, res: Response, status: number, body: unknown): void => {
+    let cleanedUp = false;
+    const cleanup = (): void => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      req.off('error', ignoreRequestError);
+      req.off('close', cleanup);
+    };
+    const ignoreRequestError = (): void => cleanup();
+    req.once('error', ignoreRequestError);
+    req.once('close', cleanup);
+    res.setHeader('Connection', 'close');
+    res.status(status).json(body);
+    req.resume();
+  };
 
   // Auth middleware (accepts Authorization: Bearer and x-api-key for Anthropic SDK compat)
   // Runs before bodyParser so unauthenticated requests are rejected immediately without parsing.
@@ -173,10 +188,13 @@ export function createApp(config: ProxyConfig): CreateAppResult {
       );
       if (!authorized) {
         if (isAnthropicMessagesPath(req.originalUrl || req.path)) {
-          res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: 'Unauthorized' } });
+          rejectRequestAndClose(req, res, 401, {
+            type: 'error',
+            error: { type: 'authentication_error', message: 'Unauthorized' },
+          });
           return;
         }
-        res.status(401).json({ error: { message: 'Unauthorized' } });
+        rejectRequestAndClose(req, res, 401, { error: { message: 'Unauthorized' } });
         return;
       }
     }
@@ -195,22 +213,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   ]);
   const rejectUnsupportedContentType = (req: Request, res: Response): void => {
     const classified = classifyHttpError({ type: 'media.type.unsupported' }, req.originalUrl || req.path);
-    let cleanedUp = false;
-    const cleanup = (): void => {
-      if (cleanedUp) return;
-      cleanedUp = true;
-      req.off('error', ignoreRequestError);
-      req.off('close', cleanup);
-    };
-    const ignoreRequestError = (): void => cleanup();
-    req.once('error', ignoreRequestError);
-    req.once('close', cleanup);
-    // Rejecting a body before parsing means it is not covered by body-parser's
-    // size limit. Drain it without buffering and close the connection so a
-    // partial/oversized unsupported body cannot pin a keep-alive socket.
-    res.setHeader('Connection', 'close');
-    res.status(classified.status).json(classified.body);
-    req.resume();
+    rejectRequestAndClose(req, res, classified.status, classified.body);
   };
   app.use((req: Request, res: Response, next: NextFunction): void => {
     const normalizedPath = req.path.replace(/\/+$/, '').toLowerCase() || '/';
@@ -287,10 +290,25 @@ export function createApp(config: ProxyConfig): CreateAppResult {
 
   const unsubscribeReconnect = onBackendReconnect(invalidateProvidersCache);
   let reconnectListenerDisposed = false;
-  const disposeReconnectListener = (): void => {
+  let responseStateSweepTimer: ReturnType<typeof setInterval> | null = null;
+  let conversationCleanupTimeout: ReturnType<typeof setTimeout> | null = null;
+  let conversationCleanupTimer: ReturnType<typeof setInterval> | null = null;
+  const disposeAppResources = (): void => {
     if (reconnectListenerDisposed) return;
     reconnectListenerDisposed = true;
     unsubscribeReconnect();
+    if (responseStateSweepTimer) {
+      clearInterval(responseStateSweepTimer);
+      responseStateSweepTimer = null;
+    }
+    if (conversationCleanupTimeout) {
+      clearTimeout(conversationCleanupTimeout);
+      conversationCleanupTimeout = null;
+    }
+    if (conversationCleanupTimer) {
+      clearInterval(conversationCleanupTimer);
+      conversationCleanupTimer = null;
+    }
   };
 
   const getProvidersList = async (): Promise<ProviderInfo[]> => {
@@ -488,6 +506,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
         (state) => state.sessionId === sessionId && state.expiresAt > Date.now(),
       );
       if (stillReferenced) continue;
+      if (idempotencyRegistry.hasUnresolvedChildSession(sessionId)) continue;
       try {
         await client.session.delete({ path: { id: sessionId } });
         pendingExpiredResponseSessionIds.delete(sessionId);
@@ -496,7 +515,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
       }
     }
   };
-  const responseStateSweepTimer = setInterval(() => {
+  responseStateSweepTimer = setInterval(() => {
     sweepResponseState().catch(() => {});
   }, RESPONSE_STATE_SWEEP_INTERVAL_MS);
   if (typeof responseStateSweepTimer.unref === 'function') responseStateSweepTimer.unref();
@@ -1107,13 +1126,14 @@ export function createApp(config: ProxyConfig): CreateAppResult {
   };
 
   if (AUTO_CLEANUP_CONVERSATIONS) {
-    setTimeout(() => {
+    conversationCleanupTimeout = setTimeout(() => {
+      conversationCleanupTimeout = null;
       cleanupConversationFiles().catch((e: unknown) => logDebug('Cleanup run failed', { error: toErrorMessage(e) }));
     }, 3000);
-    const cleanupTimer = setInterval(() => {
+    conversationCleanupTimer = setInterval(() => {
       cleanupConversationFiles().catch((e: unknown) => logDebug('Cleanup run failed', { error: toErrorMessage(e) }));
     }, Number(CLEANUP_INTERVAL_MS));
-    if (cleanupTimer.unref) cleanupTimer.unref();
+    if (conversationCleanupTimer.unref) conversationCleanupTimer.unref();
   }
 
   const createForcedToolCallRequester =
@@ -1313,7 +1333,7 @@ export function createApp(config: ProxyConfig): CreateAppResult {
     getDiscoveryLastErrorAt: () => discoveryLastErrorAt,
     getDiscoveryLastError: () => discoveryLastError,
     translators: ensureTranslatorsRegistered(defaultTranslatorRegistry()),
-    dispose: disposeReconnectListener,
+    dispose: disposeAppResources,
   };
 
   // P3: register routes (404 last to preserve catch-all order, error handler after).

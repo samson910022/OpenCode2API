@@ -108,6 +108,9 @@ function canonicalize(value: unknown, state: { nodes: number }, depth: number): 
   if (state.nodes > MAX_CANONICAL_NODES || depth > MAX_CANONICAL_DEPTH) {
     throw new RangeError('Idempotency payload exceeds canonicalization limits');
   }
+  if (typeof value === 'number' && !Number.isFinite(value)) {
+    throw new RangeError('Idempotency payload contains a non-finite number');
+  }
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
   if (Array.isArray(value)) return `[${value.map((item) => canonicalize(item, state, depth + 1)).join(',')}]`;
   const record = value as Record<string, unknown>;
@@ -500,6 +503,18 @@ export class IdempotencyRegistry {
 
   getTenantPendingResponseBytes(tenantId: string): number {
     return this.pendingCaptureBytesByTenant.get(tenantId) ?? 0;
+  }
+
+  /** A child backing a live or unknown submitted operation must remain pollable. */
+  hasUnresolvedChildSession(sessionId: string): boolean {
+    for (const record of this.entries.values()) {
+      if (
+        record.childSessionId === sessionId &&
+        record.submitted &&
+        (record.state === 'in_progress' || record.state === 'unknown')
+      ) return true;
+    }
+    return false;
   }
 
   private touch(record: IdempotencyRecord): void {

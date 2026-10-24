@@ -706,8 +706,12 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
            };
 
           let lastStreamAttemptError: unknown = null;
+          let promptPromise: Promise<void> | null = null;
+          let promptError: unknown = null;
           for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
             collected = null;
+            promptPromise = null;
+            promptError = null;
             if (attempt > 1) {
               if (fallbackToProxy) switchToProxyBundle();
               await ensureActiveModel(activeClient, pID, mID).catch(() => {});
@@ -786,7 +790,12 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                   requestAbortController.signal,
                 ).catch((err: unknown) => ({ __error: err }));
 
-                activeClient.session.prompt(promptParams).catch((err: unknown) => logDebug('Prompt error:', toErrorMessage(err)));
+                promptPromise = activePromptWithTimeout(promptParams, REQUEST_TIMEOUT_MS)
+                  .then(() => undefined)
+                  .catch((err: unknown) => {
+                    promptError = err;
+                    logDebug('Prompt error:', toErrorMessage(err));
+                  });
                 const raced = (await Promise.race([collectPromise, resClosed.then(() => ({ __cancelled: true }))])) as Record<string, unknown>;
                 collected = raced;
                 if (raced['__cancelled'] || requestAbortController.signal.aborted) {
@@ -812,7 +821,9 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
             }
 
             const collectedRecord = asRecord(collected);
-            let attemptError: unknown = collectedRecord['error'] ?? collectedRecord['__error'] ?? null;
+            const nothingStreamed = !rawContent && !rawReasoning && streamedToolCalls.length === 0;
+            if (promptPromise && nothingStreamed) await promptPromise;
+            let attemptError: unknown = promptError ?? collectedRecord['error'] ?? collectedRecord['__error'] ?? null;
             if (!attemptError && (collectedRecord['noData'] || collectedRecord['cut'] || collectedRecord['idleTimeout'])) {
               try {
                 const recovery = await pollSnapshot();
@@ -834,7 +845,6 @@ export function registerMessagesRoutes(app: Application, ctx: AppContext): void 
                 attemptError = pollErr;
               }
             }
-            const nothingStreamed = !rawContent && !rawReasoning && streamedToolCalls.length === 0;
             if (attemptError && nothingStreamed && attempt < maxAttempts && engageProxyFallback(attemptError)) {
               lastStreamAttemptError = attemptError;
               continue;
